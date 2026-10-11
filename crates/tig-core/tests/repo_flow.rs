@@ -207,3 +207,21 @@ fn concurrent_commit_is_detected() {
     let tx = b.start("b");
     b.commit(tx).unwrap();
 }
+
+/// Security review round 1, finding 6: two transactions from the same repo
+/// used to both commit, silently dropping the first one's bookmark.
+#[test]
+fn stale_transaction_is_rejected() {
+    let mut repo = repo();
+    let wc = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+    let mut a = repo.start("a");
+    let mut b = repo.start("b");
+    a.set_bookmark("first", wc).unwrap();
+    b.set_bookmark("second", wc).unwrap();
+    repo.commit(a).unwrap();
+    assert!(repo.commit(b).is_err());
+    assert!(repo.view().bookmarks.contains_key("first"));
+
+    let other = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
+    assert!(repo.commit(other.start("foreign")).is_err());
+}

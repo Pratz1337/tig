@@ -162,3 +162,22 @@ mod tests {
         assert_eq!(RepoPath::from_os_relative("a\\b").unwrap().as_str(), "a/b");
     }
 }
+
+#[cfg(test)]
+mod portable_names {
+    use super::*;
+
+    /// Names from security review round 1 that a checkout could misuse.
+    #[test]
+    fn dangerous_names_are_rejected() {
+        for bad in [
+            "C:\\outside", "..\\outside", "a:b", ".env.", ".env ", "x\u{7}", ".tig", ".TIG", ".t\u{200C}ig",
+            "dir/.tig/op_head", "a/b./c",
+        ] {
+            assert!(RepoPath::from_os_relative(bad).is_err(), "{bad:?} accepted");
+        }
+        for ok in ["aux.c", "CON", "A", "a", ".tigrc", "tig", ".env.local", "my file.txt"] {
+            assert!(RepoPath::new(ok).is_ok(), "{ok:?} rejected");
+        }
+    }
+}

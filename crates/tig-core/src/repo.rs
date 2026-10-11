@@ -98,6 +98,7 @@ impl Repo {
             view: View::default(),
             description: "initialize repo".into(),
             undo_of: None,
+            base_op: None,
         };
         tx.view.heads.insert(root_revision_id());
         let wc = tx.new_change(&[root_revision_id()], "")?;
@@ -162,6 +163,7 @@ impl Repo {
             view: self.view.clone(),
             description: description.into(),
             undo_of: None,
+            base_op: Some(self.op_id),
         }
     }
 
@@ -169,6 +171,17 @@ impl Repo {
     /// Fails without side effects (other than unreachable objects) if another
     /// process committed an operation since this repo was loaded.
     pub fn commit(&mut self, tx: Transaction) -> Result<ObjectId> {
+        // A transaction is a diff against the view it started from. Committing
+        // it on top of anything else would silently drop the operations in
+        // between, so it must belong to this repo and this exact operation.
+        if !same_store(&tx.store, &self.store) {
+            return Err(Error::Invalid("transaction belongs to a different repo".into()));
+        }
+        if tx.base_op != Some(self.op_id) {
+            return Err(Error::Invalid(
+                "transaction was started before the latest operation; start a new one".into(),
+            ));
+        }
         let (op_id, op) = tx.write_operation(Some(self.op_id))?;
         if !self.op_head.compare_and_set(Some(self.op_id), op_id)? {
             return Err(Error::Invalid(
@@ -183,26 +196,34 @@ impl Repo {
 
     /// Undoes the latest operation. Repeated undo keeps stepping back.
     pub fn undo(&mut self) -> Result<ObjectId> {
-        // The op to undo: the current one, or, if the current op is itself an
-        // undo of T, the op before T (so repeated undo keeps stepping back).
-        let target = match self.op.undo_of {
-            None => self.op_id,
-            Some(t) => *self
-                .store
-                .get_operation(&t)?
-                .parents
-                .first()
-                .ok_or_else(|| Error::Invalid("nothing left to undo".into()))?,
-        };
+        // Undo the operation at the current logical position: the repo then
+        // looks as it did at the position before it.
+        let target = self.logical_position(self.op_id)?;
         let target_op = self.store.get_operation(&target)?;
         let Some(parent) = target_op.parents.first() else {
             return Err(Error::Invalid("nothing left to undo: the repo is back at its first operation".into()));
         };
-        let parent_op = self.store.get_operation(parent)?;
+        let restore = self.logical_position(*parent)?;
         let mut tx = self.start(format!("undo: {}", target_op.description));
-        tx.view = self.store.get_view(&parent_op.view)?;
+        tx.view = self.store.get_view(&self.store.get_operation(&restore)?.view)?;
         tx.undo_of = Some(target);
         self.commit(tx)
+    }
+
+    /// The non-undo operation whose state `op` represents. A normal operation
+    /// is its own position. An undo of T sits where history was before T, so
+    /// undo, new work, undo, undo... always walks back through real history
+    /// and never re-applies something already undone.
+    fn logical_position(&self, mut op: ObjectId) -> Result<ObjectId> {
+        loop {
+            let Some(undone) = self.store.get_operation(&op)?.undo_of else {
+                return Ok(op);
+            };
+            let Some(&before) = self.store.get_operation(&undone)?.parents.first() else {
+                return Ok(undone);
+            };
+            op = before;
+        }
     }
 
     /// Makes the repo look exactly as it did after `op`.
@@ -265,6 +286,7 @@ impl Repo {
         if spec.len() == 64 {
             if let Ok(id) = spec.parse::<ObjectId>() {
                 if self.store.has(&id)? {
+                    self.store.get_revision(&id)?; // must be a revision, not a blob
                     return Ok(id);
                 }
             }
@@ -346,6 +368,13 @@ pub struct Transaction {
     view: View,
     description: String,
     undo_of: Option<ObjectId>,
+    /// The operation this transaction's view was read from.
+    base_op: Option<ObjectId>,
+}
+
+fn same_store(a: &Arc<dyn Store>, b: &Arc<dyn Store>) -> bool {
+    // Compare data pointers only; vtable pointers may differ for one object.
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
 }
 
 impl Transaction {
@@ -383,6 +412,22 @@ impl Transaction {
     /// Creates an empty change on top of `parents` (merging their trees when
     /// there are several). Does not move any workspace.
     pub fn new_change(&mut self, parents: &[ObjectId], description: &str) -> Result<ObjectId> {
+        self.atomically(|tx| tx.new_change_inner(parents, description))
+    }
+
+    /// Runs one public step. If it fails, the view is restored exactly, so a
+    /// refused step never leaves a half-applied transaction that could still
+    /// be committed. (Objects already written stay in the store, unreachable.)
+    fn atomically<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let saved = self.view.clone();
+        let result = step(self);
+        if result.is_err() {
+            self.view = saved;
+        }
+        result
+    }
+
+    fn new_change_inner(&mut self, parents: &[ObjectId], description: &str) -> Result<ObjectId> {
         let tree = self.merged_tree(parents)?;
         let sig = self.settings.signature();
         self.write_revision(Revision {
@@ -393,6 +438,12 @@ impl Transaction {
             author: sig.clone(),
             committer: sig,
             description: description.to_string(),
+        })
+        .and_then(|id| {
+            // A parent may have been hidden (e.g. after undo), leaving one of
+            // its ancestors as a head.
+            self.normalize_heads()?;
+            Ok(id)
         })
     }
 
@@ -422,12 +473,18 @@ impl Transaction {
     /// referenced `old` at it. Visible descendants are rebased onto it.
     /// Returns `old` unchanged if `edit` changed nothing.
     pub fn rewrite(&mut self, old: ObjectId, edit: impl FnOnce(&mut Revision)) -> Result<ObjectId> {
+        self.atomically(|tx| tx.rewrite_inner(old, edit))
+    }
+
+    fn rewrite_inner(&mut self, old: ObjectId, edit: impl FnOnce(&mut Revision)) -> Result<ObjectId> {
         if old == root_revision_id() {
             return Err(Error::Invalid("the root revision cannot be changed".into()));
         }
         let before = self.store.get_revision(&old)?;
         let mut rev = before.clone();
         edit(&mut rev);
+        // A rewrite is a new revision of the *same* change.
+        rev.change_id = before.change_id;
         if rev.tree == before.tree && rev.parents == before.parents && rev.description == before.description {
             return Ok(old);
         }
@@ -442,16 +499,23 @@ impl Transaction {
     /// Hides a revision. Its children are rebased onto its parents; workspaces
     /// on it get a fresh empty change on its parents.
     pub fn abandon(&mut self, id: ObjectId) -> Result<()> {
+        self.atomically(|tx| tx.abandon_inner(id))
+    }
+
+    fn abandon_inner(&mut self, id: ObjectId) -> Result<()> {
         if id == root_revision_id() {
             return Err(Error::Invalid("the root revision cannot be abandoned".into()));
         }
         let rev = self.store.get_revision(&id)?;
+        // Only the root may be parentless; a stored revision that claims
+        // otherwise is malformed, and must not crash us.
+        let Some(&first_parent) = rev.parents.first() else {
+            return Err(Error::Invalid(format!("revision {} has no parents and cannot be abandoned", id.short(12))));
+        };
         self.view.heads.remove(&id);
         for p in &rev.parents {
             self.view.heads.insert(*p);
         }
-        // Only the root has no parents, and it was rejected above.
-        let first_parent = rev.parents[0];
         for target in self.view.bookmarks.values_mut() {
             if *target == id {
                 *target = first_parent;
@@ -460,7 +524,7 @@ impl Transaction {
         let on_it: Vec<String> =
             self.view.workspaces.iter().filter(|(_, wc)| **wc == id).map(|(n, _)| n.clone()).collect();
         for ws in on_it {
-            let fresh = self.new_change(&rev.parents, "")?;
+            let fresh = self.new_change_inner(&rev.parents, "")?;
             self.view.workspaces.insert(ws, fresh);
         }
         self.rebase_children_onto_parents(id, &rev)?;
@@ -471,34 +535,49 @@ impl Transaction {
     /// is an empty, undescribed leaf nobody else uses (so `new`/`edit` do not
     /// litter the log with empty changes).
     pub fn set_working(&mut self, workspace: &str, rev: ObjectId) -> Result<()> {
+        self.atomically(|tx| tx.set_working_inner(workspace, rev))
+    }
+
+    fn set_working_inner(&mut self, workspace: &str, rev: ObjectId) -> Result<()> {
+        self.store.get_revision(&rev)?;
         // Visible first, so `is_discardable` sees `rev` as using its parents.
         self.view.heads.insert(rev);
         self.normalize_heads()?;
         let old = self.view.workspaces.insert(workspace.to_string(), rev);
         if let Some(old) = old {
             if old != rev && self.is_discardable(old)? {
-                self.abandon(old)?;
+                self.abandon_inner(old)?;
             }
         }
         Ok(())
     }
 
     pub fn remove_workspace(&mut self, workspace: &str) -> Result<()> {
+        self.atomically(|tx| tx.remove_workspace_inner(workspace))
+    }
+
+    fn remove_workspace_inner(&mut self, workspace: &str) -> Result<()> {
         let old = self
             .view
             .workspaces
             .remove(workspace)
             .ok_or_else(|| Error::Invalid(format!("no workspace named {workspace:?}")))?;
         if self.is_discardable(old)? {
-            self.abandon(old)?;
+            self.abandon_inner(old)?;
         }
         Ok(())
     }
 
     pub fn set_bookmark(&mut self, name: &str, rev: ObjectId) -> Result<()> {
         validate_bookmark(name)?;
-        self.view.bookmarks.insert(name.to_string(), rev);
-        Ok(())
+        self.store.get_revision(&rev)?;
+        self.atomically(|tx| {
+            tx.view.bookmarks.insert(name.to_string(), rev);
+            // A bookmark can make a hidden revision visible again; keep heads
+            // exact so "is a head" keeps meaning "has no visible children".
+            tx.view.heads.insert(rev);
+            tx.normalize_heads()
+        })
     }
 
     pub fn delete_bookmark(&mut self, name: &str) -> Result<()> {
@@ -509,6 +588,9 @@ impl Transaction {
             .ok_or_else(|| Error::Invalid(format!("no bookmark named {name:?}")))
     }
 
+    /// Relies on the invariant that `heads` is exactly the set of visible
+    /// revisions without visible children (every step that changes
+    /// visibility ends with `normalize_heads`).
     fn is_discardable(&self, id: ObjectId) -> Result<bool> {
         if id == root_revision_id() || !self.view.heads.contains(&id) {
             return Ok(false);
@@ -578,7 +660,8 @@ impl Transaction {
                     new_parents.push(*rewritten.get(p).unwrap_or(p));
                 }
             }
-            new_parents.dedup();
+            let mut seen = HashSet::new();
+            new_parents.retain(|p| seen.insert(*p));
             let old_base = self.merged_tree(&child.parents)?;
             let new_base = self.merged_tree(&new_parents)?;
             let tree = match merge_trees(&*self.store, &old_base, &new_base, &child.tree)? {

@@ -98,7 +98,7 @@ internal/billing/**   @billing
 ```
 
 - A line without a role belongs to the built-in group `private` (simple mode). Last match wins. `!` negates. Matching is case-insensitive and Unicode-NFC-normalized for safety.
-- New repos ship this default `.private`: `.env*`, `*.pem`, `*.key`.
+- New repos ship this default `.private` (`tig_private::rules::DEFAULT_PRIVATE`): `.env*` except `.env.example`, `.env.sample` and `.env.template`, plus `*.pem`, `*.key`, `*.p12`, `*.pfx`, and the SSH key names `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`. The example files stay public on purpose: projects commit them for every contributor, and making them private by default would teach people to fight the tool on day one.
 - `tig why <path>` prints the effective rule and group.
 - **Publishing** builds a public view: every private path is replaced by a sealed entry, and private content is encrypted into one sealed pack per access group and push window (X25519 key wrapping per member, content keys per epoch). The exact rules are in "Crypto and wire rules" below.
 - **The leak rule:** if a path was public in an earlier published snapshot and later becomes private, tig refuses to pretend it is hidden. It says the content already leaked and tells you to rotate it.
@@ -120,6 +120,18 @@ These are non-negotiable. Reviewers check every publish/fetch change against the
 4. **Labels are frozen.** Every domain-separation string lives in `tig_core::domain`. They are internal protocol constants, not branding, and they stay as written even if the product is renamed. A golden test pins object IDs.
 5. **Every key gets its own subkey.** The epoch key is never used directly. Each purpose (`CONTENT_KEY`, `NONCE_KEY`, `SEAL_SALT_KEY`, `WIRE_ID_KEY`) derives its own subkey with `blake3::derive_key`.
 6. **Paste detection** compares keyed IDs of changed public blobs against keyed IDs of private blobs at publish time. The empty blob is exempt, because an empty `.env` matches every empty file.
+
+### Paths
+
+`object::validate_name` enforces a portable-name policy everywhere, including when decoding stored trees. It rejects `\`, `:`, control characters, a trailing `.` or space (Windows silently strips them, so `.env.` would land on disk as `.env`), and anything that aliases `.tig` (any case, or with HFS+-ignorable characters). Some names are only dangerous on some filesystems but exist in real repos, such as `aux.c` in Linux and `A` next to `a`. The filesystem working copy must check those before writing anything: Windows device names, case collisions on case-insensitive volumes, NTFS 8.3 aliases such as `TIG~1`, and never writing through a symlink or reparse-point ancestor.
+
+### Known gaps (tracked, not forgotten)
+
+- **Crash durability:** objects are written by rename but directory entries are not fsynced before the op head moves. The plan is crash recovery over an fsync storm: on load, if the current operation references missing objects, fall back to the newest operation whose objects are complete, and say so. Per-object fsync on snapshot would break the hot-path rule.
+- **Huge objects:** `DiskStore` reads a whole loose file into memory. Large files get chunked blobs and streaming in the storage phase. Until then, a corrupt multi-gigabyte file can cost one large allocation.
+- **Untrusted tree expansion:** a tree DAG in which many entries share one subtree can expand exponentially when walked. Fetch must budget expanded entries before accepting objects from a peer. Depth is already capped at `treeops::MAX_TREE_DEPTH`.
+- **Wide directories:** a tree object lists all of a directory's entries, as in git. Editing one file in a directory of N entries re-encodes and rehashes O(N) bytes, and lookup or diff decode the whole directory. Depth-wise cost already follows the changed paths. If benchmarks on real monorepos show this matters, directories get chunked into bounded-size nodes with structural sharing (a prolly or B-tree layout). That is a format change, so it is decided by measurement, not guesswork.
+- **Visual spoofing in `.private`:** matching uses NFC plus Unicode case folding. Fullwidth or zero-width look-alikes (`．ｅｎｖ`) are different names and are not treated as `.env`. A publish-time warning for confusable names is a possible later addition.
 
 ## Phases
 

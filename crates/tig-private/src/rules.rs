@@ -1,12 +1,17 @@
 //! Parsing and matching for the `.private` file.
 //!
-//! The file is gitignore syntax plus optional `@role` tags. It is compiled
-//! once into a single [`globset::GlobSet`]; classifying a path is one query
-//! against that set, and the last matching rule wins.
+//! The file is gitignore syntax plus optional `@role` tags. Each rule is
+//! translated by hand into one anchored regex (so the gitignore rules hold
+//! exactly: `*`, `?` and `[...]` never match `/`, and `{}` is literal), and
+//! all rules are compiled once into a single [`regex::RegexSet`]. Classifying
+//! a path is one query against that set; the last matching rule wins.
+//!
+//! Matching is Unicode case-insensitive (the regex crate's simple case
+//! folding, so `.ÉNV` matches `.énv`) on NFC-normalized text.
 
 use std::collections::BTreeSet;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use regex::{RegexSet, RegexSetBuilder};
 use tig_core::RepoPath;
 use unicode_normalization::UnicodeNormalization;
 
@@ -77,14 +82,11 @@ struct CompiledRule {
 
 /// A compiled `.private` file.
 ///
-/// Patterns are turned into one [`GlobSet`] at parse time. [`Rules::classify`]
-/// asks that set once and keeps the highest matching rule index.
+/// Rule `i` is regex `i` of one [`RegexSet`] built at parse time.
+/// [`Rules::classify`] asks that set once and keeps the highest match.
 #[derive(Clone, Debug)]
 pub struct Rules {
-    set: GlobSet,
-    /// Glob index → rule index. Globs are appended in rule order, so the
-    /// highest matching glob index belongs to the last matching rule.
-    glob_to_rule: Vec<usize>,
+    set: RegexSet,
     rules: Vec<CompiledRule>,
     /// Custom roles named anywhere in the file. Never includes `private`.
     roles: BTreeSet<String>,
@@ -94,8 +96,7 @@ impl Rules {
     /// No rules. Every path is public, and the file is in simple mode.
     pub fn empty() -> Self {
         Rules {
-            set: GlobSet::empty(),
-            glob_to_rule: Vec::new(),
+            set: RegexSet::empty(),
             rules: Vec::new(),
             roles: BTreeSet::new(),
         }
@@ -104,8 +105,7 @@ impl Rules {
     /// Parse a `.private` file. Stops at the first bad line.
     pub fn parse(text: &str) -> Result<Self, RuleError> {
         let mut rules = Vec::new();
-        let mut builder = GlobSetBuilder::new();
-        let mut glob_to_rule = Vec::new();
+        let mut regexes = Vec::new();
         let mut roles = BTreeSet::new();
 
         for (idx, raw) in text.lines().enumerate() {
@@ -143,14 +143,12 @@ impl Rules {
             }
 
             let pattern: String = pattern.nfc().collect();
-            let globs = globs_for(&pattern).map_err(|message| rule_error(line_no, message))?;
-            let rule_index = rules.len();
-            for glob_pattern in &globs {
-                let glob =
-                    compile_glob(glob_pattern).map_err(|message| rule_error(line_no, message))?;
-                builder.add(glob);
-                glob_to_rule.push(rule_index);
-            }
+            let regex = rule_regex(&pattern).map_err(|message| rule_error(line_no, message))?;
+            // Compile alone first so a bad pattern reports its own line.
+            regex::RegexBuilder::new(&regex)
+                .build()
+                .map_err(|e| rule_error(line_no, format!("invalid pattern: {e}")))?;
+            regexes.push(regex);
             rules.push(CompiledRule {
                 reference: RuleRef {
                     line: line_no,
@@ -161,14 +159,15 @@ impl Rules {
             });
         }
 
-        let set = builder.build().map_err(|e| {
-            let line = rules.last().map(|rule| rule.reference.line).unwrap_or(1);
-            rule_error(line, format!("invalid pattern: {e}"))
-        })?;
-        debug_assert_eq!(glob_to_rule.len(), set.len());
+        let set = RegexSetBuilder::new(&regexes)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| {
+                let line = rules.last().map(|rule| rule.reference.line).unwrap_or(1);
+                rule_error(line, format!("rules too large to compile: {e}"))
+            })?;
         Ok(Rules {
             set,
-            glob_to_rule,
             rules,
             roles,
         })
@@ -177,19 +176,14 @@ impl Rules {
     /// Classify `path`. The repo root is always public.
     ///
     /// The path and every pattern are compared in Unicode NFC, without regard
-    /// to ASCII case. The last matching line wins.
+    /// to case (Unicode simple case folding). The last matching line wins.
     pub fn classify(&self, path: &RepoPath) -> Verdict {
         if path.is_root() {
             return Verdict::Public { rule: None };
         }
         let normalized: String = path.as_str().nfc().collect();
-        // One GlobSet query. Glob indices increase with rule order.
-        let winner = self
-            .set
-            .matches(&normalized)
-            .into_iter()
-            .map(|glob| self.glob_to_rule[glob])
-            .max();
+        // One RegexSet query. Indices follow rule order.
+        let winner = self.set.matches(&normalized).into_iter().max();
         match winner {
             None => Verdict::Public { rule: None },
             Some(index) => {
@@ -296,63 +290,174 @@ fn parse_role(token: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// Gitignore pattern → globs that classify file paths.
+/// Translates one gitignore pattern into an anchored regex over file paths.
 ///
-/// A pattern with no `/` other than a trailing directory slash matches that
-/// basename at any depth (`**/name` and `**/name/**`). Any other `/` anchors
-/// it at the repo root, after one leading `/` is stripped. A trailing `/`
-/// matches the contents of a directory, not a file of that name. A pattern
-/// that matches a directory also matches everything inside it, because callers
-/// classify file paths rather than pruning a directory walk.
-fn globs_for(pattern: &str) -> Result<Vec<String>, String> {
-    if pattern.is_empty() {
+/// - No `/` except a trailing one: matches the basename at any depth.
+///   Any other `/` anchors it at the root (one leading `/` is stripped).
+/// - A trailing `/` matches only directories, so only paths inside one.
+/// - A match on a directory covers everything inside it, because we classify
+///   file paths instead of pruning a directory walk.
+/// - `**` as a whole component spans zero or more directories (leading,
+///   middle) or everything inside (trailing). Elsewhere it is plain `*`.
+/// - `*`, `?` and `[...]` never match `/`. `{`, `}` and every other
+///   character are literal. `\x` escapes `x`.
+fn rule_regex(pattern: &str) -> Result<String, String> {
+    let directory = pattern.ends_with('/') && !pattern.ends_with("\\/");
+    let body = if directory { &pattern[..pattern.len() - 1] } else { pattern };
+    let anchored = body.contains('/');
+    let body = body.strip_prefix('/').unwrap_or(body);
+    if body.is_empty() {
         return Err("empty pattern".into());
     }
-    let directory = pattern.ends_with('/');
-    let pattern = pattern.trim_end_matches('/');
-    if pattern.is_empty() {
-        return Err("empty pattern".into());
+    let components = split_components(body)?;
+    let mut re = String::from("^");
+    if !anchored {
+        re.push_str("(?:.*/)?");
     }
-    // Decide anchoring before stripping a leading `/`, or `/build` would look
-    // like the unanchored basename `build`.
-    let anchored = pattern.contains('/');
-    let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
-    if pattern.is_empty() {
-        return Err("empty pattern".into());
-    }
-    let base = if anchored {
-        pattern.to_string()
-    } else {
-        format!("**/{pattern}")
-    };
-    // A glob that already ends in `/**` matches every file under that prefix.
-    let covers_inside = base.ends_with("/**");
-    let mut globs = Vec::with_capacity(2);
-    if directory {
-        globs.push(if covers_inside {
-            base
-        } else {
-            format!("{base}/**")
-        });
-    } else {
-        globs.push(base.clone());
-        if !covers_inside {
-            globs.push(format!("{base}/**"));
+    let last = components.len() - 1;
+    for (i, comp) in components.iter().enumerate() {
+        if comp == "**" {
+            if components.len() == 1 {
+                re.push_str("[^/]+");
+            } else if i == last {
+                // Everything inside the previous component; the slash before
+                // this component was already written.
+                re.push_str(".+");
+            } else {
+                // Zero or more whole directories.
+                re.push_str("(?:[^/]+/)*");
+            }
+            continue;
+        }
+        re.push_str(&component_regex(comp)?);
+        if i != last {
+            re.push('/');
         }
     }
-    Ok(globs)
+    re.push_str(if directory { "/.+$" } else { "(?:/.+)?$" });
+    Ok(re)
 }
 
-fn compile_glob(pattern: &str) -> Result<globset::Glob, String> {
-    // `backslash_escape` is off by default on Windows, where `\` is a
-    // separator. Force it on so the same pattern compiles the same way
-    // everywhere. `\#` and `\!` are decoded before we get here.
-    GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .case_insensitive(true)
-        .backslash_escape(true)
-        .build()
-        .map_err(|e| format!("invalid pattern {pattern:?}: {e}"))
+/// Splits on unescaped `/`, keeping escapes for `component_regex`.
+fn split_components(body: &str) -> Result<Vec<String>, String> {
+    let mut out = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let next = chars.next().ok_or("pattern ends with a lone backslash")?;
+                let cur = out.last_mut().expect("never empty");
+                cur.push('\\');
+                cur.push(next);
+            }
+            '/' => out.push(String::new()),
+            _ => out.last_mut().expect("never empty").push(c),
+        }
+    }
+    if out.iter().any(String::is_empty) {
+        return Err("empty path component (\"//\") in pattern".into());
+    }
+    Ok(out)
+}
+
+fn component_regex(comp: &str) -> Result<String, String> {
+    let chars: Vec<char> = comp.chars().collect();
+    let mut re = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                // split_components only keeps a backslash with a char after it.
+                re.push_str(&regex::escape(&chars[i + 1].to_string()));
+                i += 2;
+            }
+            '*' => {
+                while i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                }
+                re.push_str("[^/]*");
+            }
+            '?' => {
+                re.push_str("[^/]");
+                i += 1;
+            }
+            '[' => {
+                let (class, next) = class_regex(&chars, i)?;
+                re.push_str(&class);
+                i = next;
+            }
+            c => {
+                re.push_str(&regex::escape(&c.to_string()));
+                i += 1;
+            }
+        }
+    }
+    Ok(re)
+}
+
+/// Parses `[...]` starting at `start`; returns the regex class and the index
+/// after `]`. The class never matches `/`, negated or not.
+fn class_regex(chars: &[char], start: usize) -> Result<(String, usize), String> {
+    let unclosed = || {
+        "unclosed '[' in pattern ('/' cannot appear inside [...]; write \\[ for a literal bracket)"
+            .to_string()
+    };
+    let mut i = start + 1;
+    let negated = matches!(chars.get(i), Some('!') | Some('^'));
+    if negated {
+        i += 1;
+    }
+    let mut items = String::new();
+    let mut first = true;
+    loop {
+        let c = *chars.get(i).ok_or_else(unclosed)?;
+        if c == ']' && !first {
+            i += 1;
+            break;
+        }
+        if c == '[' && chars.get(i + 1) == Some(&':') {
+            return Err("POSIX character classes like [[:alpha:]] are not supported".into());
+        }
+        let lo = if c == '\\' {
+            i += 1;
+            *chars.get(i).ok_or_else(unclosed)?
+        } else {
+            c
+        };
+        i += 1;
+        first = false;
+        if chars.get(i) == Some(&'-') && chars.get(i + 1).is_some_and(|&n| n != ']') {
+            let mut hi = chars[i + 1];
+            i += 2;
+            if hi == '\\' {
+                hi = *chars.get(i).ok_or_else(unclosed)?;
+                i += 1;
+            }
+            if hi < lo {
+                return Err(format!("invalid range {lo}-{hi} in pattern"));
+            }
+            items.push_str(&class_char(lo));
+            items.push('-');
+            items.push_str(&class_char(hi));
+        } else {
+            items.push_str(&class_char(lo));
+        }
+    }
+    let class = if negated {
+        format!("[^{items}/]")
+    } else {
+        format!("[{items}--/]")
+    };
+    Ok((class, i))
+}
+
+/// One character, escaped for use inside a regex class.
+fn class_char(c: char) -> String {
+    if c.is_alphanumeric() {
+        c.to_string()
+    } else {
+        format!("\\x{{{:x}}}", c as u32)
+    }
 }
 
 #[cfg(test)]
@@ -744,7 +849,7 @@ mixed @private @audit
 
         let glob = Rules::parse("# c\nok\nfoo[\n").unwrap_err();
         assert_eq!(glob.line, 3);
-        assert!(glob.message.contains("invalid pattern"), "{}", glob.message);
+        assert!(glob.message.contains("unclosed"), "{}", glob.message);
 
         let empty = Rules::parse("!\n").unwrap_err();
         assert_eq!(empty.line, 1);
@@ -761,6 +866,45 @@ mixed @private @audit
             Verdict::Private { readers, .. } => assert_eq!(readers, BTreeSet::from(["team".to_string()])),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Bypasses found in security review round 1: each one used to classify
+    /// a path the user meant to protect as public.
+    #[test]
+    fn review_round1_bypasses_are_closed() {
+        // Unicode case folding, not just ASCII.
+        assert_private(&parse_ok(".ÉNV\n"), ".énv");
+        assert_private(&parse_ok("SECRETS/**\n"), "secrets/ÉTÉ.txt");
+        assert_private(&parse_ok("k.key\n"), "\u{212A}.key"); // Kelvin sign
+        // Character classes never cross '/', negated or not.
+        let rules = parse_ok("secrets/**\n!/secrets/public[!x]data\n");
+        assert_private(&rules, "secrets/public/data");
+        assert_public(&rules, "secrets/publicYdata");
+        let slash = Rules::parse("a[/]b\n").unwrap_err();
+        assert!(slash.message.contains("'/' cannot appear"), "{}", slash.message);
+        assert_public(&parse_ok("a[.-0]b\n"), "a/b"); // range spanning '/'
+        // Braces are literal in gitignore.
+        let braces = parse_ok("secret{1,2}.txt\n");
+        assert_private(&braces, "secret{1,2}.txt");
+        assert_public(&braces, "secret1.txt");
+    }
+
+    #[test]
+    fn gitignore_star_forms() {
+        let mid = parse_ok("a/**/b\n");
+        for p in ["a/b", "a/x/b", "a/x/y/b", "a/b/c"] {
+            assert_private(&mid, p);
+        }
+        assert_public(&mid, "a/xb");
+        let lead = parse_ok("**/logs\n");
+        assert_private(&lead, "logs/x");
+        assert_private(&lead, "deep/logs/x");
+        let stars = parse_ok("a**b\n"); // not a whole component: plain '*'
+        assert_private(&stars, "axyb");
+        assert_public(&stars, "ax/yb");
+        assert!(Rules::parse("[[:alpha:]]\n").unwrap_err().message.contains("POSIX"));
+        assert!(Rules::parse("[z-a]\n").unwrap_err().message.contains("range"));
+        assert_private(&parse_ok("\\[x]\n"), "[x]");
     }
 
     #[test]

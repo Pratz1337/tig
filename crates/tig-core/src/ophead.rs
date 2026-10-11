@@ -99,14 +99,21 @@ impl OpHeadStore for FileOpHead {
         if self.read()? != expected {
             return Ok(false);
         }
-        let tmp = self.path.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
+        // Unpredictable name + create_new: never truncate or follow a file
+        // (or link) that someone planted in the metadata directory.
+        let mut suffix = [0u8; 8];
+        getrandom::getrandom(&mut suffix).map_err(|e| Error::Invalid(format!("no randomness: {e}")))?;
+        let tmp = self.path.with_extension(format!("tmp-{}", hex::encode(suffix)));
+        let written = (|| -> Result<()> {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(new.to_hex().as_bytes())?;
             f.sync_all()?;
+            Ok(fs::rename(&tmp, &self.path)?)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        fs::rename(&tmp, &self.path)?;
-        Ok(true)
+        written.map(|()| true)
     }
 }
 

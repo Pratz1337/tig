@@ -101,15 +101,25 @@ pub fn ancestors(store: &dyn Store, id: &ObjectId) -> Result<HashSet<ObjectId>> 
 mod tests {
     use super::*;
     use crate::object::EntryKind;
-    use crate::store::{empty_tree_id, MemoryStore};
+    use crate::seal::{SealSalt, SealedId};
+    use crate::store::{empty_tree_id, MemoryStore, StoreExt};
+    use crate::treeops::Leaf;
 
     fn tree(store: &MemoryStore, files: &[(&str, &[u8])]) -> ObjectId {
         let edits = files
             .iter()
             .map(|(p, data)| {
                 let id = store.put_blob(data).unwrap();
-                (RepoPath::new(p).unwrap(), Some((EntryKind::File, id)))
+                (RepoPath::new(p).unwrap(), Some(Leaf::file(id)))
             })
+            .collect();
+        apply_edits(store, &empty_tree_id(), &edits).unwrap()
+    }
+
+    fn tree_leaves(store: &MemoryStore, files: &[(&str, Leaf)]) -> ObjectId {
+        let edits = files
+            .iter()
+            .map(|(p, leaf)| (RepoPath::new(p).unwrap(), Some(*leaf)))
             .collect();
         apply_edits(store, &empty_tree_id(), &edits).unwrap()
     }
@@ -157,5 +167,50 @@ mod tests {
         let ours = tree(&s, &[("a", b"now a file")]);
         let theirs = tree(&s, &[("a/x", b"2")]);
         assert!(matches!(merge_trees(&s, &base, &ours, &theirs).unwrap(), MergeOutcome::Conflict(_)));
+    }
+
+    #[test]
+    fn sealed_entries_on_both_sides_merge() {
+        let s = MemoryStore::new();
+        let a1 = s.put_blob(b"1").unwrap();
+        let a2 = s.put_blob(b"2").unwrap();
+        let note = s.put_blob(b"n").unwrap();
+        let hidden = s.put_blob(b"hidden").unwrap();
+        let hidden2 = s.put_blob(b"hidden-2").unwrap();
+        let salt = SealSalt::from_bytes([4; 32]);
+        let secret = Leaf::sealed(SealedId::compute(&salt, EntryKind::File, &hidden));
+        let secret2 = Leaf::sealed(SealedId::compute(&salt, EntryKind::File, &hidden2));
+
+        let base = tree_leaves(&s, &[("a", Leaf::file(a1)), ("secret", secret)]);
+        let ours = tree_leaves(&s, &[("a", Leaf::file(a2)), ("secret", secret)]);
+        let theirs = tree_leaves(&s, &[
+            ("a", Leaf::file(a1)),
+            ("secret", secret2),
+            ("note", Leaf::file(note)),
+        ]);
+        let want = tree_leaves(&s, &[
+            ("a", Leaf::file(a2)),
+            ("secret", secret2),
+            ("note", Leaf::file(note)),
+        ]);
+        let merged = merge_trees(&s, &base, &ours, &theirs).unwrap();
+        assert_eq!(merged, MergeOutcome::Clean(want));
+
+        let got = s.get_tree(&want).unwrap();
+        let sealed = got.get("secret").unwrap();
+        assert_eq!(sealed.kind(), EntryKind::Sealed);
+        assert_eq!(sealed.sealed_id(), secret2.sealed_id());
+
+        // The same sealed update on both sides is not a conflict.
+        let ours_same = tree_leaves(&s, &[("a", Leaf::file(a2)), ("secret", secret2)]);
+        let theirs_same = tree_leaves(&s, &[
+            ("a", Leaf::file(a1)),
+            ("secret", secret2),
+            ("note", Leaf::file(note)),
+        ]);
+        assert_eq!(
+            merge_trees(&s, &base, &ours_same, &theirs_same).unwrap(),
+            MergeOutcome::Clean(want)
+        );
     }
 }

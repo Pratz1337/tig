@@ -70,7 +70,7 @@ impl Workspace {
             }
         };
         match leaf {
-            Some((kind, id)) if kind.is_file_like() => Ok(Some(repo.store().get_blob(&id)?)),
+            Some(found) if found.is_file_like() => Ok(Some(repo.store().get_blob(&found.id())?)),
             _ => Ok(None),
         }
     }
@@ -84,7 +84,7 @@ impl Workspace {
             return Err(Error::Invalid(format!("cannot write a file at {path}")));
         }
         let id = repo.store().put_blob(data)?;
-        self.set(repo, path.clone(), Some((kind, id)))
+        self.set(repo, path.clone(), Some(Leaf::new(kind, id)?))
     }
 
     pub fn remove(&mut self, repo: &Repo, path: &RepoPath) -> Result<()> {
@@ -96,7 +96,7 @@ impl Workspace {
     /// `leaf` must be a file, executable, or symlink (or None to delete the
     /// path, including a whole directory).
     pub fn set(&mut self, repo: &Repo, path: RepoPath, leaf: Option<Leaf>) -> Result<()> {
-        if path.is_root() || leaf.is_some_and(|(kind, _)| !kind.is_file_like()) {
+        if path.is_root() || leaf.is_some_and(|found| !found.is_file_like()) {
             return Err(Error::Invalid(format!("workspace edits must be files; got {leaf:?} at {path}")));
         }
         // Edits to a path and its ancestor in one overlay would be ambiguous;

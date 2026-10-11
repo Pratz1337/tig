@@ -200,7 +200,26 @@ pub struct Tree {
     entries: Vec<TreeEntry>,
 }
 
+/// True if `name` would be treated as the `.tig` metadata directory by some
+/// filesystem: any case, and with the zero-width characters that macOS HFS+
+/// ignores removed (git guards `.git` the same way).
+fn is_metadata_dir(name: &str) -> bool {
+    const IGNORABLE: &[char] = &[
+        '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}', '\u{206F}', '\u{FEFF}',
+    ];
+    let visible: String = name.chars().filter(|c| !IGNORABLE.contains(c)).collect();
+    visible.eq_ignore_ascii_case(".tig")
+}
+
 /// Validates one path component.
+///
+/// Rejected everywhere (including when decoding stored trees): empty, `.`,
+/// `..`, `/`, NUL, `\`, `:`, control characters, a trailing `.` or space,
+/// and anything that aliases `.tig`. Names that are only dangerous on some
+/// filesystems but legitimately exist in real repos (Windows device names
+/// like `aux.c`, and `A` next to `a`) are checked by the filesystem working
+/// copy before it writes, not here.
 pub fn validate_name(name: &str) -> Result<()> {
     let bad = |reason| {
         Err(Error::InvalidPath {
@@ -216,6 +235,23 @@ pub fn validate_name(name: &str) -> Result<()> {
     }
     if name.contains('/') || name.contains('\0') {
         return bad("name contains '/' or NUL");
+    }
+    // Portable-name policy: names that mean something else on some OS are
+    // refused everywhere, so a repo can never smuggle them onto a disk.
+    // `\` is a separator on Windows, ':' opens an NTFS alternate data stream
+    // or a drive prefix, and Windows silently strips trailing dots and spaces
+    // (`.env.` and `.env ` would be written as `.env`).
+    if name.contains('\\') || name.contains(':') {
+        return bad("name contains '\\' or ':'");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return bad("name contains a control character");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return bad("name ends with '.' or ' ' (Windows would rename it)");
+    }
+    if is_metadata_dir(name) {
+        return bad("'.tig' is reserved for repository metadata");
     }
     Ok(())
 }
