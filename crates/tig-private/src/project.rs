@@ -5,6 +5,8 @@
 //! 2. Find the sealed roots: the highest entries whose files are all private
 //!    to the same readers. A fully private folder becomes one sealed entry,
 //!    so outsiders learn its name and nothing inside it.
+//!    Existing foreign seals are neutral: they add no readers and do not
+//!    prevent an otherwise private folder from being sealed whole.
 //! 3. Replace each sealed root with `Leaf::sealed` in one `apply_edits`
 //!    call, so every subtree without private files is reused by ID.
 
@@ -79,8 +81,8 @@ pub fn project_tree(store: &dyn Store, root: &ObjectId, key: &EpochKey) -> Resul
         return Err(ProjectError::RolesNotSupported(roles.join(", ")));
     }
 
-    // 1. Classify files. Already-sealed entries (from a public clone) pass
-    //    through unchanged: they are public-safe by construction.
+    // 1. Classify files. Already-sealed entries (from a public clone) are
+    //    opaque and public-safe; a surrounding private seal may absorb them.
     let mut public_files = Vec::new();
     let mut private_files = Vec::new();
     let mut negated = Vec::new();
@@ -124,8 +126,10 @@ pub fn project_tree(store: &dyn Store, root: &ObjectId, key: &EpochKey) -> Resul
             cur = dir.parent();
         }
     };
-    for (path, _) in &public_files {
-        fold(path, None);
+    for (path, leaf) in &public_files {
+        if leaf.kind() != EntryKind::Sealed {
+            fold(path, None);
+        }
     }
     for (path, _) in &private_files {
         fold(path, readers_of.get(path));
@@ -158,6 +162,8 @@ pub fn project_tree(store: &dyn Store, root: &ObjectId, key: &EpochKey) -> Resul
         sealed.push(SealedRoot { path, leaf, readers });
     }
     let public_tree = apply_edits(store, root, &edits)?;
+    // Foreign seals absorbed into a private folder are no longer public leaves.
+    public_files.retain(|(path, _)| !tig_core::path::has_ancestor(&edits, path));
     Ok(Projection { public_tree, sealed, public_files, private_files, negated })
 }
 
@@ -181,6 +187,10 @@ mod tests {
     use super::*;
     use tig_core::store::empty_tree_id;
     use tig_core::MemoryStore;
+
+    fn group() -> crate::keys::GroupEpoch {
+        crate::keys::GroupEpoch { group: PRIVATE_GROUP.into(), epoch: 1 }
+    }
 
     fn p(s: &str) -> RepoPath {
         RepoPath::new(s).unwrap()
@@ -211,7 +221,7 @@ mod tests {
                 ("src/main.rs", b"fn main() {}"),
             ],
         );
-        let key = EpochKey::generate().unwrap();
+        let key = EpochKey::generate(group()).unwrap();
         let proj = project_tree(&s, &root, &key).unwrap();
         assert_eq!(sealed_paths(&proj), vec![".env", "secrets"]);
         // Outsiders see the names of the sealed roots and nothing below them.
@@ -236,7 +246,7 @@ mod tests {
             &s,
             &[(".private", b"secrets/**\n!secrets/README.md\n"), ("secrets/README.md", b"hi"), ("secrets/a.key", b"A")],
         );
-        let proj = project_tree(&s, &root, &EpochKey::generate().unwrap()).unwrap();
+        let proj = project_tree(&s, &root, &EpochKey::generate(group()).unwrap()).unwrap();
         assert_eq!(sealed_paths(&proj), vec!["secrets/a.key"]);
         assert_eq!(proj.negated, vec![p("secrets/README.md")]);
     }
@@ -245,7 +255,7 @@ mod tests {
     fn no_rules_means_everything_public_and_same_tree() {
         let s = MemoryStore::new();
         let root = tree(&s, &[("a.txt", b"a")]);
-        let proj = project_tree(&s, &root, &EpochKey::generate().unwrap()).unwrap();
+        let proj = project_tree(&s, &root, &EpochKey::generate(group()).unwrap()).unwrap();
         assert_eq!(proj.public_tree, root);
         assert!(proj.sealed.is_empty());
     }
@@ -253,7 +263,7 @@ mod tests {
     #[test]
     fn refusals() {
         let s = MemoryStore::new();
-        let key = EpochKey::generate().unwrap();
+        let key = EpochKey::generate(group()).unwrap();
         let roles = tree(&s, &[(".private", b"billing/ @billing\n"), ("billing/x", b"x")]);
         assert!(matches!(project_tree(&s, &roles, &key), Err(ProjectError::RolesNotSupported(r)) if r == "@billing"));
         let self_private = tree(&s, &[(".private", b".priv*\n")]);
@@ -263,7 +273,7 @@ mod tests {
     #[test]
     fn sealed_ids_are_stable_across_publishes_of_unchanged_content() {
         let s = MemoryStore::new();
-        let key = EpochKey::generate().unwrap();
+        let key = EpochKey::generate(group()).unwrap();
         let a = tree(&s, &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"1")]);
         let b = tree(&s, &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"2")]);
         let (pa, pb) = (project_tree(&s, &a, &key).unwrap(), project_tree(&s, &b, &key).unwrap());

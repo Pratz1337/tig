@@ -18,7 +18,7 @@ use crate::object::EntryKind;
 /// key (see tig-private); it depends on the entry's path and content, so
 /// disclosing one salt (commit-then-reveal) exposes nothing about any other
 /// entry or any other version of the same path.
-#[derive(Clone)]
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SealSalt([u8; 32]);
 
 impl SealSalt {
