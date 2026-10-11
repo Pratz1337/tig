@@ -65,11 +65,14 @@ Encodings are hand-written, versioned, and varint-based (`tig-core::encode`). Th
 
 Every mutation of repo state writes a new `View` plus an `Operation` pointing at it, then moves the single op-head pointer (an atomic file replace on disk, a swap in memory). `undo` writes a new operation whose view equals the parent's view. Nothing is ever destroyed, so `undo` is always available.
 
+**Two kinds of head update.** User actions (describe, new, undo, publish, and so on) move the durable `op_head`, which is synced. Working-copy snapshots only record what is already on disk, so they write the unsynced `op_head.light`: `(label, base, recent light heads, checksum)`. It counts only while its checksum holds and `base` is still the durable head. A crash can lose it, but the next command simply snapshots the same files again; a workspace state left ahead of the repo re-scans from disk. git does not sync its index for the same reason. This saves an fsync on every edit.
+
 ### Stores
 
 `trait Store`: `get`, `put`, `has`. Backends:
 - `MemoryStore`: agents, tests, the fastest path.
-- `DiskStore`: loose objects, lz4-compressed, sharded `objects/ab/cdef…`, written atomically (tmp + rename). Packs come later.
+- `DiskStore`: loose objects, lz4-compressed, sharded `objects/ab/cdef…`, written atomically (tmp + rename).
+- `JournalStore` (what a repo on disk uses): small objects (≤ 64 KiB) are appended to one `store/journal` file, larger ones go to `DiskStore`. On Windows the antivirus scans a file the first time it is opened after a change (about 6 ms each); a snapshot used to create about seven new files, and the next command paid for each. The journal makes that one file. It is the frozen-base-plus-ledger idea applied to storage: the journal is the ledger over loose objects, and it is compacted into them once it passes 4 MB, before the scan cost starts to grow with its size. A record counts only if its body hashes to its ID, so a torn tail is ignored. Appends take an OS file lock, and one handle stays open for the store's lifetime. Packs for transfer come later.
 
 Object storage is plaintext for whoever holds it. Encryption happens only when objects leave the machine.
 `Store::kind` is a cheap object type check that need not verify the body hash; `get_raw` reads and verifies the body.
@@ -88,7 +91,7 @@ The working-copy index is a **frozen sorted snapshot plus a small mutation ledge
 
 A workspace is `(working revision, overlay)`. The overlay maps path → `Some(file)`, `None` (deleted), or an internal `Some(tree)` graft that fully replaces a deleted or replaced directory. Edits under a graft update that subtree; reads and listings resolve through it without bringing back base siblings. Restoring the base subtree ID cancels the graft. The public workspace edit API only accepts files and deletions. A snapshot folds the overlay into new trees, reusing every unchanged subtree by ID, so the cost is proportional to the changed paths. Many workspaces share one store, so ten agents cost one repo plus their deltas.
 
-The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (path → size, mtime, id) to find changed files and feeds them into the overlay.
+The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (path → size, mtime, id) to find changed files and feeds them into the overlay. Its walk (`walk.rs`) lists each directory with one `read_dir` (on Windows the listing already carries sizes and times, like git's `fscache`), spreads directories over a thread pool (like git's `preloadIndex`), and decides each file on the worker threads. `TIG_TRACE_PERF=1` prints a per-phase timing breakdown of any command, like `GIT_TRACE_PERFORMANCE`.
 
 Stat scans reuse the frozen cache and update only changed rows. An identical revision, tree and stat cache needs no state-file rewrite; changes to timestamps or racy flags still get saved. Checking out an identical tree only records the revision move, without file-write preflight. Checkouts that change files retain the complete preflight and per-path safety checks.
 
