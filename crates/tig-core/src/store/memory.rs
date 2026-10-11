@@ -32,7 +32,11 @@ impl Store for MemoryStore {
     }
 
     fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> Result<()> {
-        self.objects.write().expect("lock poisoned").entry(*id).or_insert_with(|| (kind, body.to_vec()));
+        self.objects
+            .write()
+            .expect("lock poisoned")
+            .entry(*id)
+            .or_insert_with(|| (kind, body.to_vec()));
         Ok(())
     }
 

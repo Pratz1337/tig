@@ -100,9 +100,26 @@ internal/billing/**   @billing
 - A line without a role belongs to the built-in group `private` (simple mode). Last match wins. `!` negates. Matching is case-insensitive and Unicode-NFC-normalized for safety.
 - New repos ship this default `.private`: `.env*`, `*.pem`, `*.key`.
 - `tig why <path>` prints the effective rule and group.
-- **Publishing** builds a public view: every private path is replaced by a sealed entry per access group, and private content is encrypted into one sealed pack per group (X25519 key wrapping per member, ChaCha20-Poly1305 content keys per epoch, BLAKE3 keyed hashes so nobody can test whether a known file exists).
+- **Publishing** builds a public view: every private path is replaced by a sealed entry, and private content is encrypted into one sealed pack per access group and push window (X25519 key wrapping per member, content keys per epoch). The exact rules are in "Crypto and wire rules" below.
 - **The leak rule:** if a path was public in an earlier published snapshot and later becomes private, tig refuses to pretend it is hidden. It says the content already leaked and tells you to rotate it.
 - Roles, the Discord-style hierarchy, and two-step grants come after simple mode works end to end.
+
+### Crypto and wire rules
+
+These are non-negotiable. Reviewers check every publish/fetch change against them.
+
+1. **A sealed entry never contains an internal ID.** Internal IDs are plain, unsalted content hashes, so a small private file could be guessed from its ID. A sealed entry holds a `SealedId` = BLAKE3 keyed hash under a secret per-entry `SealSalt` (`tig_core::seal`). `SealedId` is its own type, and `TreeEntry::new` refuses `EntryKind::Sealed`. The only way to build a sealed entry is `TreeEntry::sealed(name, SealedId)`, so the type system blocks the mistake.
+   - Salt: `salt = keyed_hash(derive_key(SEAL_SALT_KEY, epoch_key), path || kind || target_id)`. It is deterministic, so an unchanged private folder keeps the same sealed ID across publishes and public history stays stable. It is bound to the content, so disclosing one salt on embargo day reveals nothing about other entries or other versions of the same path.
+   - Known leak, by design: outsiders can see *that* a sealed entry changed between revisions, never what changed.
+2. **Only public-projection IDs and keyed IDs cross the wire.** This rule is broader than "don't send private object IDs". Any internal ID whose hash covers private content can be used to test a guess: the internal tree above `.env`, every internal revision, and every operation and view. So:
+   - Publishing produces a **public projection**: public trees (private entries replaced by sealed entries), public revisions whose tree and parents are public IDs and whose predecessors are dropped, and public blobs.
+   - Have/want negotiation lists public-projection IDs for public objects, and `WireId = keyed_hash(derive_key(WIRE_ID_KEY, epoch_key), object_id)` for private objects. The server routes by group and never sees a plain private ID.
+   - Operations, views, and internal revision and tree IDs never leave the machine. Users share change IDs (random) or public revision IDs.
+   - Readers rebuild internal trees locally by opening the sealed entries they hold keys for.
+3. **One AEAD: XChaCha20-Poly1305.** Use it everywhere: random nonces for key wrapping, and synthetic nonces for pack objects (`nonce = keyed_hash(derive_key(NONCE_KEY, epoch_key), object_id)[..24]`, an SIV-style construction that keeps dedup within a group and epoch). Its 192-bit nonce makes random nonces safe and leaves a wide margin for synthetic ones, so contributors never have to choose. Associated data binds every ciphertext to `(group, epoch, object kind)`, so ciphertexts cannot be swapped between groups.
+4. **Labels are frozen.** Every domain-separation string lives in `tig_core::domain`. They are internal protocol constants, not branding, and they stay as written even if the product is renamed. A golden test pins object IDs.
+5. **Every key gets its own subkey.** The epoch key is never used directly. Each purpose (`CONTENT_KEY`, `NONCE_KEY`, `SEAL_SALT_KEY`, `WIRE_ID_KEY`) derives its own subkey with `blake3::derive_key`.
+6. **Paste detection** compares keyed IDs of changed public blobs against keyed IDs of private blobs at publish time. The empty blob is exempt, because an empty `.env` matches every empty file.
 
 ## Phases
 

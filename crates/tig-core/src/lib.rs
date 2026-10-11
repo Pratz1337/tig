@@ -3,17 +3,25 @@
 //!
 //! Read DESIGN.md at the repo root before changing anything here.
 
+pub mod domain;
 pub mod encode;
 pub mod error;
 pub mod id;
 pub mod index;
+pub mod merge;
 pub mod object;
+pub mod ophead;
 pub mod path;
+pub mod repo;
+pub mod seal;
 pub mod store;
 pub mod treeops;
+pub mod workspace;
 
 pub use error::{Error, Result};
 pub use id::{ChangeId, ObjectId};
+pub use object::{
+    EntryKind, Object, ObjectKind, Operation, Revision, Signature, Tree, TreeEntry, View,
+};
 pub use path::RepoPath;
-pub use object::{EntryKind, Object, ObjectKind, Operation, Revision, Signature, Tree, TreeEntry, View};
 pub use store::{MemoryStore, Store};

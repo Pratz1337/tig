@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::encode::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{ChangeId, ObjectId};
+use crate::seal::SealedId;
 
-const ID_CONTEXT: &str = "tig object v1";
 const FORMAT_V1: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -44,7 +44,7 @@ impl ObjectKind {
 
 /// Computes the ID of an encoded object without building it.
 pub fn hash_object(kind: ObjectKind, body: &[u8]) -> ObjectId {
-    let mut h = blake3::Hasher::new_derive_key(ID_CONTEXT);
+    let mut h = blake3::Hasher::new_derive_key(crate::domain::OBJECT_ID);
     h.update(&[kind as u8]);
     h.update(body);
     ObjectId(*h.finalize().as_bytes())
@@ -99,7 +99,10 @@ impl Object {
 fn check_version(r: &mut Reader<'_>, what: &'static str) -> Result<()> {
     let v = r.u8()?;
     if v != FORMAT_V1 {
-        return Err(Error::decode(what, format!("unsupported format version {v}")));
+        return Err(Error::decode(
+            what,
+            format!("unsupported format version {v}"),
+        ));
     }
     Ok(())
 }
@@ -132,15 +135,62 @@ impl EntryKind {
 
     /// True for entries whose id points at a blob.
     pub fn is_file_like(self) -> bool {
-        matches!(self, EntryKind::File | EntryKind::Executable | EntryKind::Symlink)
+        matches!(
+            self,
+            EntryKind::File | EntryKind::Executable | EntryKind::Symlink
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Fields are crate-private: outside tig-core, entries are built with
+/// [`TreeEntry::new`] or [`TreeEntry::sealed`], so a plain object ID can never
+/// be placed in a `Sealed` slot (see `seal.rs`).
 pub struct TreeEntry {
-    pub name: String,
-    pub kind: EntryKind,
-    pub id: ObjectId,
+    pub(crate) name: String,
+    pub(crate) kind: EntryKind,
+    pub(crate) id: ObjectId,
+}
+
+impl TreeEntry {
+    /// A file, executable, symlink, or directory entry. Rejects `Sealed`:
+    /// use [`TreeEntry::sealed`] with a [`SealedId`].
+    pub fn new(name: impl Into<String>, kind: EntryKind, id: ObjectId) -> Result<Self> {
+        let name = name.into();
+        validate_name(&name)?;
+        if kind == EntryKind::Sealed {
+            return Err(Error::Invalid(format!(
+                "{name:?}: a sealed entry needs a SealedId; a plain object ID would let anyone test guesses of private content"
+            )));
+        }
+        Ok(TreeEntry { name, kind, id })
+    }
+
+    /// The public stand-in for a private file or folder.
+    pub fn sealed(name: impl Into<String>, sealed: SealedId) -> Result<Self> {
+        let name = name.into();
+        validate_name(&name)?;
+        Ok(TreeEntry { name, kind: EntryKind::Sealed, id: ObjectId(*sealed.as_bytes()) })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    /// The object this entry points at. For `Sealed` entries these are the
+    /// sealed ID's bytes, which name no object; use [`TreeEntry::sealed_id`].
+    pub fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    pub fn sealed_id(&self) -> Option<SealedId> {
+        (self.kind == EntryKind::Sealed).then(|| SealedId::from_stored(self.id.0))
+    }
 }
 
 /// A directory. Entries are kept sorted bytewise by name with no duplicates;
@@ -152,7 +202,12 @@ pub struct Tree {
 
 /// Validates one path component.
 pub fn validate_name(name: &str) -> Result<()> {
-    let bad = |reason| Err(Error::InvalidPath { path: name.to_string(), reason });
+    let bad = |reason| {
+        Err(Error::InvalidPath {
+            path: name.to_string(),
+            reason,
+        })
+    };
     if name.is_empty() {
         return bad("empty name");
     }
@@ -172,7 +227,10 @@ impl Tree {
         }
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         if let Some(w) = entries.windows(2).find(|w| w[0].name == w[1].name) {
-            return Err(Error::Invalid(format!("duplicate tree entry {:?}", w[0].name)));
+            return Err(Error::Invalid(format!(
+                "duplicate tree entry {:?}",
+                w[0].name
+            )));
         }
         Ok(Tree { entries })
     }
@@ -256,8 +314,14 @@ impl Signature {
         let email = r.str()?.to_string();
         let timestamp_ms = r.ivarint()?;
         let tz = r.ivarint()?;
-        let tz_offset_min = i32::try_from(tz).map_err(|_| Error::decode("signature", "timezone out of range"))?;
-        Ok(Signature { name, email, timestamp_ms, tz_offset_min })
+        let tz_offset_min =
+            i32::try_from(tz).map_err(|_| Error::decode("signature", "timezone out of range"))?;
+        Ok(Signature {
+            name,
+            email,
+            timestamp_ms,
+            tz_offset_min,
+        })
     }
 }
 
@@ -310,7 +374,15 @@ impl Revision {
         let committer = Signature::read(&mut r)?;
         let description = r.str()?.to_string();
         r.finish()?;
-        Ok(Revision { tree, parents, change_id, predecessors, author, committer, description })
+        Ok(Revision {
+            tree,
+            parents,
+            change_id,
+            predecessors,
+            author,
+            committer,
+            description,
+        })
     }
 }
 
@@ -325,6 +397,9 @@ pub struct Operation {
     pub user: String,
     pub timestamp_ms: i64,
     pub description: String,
+    /// Set when this operation is an undo: the operation it undid. Lets
+    /// repeated `undo` keep stepping back instead of toggling.
+    pub undo_of: Option<ObjectId>,
 }
 
 impl Operation {
@@ -339,6 +414,13 @@ impl Operation {
         w.str(&self.user);
         w.ivarint(self.timestamp_ms);
         w.str(&self.description);
+        match &self.undo_of {
+            None => w.u8(0),
+            Some(id) => {
+                w.u8(1);
+                w.id(id);
+            }
+        }
         w.finish()
     }
 
@@ -351,8 +433,20 @@ impl Operation {
         let user = r.str()?.to_string();
         let timestamp_ms = r.ivarint()?;
         let description = r.str()?.to_string();
+        let undo_of = match r.u8()? {
+            0 => None,
+            1 => Some(r.id()?),
+            b => return Err(Error::decode("operation", format!("bad undo flag {b}"))),
+        };
         r.finish()?;
-        Ok(Operation { parents, view, user, timestamp_ms, description })
+        Ok(Operation {
+            parents,
+            view,
+            user,
+            timestamp_ms,
+            description,
+            undo_of,
+        })
     }
 }
 
@@ -429,26 +523,52 @@ mod tests {
     use super::*;
 
     fn sig() -> Signature {
-        Signature { name: "a".into(), email: "a@x".into(), timestamp_ms: 1_700_000_000_000, tz_offset_min: -300 }
+        Signature {
+            name: "a".into(),
+            email: "a@x".into(),
+            timestamp_ms: 1_700_000_000_000,
+            tz_offset_min: -300,
+        }
     }
 
     #[test]
     fn tree_is_canonical() {
         let id = ObjectId([1; 32]);
         let a = Tree::new(vec![
-            TreeEntry { name: "b".into(), kind: EntryKind::File, id },
-            TreeEntry { name: "a".into(), kind: EntryKind::Tree, id },
+            TreeEntry {
+                name: "b".into(),
+                kind: EntryKind::File,
+                id,
+            },
+            TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::Tree,
+                id,
+            },
         ])
         .unwrap();
         let b = Tree::decode(&a.encode()).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.entries()[0].name, "a");
         assert!(Tree::new(vec![
-            TreeEntry { name: "a".into(), kind: EntryKind::File, id },
-            TreeEntry { name: "a".into(), kind: EntryKind::File, id },
+            TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::File,
+                id
+            },
+            TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::File,
+                id
+            },
         ])
         .is_err());
-        assert!(Tree::new(vec![TreeEntry { name: "x/y".into(), kind: EntryKind::File, id }]).is_err());
+        assert!(Tree::new(vec![TreeEntry {
+            name: "x/y".into(),
+            kind: EntryKind::File,
+            id
+        }])
+        .is_err());
     }
 
     #[test]
@@ -463,7 +583,10 @@ mod tests {
             description: "hello\n".into(),
         };
         let obj = Object::Revision(r.clone());
-        assert_eq!(Object::decode(ObjectKind::Revision, &obj.encode_body()).unwrap(), obj);
+        assert_eq!(
+            Object::decode(ObjectKind::Revision, &obj.encode_body()).unwrap(),
+            obj
+        );
     }
 
     #[test]
@@ -475,8 +598,32 @@ mod tests {
         assert_eq!(View::decode(&v.encode()).unwrap(), v);
     }
 
+    /// Object IDs are part of the on-disk format. If this fails, an ID label
+    /// or an encoding changed and every existing repo would break.
+    #[test]
+    fn object_ids_are_frozen() {
+        assert_eq!(
+            hash_object(ObjectKind::Blob, b"hello\n").to_hex(),
+            "887c6633a8c3d0b715bac9b815307d47430c8a2d679dae9e84e9e7735eb4444e"
+        );
+        assert_eq!(Object::Tree(Tree::empty()).id().to_hex(), "43581fee33ae552ce24395c7610880617df277cef408a4988fe120e996bc2935");
+    }
+
+    #[test]
+    fn sealed_entries_need_a_sealed_id() {
+        use crate::seal::SealSalt;
+        assert!(TreeEntry::new("x", EntryKind::Sealed, ObjectId([1; 32])).is_err());
+        let sid = SealedId::compute(&SealSalt::from_bytes([3; 32]), EntryKind::File, &ObjectId([1; 32]));
+        let e = TreeEntry::sealed("x", sid).unwrap();
+        assert_eq!(e.sealed_id(), Some(sid));
+        assert_eq!(TreeEntry::new("f", EntryKind::File, ObjectId([1; 32])).unwrap().sealed_id(), None);
+    }
+
     #[test]
     fn kinds_hash_differently() {
-        assert_ne!(hash_object(ObjectKind::Blob, b""), hash_object(ObjectKind::Tree, b""));
+        assert_ne!(
+            hash_object(ObjectKind::Blob, b""),
+            hash_object(ObjectKind::Tree, b"")
+        );
     }
 }

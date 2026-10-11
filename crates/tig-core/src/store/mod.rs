@@ -4,6 +4,7 @@
 mod disk;
 mod memory;
 
+pub use disk::DiskStore;
 pub use memory::MemoryStore;
 
 use crate::error::{Error, Result};
@@ -48,7 +49,10 @@ pub trait StoreExt: Store {
     fn get_kind(&self, id: &ObjectId, expected: ObjectKind) -> Result<Vec<u8>> {
         let (kind, body) = self.get_raw(id)?.ok_or(Error::NotFound(*id))?;
         if kind != expected {
-            return Err(Error::WrongKind { expected: expected.name(), found: kind.name() });
+            return Err(Error::WrongKind {
+                expected: expected.name(),
+                found: kind.name(),
+            });
         }
         Ok(body)
     }

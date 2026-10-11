@@ -11,7 +11,10 @@ pub enum Error {
     #[error("cannot decode {what}: {reason}")]
     Decode { what: &'static str, reason: String },
     #[error("expected a {expected} object, found {found}")]
-    WrongKind { expected: &'static str, found: &'static str },
+    WrongKind {
+        expected: &'static str,
+        found: &'static str,
+    },
     #[error("invalid path {path:?}: {reason}")]
     InvalidPath { path: String, reason: &'static str },
     #[error("{0}")]
@@ -22,6 +25,9 @@ pub enum Error {
 
 impl Error {
     pub(crate) fn decode(what: &'static str, reason: impl Into<String>) -> Self {
-        Error::Decode { what, reason: reason.into() }
+        Error::Decode {
+            what,
+            reason: reason.into(),
+        }
     }
 }

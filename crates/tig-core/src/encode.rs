@@ -77,7 +77,10 @@ impl<'a> Reader<'a> {
     }
 
     pub fn u8(&mut self) -> Result<u8> {
-        let b = *self.buf.get(self.pos).ok_or_else(|| self.err("unexpected end"))?;
+        let b = *self
+            .buf
+            .get(self.pos)
+            .ok_or_else(|| self.err("unexpected end"))?;
         self.pos += 1;
         Ok(b)
     }
@@ -108,7 +111,11 @@ impl<'a> Reader<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len()).ok_or_else(|| self.err("unexpected end"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or_else(|| self.err("unexpected end"))?;
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
