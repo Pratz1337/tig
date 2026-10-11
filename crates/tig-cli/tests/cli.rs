@@ -113,12 +113,7 @@ fn end_to_end_session() {
         .expect(&log);
     assert!(!lines[parent].contains("(empty)"), "{log}");
     assert!(lines[parent + 1].contains("initial"), "{log}");
-    assert!(
-        lines
-            .iter()
-            .any(|line| *line == "* root"),
-        "{log}"
-    );
+    assert!(lines.contains(&"* root"), "{log}");
 
     fs::write(repo.join("src/main.rs"), "fn main() {}\n// edited\n").unwrap();
     let diff = expect_ok(tig(&repo).args(["diff"]));
