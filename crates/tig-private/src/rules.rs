@@ -8,6 +8,15 @@
 //!
 //! Matching is Unicode case-insensitive (the regex crate's simple case
 //! folding, so `.ÉNV` matches `.énv`) on NFC-normalized text.
+//!
+//! The built-in floor ([`DEFAULT_PRIVATE`]) always applies underneath the
+//! repository file. [`Rules::parse_layered`] puts the floor first and the
+//! file after it, so the last match still wins: the file can add private
+//! paths, and it can make a default-private path public only with an
+//! explicit `!` line. Deleting or emptying `.private` leaves the floor in
+//! place, so `.env` stays private. [`Rules::parse`] reads one text and does
+//! not add the floor; publish and [`crate::project::rules_of`] use the
+//! layered rules.
 
 use std::collections::BTreeSet;
 
@@ -18,10 +27,11 @@ use unicode_normalization::UnicodeNormalization;
 /// Built-in access group for a positive rule that names no roles.
 const BUILTIN_ROLE: &str = "private";
 
-/// Default `.private` contents for a new repository.
+/// Built-in floor, and the `.private` text `tig init` writes so people can see it.
 ///
-/// Environment files and private keys are private. The header comment in the
-/// string describes the rule format.
+/// These rules apply underneath the repository file even when that file is
+/// missing or empty. Environment files and private keys are private. The
+/// header comment in the string describes the rule format.
 pub const DEFAULT_PRIVATE: &str = "\
 # .private: paths matched here are private. The repository is public by default.
 # gitignore syntax. The last matching line wins. A leading ! makes a path public.
@@ -51,13 +61,34 @@ pub struct RuleError {
     pub message: String,
 }
 
+/// Where the deciding rule was written. Line numbers count inside that text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSource {
+    /// A line of the built-in floor ([`DEFAULT_PRIVATE`]).
+    BuiltIn,
+    /// A line of the repository's `.private` file.
+    File,
+}
+
 /// The rule that decided a path, so a caller can show why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleRef {
-    /// 1-based line number.
+    /// 1-based line number inside [`source`](Self::source), not in the other text.
     pub line: usize,
     /// The rule line as written, with unescaped trailing ASCII spaces removed.
     pub text: String,
+    /// Built-in floor, or the repository file.
+    pub source: RuleSource,
+}
+
+impl RuleRef {
+    /// Text for `tig why`. A floor decision reads `built-in default rule: .env*`.
+    pub fn explanation(&self) -> String {
+        match self.source {
+            RuleSource::BuiltIn => format!("built-in default rule: {}", self.text),
+            RuleSource::File => format!(".private line {}: {}", self.line, self.text),
+        }
+    }
 }
 
 /// Whether a path is public or private, and which rule decided it.
@@ -102,76 +133,31 @@ impl Rules {
         }
     }
 
-    /// Parse a `.private` file. Stops at the first bad line.
+    /// Parse one `.private` text. Stops at the first bad line.
+    ///
+    /// Does not add the built-in floor. Publish and
+    /// [`crate::project::rules_of`] use [`Rules::parse_layered`] so a missing
+    /// file still hides `.env`.
     pub fn parse(text: &str) -> Result<Self, RuleError> {
+        Self::compile(&[(text, RuleSource::File)])
+    }
+
+    /// Rules from `base`, then rules from `file`. The last match wins.
+    ///
+    /// Line numbers stay inside the text they came from. A bad line in
+    /// `file` reports that file's line, not a line of `base`. Pass
+    /// [`DEFAULT_PRIVATE`] as `base` for the built-in floor.
+    pub fn parse_layered(base: &str, file: &str) -> Result<Self, RuleError> {
+        Self::compile(&[(base, RuleSource::BuiltIn), (file, RuleSource::File)])
+    }
+
+    fn compile(parts: &[(&str, RuleSource)]) -> Result<Self, RuleError> {
         let mut rules = Vec::new();
         let mut regexes = Vec::new();
         let mut roles = BTreeSet::new();
-
-        for (idx, raw) in text.lines().enumerate() {
-            let line_no = idx + 1;
-            let mut line = raw;
-            while let Some(before) = line.strip_suffix(' ') {
-                // Git ignores trailing ASCII spaces only when unescaped.
-                if before.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
-                    break;
-                }
-                line = before;
-            }
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let tokens = split_tokens(line);
-            let mut tokens = tokens.iter().map(String::as_str);
-            // A line containing only separators has no pattern.
-            let Some(first) = tokens.next() else {
-                continue;
-            };
-            if line.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
-                return Err(rule_error(
-                    line_no,
-                    "leading whitespace in a pattern must be escaped with a backslash",
-                ));
-            }
-            let (negated, pattern) =
-                split_negation(first).map_err(|message| rule_error(line_no, message))?;
-            let rest: Vec<&str> = tokens.collect();
-            if negated && !rest.is_empty() {
-                return Err(rule_error(
-                    line_no,
-                    "a negated pattern cannot have @role tags",
-                ));
-            }
-
-            let mut readers = BTreeSet::new();
-            for token in rest {
-                let role = parse_role(token).map_err(|message| rule_error(line_no, message))?;
-                if role != BUILTIN_ROLE {
-                    roles.insert(role.clone());
-                }
-                readers.insert(role);
-            }
-            if !negated && readers.is_empty() {
-                readers.insert(BUILTIN_ROLE.to_string());
-            }
-
-            let pattern: String = pattern.nfc().collect();
-            let regex = rule_regex(&pattern).map_err(|message| rule_error(line_no, message))?;
-            // Compile alone first so a bad pattern reports its own line.
-            regex::RegexBuilder::new(&regex)
-                .build()
-                .map_err(|e| rule_error(line_no, format!("invalid pattern: {e}")))?;
-            regexes.push(regex);
-            rules.push(CompiledRule {
-                reference: RuleRef {
-                    line: line_no,
-                    text: line.to_string(),
-                },
-                negated,
-                readers,
-            });
+        for &(text, source) in parts {
+            push_rules(text, source, &mut rules, &mut regexes, &mut roles)?;
         }
-
         let set = RegexSetBuilder::new(&regexes)
             .case_insensitive(true)
             .build()
@@ -228,6 +214,81 @@ impl Rules {
     pub fn is_simple_mode(&self) -> bool {
         self.roles.is_empty()
     }
+}
+
+/// Appends one text's rules. `line` numbers count inside `text` only.
+fn push_rules(
+    text: &str,
+    source: RuleSource,
+    rules: &mut Vec<CompiledRule>,
+    regexes: &mut Vec<String>,
+    roles: &mut BTreeSet<String>,
+) -> Result<(), RuleError> {
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let mut line = raw;
+        while let Some(before) = line.strip_suffix(' ') {
+            // Git ignores trailing ASCII spaces only when unescaped.
+            if before.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
+                break;
+            }
+            line = before;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens = split_tokens(line);
+        let mut tokens = tokens.iter().map(String::as_str);
+        // A line containing only separators has no pattern.
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        if line.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
+            return Err(rule_error(
+                line_no,
+                "leading whitespace in a pattern must be escaped with a backslash",
+            ));
+        }
+        let (negated, pattern) =
+            split_negation(first).map_err(|message| rule_error(line_no, message))?;
+        let rest: Vec<&str> = tokens.collect();
+        if negated && !rest.is_empty() {
+            return Err(rule_error(
+                line_no,
+                "a negated pattern cannot have @role tags",
+            ));
+        }
+
+        let mut readers = BTreeSet::new();
+        for token in rest {
+            let role = parse_role(token).map_err(|message| rule_error(line_no, message))?;
+            if role != BUILTIN_ROLE {
+                roles.insert(role.clone());
+            }
+            readers.insert(role);
+        }
+        if !negated && readers.is_empty() {
+            readers.insert(BUILTIN_ROLE.to_string());
+        }
+
+        let pattern: String = pattern.nfc().collect();
+        let regex = rule_regex(&pattern).map_err(|message| rule_error(line_no, message))?;
+        // Compile alone first so a bad pattern reports its own line.
+        regex::RegexBuilder::new(&regex)
+            .build()
+            .map_err(|e| rule_error(line_no, format!("invalid pattern: {e}")))?;
+        regexes.push(regex);
+        rules.push(CompiledRule {
+            reference: RuleRef {
+                line: line_no,
+                text: line.to_string(),
+                source,
+            },
+            negated,
+            readers,
+        });
+    }
+    Ok(())
 }
 
 /// Splits a rule line on unescaped ASCII whitespace. `\ ` stays in the token as an
@@ -1036,5 +1097,58 @@ mixed @private @audit
             star.classify(&RepoPath::root()),
             Verdict::Public { rule: None }
         ));
+    }
+
+    #[test]
+    fn built_in_floor_sits_under_the_file() {
+        let floor_line = DEFAULT_PRIVATE
+            .lines()
+            .position(|line| line == ".env*")
+            .unwrap()
+            + 1;
+
+        let absent = Rules::parse_layered(DEFAULT_PRIVATE, "").unwrap();
+        assert_private(&absent, ".env");
+        assert_private(&absent, ".env.local");
+        assert_public(&absent, ".env.example");
+        assert_public(&absent, "src/main.rs");
+        match absent.classify(&rp(".env")) {
+            Verdict::Private { rule, .. } => {
+                assert_eq!(rule.source, RuleSource::BuiltIn);
+                assert_eq!(rule.line, floor_line);
+                assert_eq!(rule.text, ".env*");
+                assert_eq!(rule.explanation(), "built-in default rule: .env*");
+            }
+            other => panic!("absent file: {other:?}"),
+        }
+        // parse() itself does not install the floor.
+        assert_public(&Rules::parse("").unwrap(), ".env");
+
+        let extra = Rules::parse_layered(DEFAULT_PRIVATE, "secrets/\n").unwrap();
+        assert_private(&extra, ".env");
+        assert_private(&extra, "secrets/a.key");
+        assert_public(&extra, "src/main.rs");
+        match extra.classify(&rp(".env")) {
+            Verdict::Private { rule, .. } => assert_eq!(rule.source, RuleSource::BuiltIn),
+            other => panic!("file without .env*: {other:?}"),
+        }
+
+        let opened = Rules::parse_layered(DEFAULT_PRIVATE, "# keep\n!.env\n").unwrap();
+        assert_public(&opened, ".env");
+        assert_private(&opened, ".env.local");
+        assert_private(&opened, "id_rsa");
+        match opened.classify(&rp(".env")) {
+            Verdict::Public { rule: Some(rule) } => {
+                assert_eq!(rule.source, RuleSource::File);
+                assert_eq!(rule.line, 2);
+                assert_eq!(rule.text, "!.env");
+                assert_eq!(rule.explanation(), ".private line 2: !.env");
+            }
+            other => panic!("negated .env: {other:?}"),
+        }
+
+        let err = Rules::parse_layered(DEFAULT_PRIVATE, "# ok\n!\n").unwrap_err();
+        assert_eq!(err.line, 2);
+        assert!(err.message.contains("empty"), "{}", err.message);
     }
 }

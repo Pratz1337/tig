@@ -17,7 +17,7 @@ use tig_core::treeops::{apply_edits, lookup, walk, Leaf};
 use tig_core::{EntryKind, ObjectId, RepoPath, Revision};
 
 use crate::keys::EpochKey;
-use crate::rules::{RuleError, Rules, Verdict};
+use crate::rules::{RuleError, RuleSource, Rules, Verdict, DEFAULT_PRIVATE};
 
 /// The file that holds the rules. It must itself stay public.
 pub const RULES_FILE: &str = ".private";
@@ -58,7 +58,12 @@ pub struct Projection {
     pub negated: Vec<RepoPath>,
 }
 
-/// Reads and parses the `.private` file of `root` (empty rules if absent).
+/// Reads the `.private` file of `root` and layers it on the built-in floor.
+///
+/// An absent or empty file still applies [`DEFAULT_PRIVATE`], so `.env` stays
+/// private. The file can add paths and can re-publish a default-private path
+/// only with an explicit `!` line. Invalid UTF-8, a non-file, or a bad rule
+/// is an error.
 pub fn rules_of(store: &dyn Store, root: &ObjectId) -> Result<Rules, ProjectError> {
     let path = RepoPath::new(RULES_FILE)?;
     match lookup(store, root, &path)? {
@@ -67,9 +72,9 @@ pub fn rules_of(store: &dyn Store, root: &ObjectId) -> Result<Rules, ProjectErro
             let text = std::str::from_utf8(&bytes).map_err(|_| {
                 tig_core::Error::Invalid(".private is invalid: expected UTF-8".into())
             })?;
-            Ok(Rules::parse(text)?)
+            Ok(Rules::parse_layered(DEFAULT_PRIVATE, text)?)
         }
-        None => Ok(Rules::empty()),
+        None => Ok(Rules::parse_layered(DEFAULT_PRIVATE, "")?),
         Some(_) => Err(tig_core::Error::Invalid(
             ".private is invalid: expected a regular file".into(),
         )
@@ -102,10 +107,15 @@ pub fn project_tree(
         }
         match rules.classify(&path) {
             Verdict::Public { rule } => {
-                if path.as_str() == RULES_FILE {
-                    // fine: the rules file is public, as it must be
-                } else if rule.is_some() {
-                    negated.push(path.clone());
+                // A built-in `!` (`.env.example` and friends) is the floor's
+                // own exception, not a user override. A `!` in the file is
+                // reported so publish can ask the first time.
+                if path.as_str() != RULES_FILE {
+                    if let Some(rule) = &rule {
+                        if rule.source == RuleSource::File {
+                            negated.push(path.clone());
+                        }
+                    }
                 }
                 public_files.push((path, leaf));
             }
@@ -291,12 +301,62 @@ mod tests {
     }
 
     #[test]
-    fn no_rules_means_everything_public_and_same_tree() {
+    fn a_public_file_keeps_the_same_tree_when_nothing_is_private() {
         let s = MemoryStore::new();
         let root = tree(&s, &[("a.txt", b"a")]);
         let proj = project_tree(&s, &root, &EpochKey::generate(group()).unwrap()).unwrap();
         assert_eq!(proj.public_tree, root);
         assert!(proj.sealed.is_empty());
+    }
+
+    #[test]
+    fn built_in_floor_hides_env_unless_the_file_negates_it() {
+        let s = MemoryStore::new();
+        let key = EpochKey::generate(group()).unwrap();
+
+        let absent = tree(&s, &[(".env", b"TOKEN=1"), ("src/main.rs", b"fn main() {}")]);
+        let proj = project_tree(&s, &absent, &key).unwrap();
+        assert_eq!(sealed_paths(&proj), vec![".env"]);
+        match rules_of(&s, &absent).unwrap().classify(&p(".env")) {
+            Verdict::Private { rule, .. } => {
+                assert_eq!(rule.source, crate::rules::RuleSource::BuiltIn);
+                assert_eq!(rule.text, ".env*");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let extra = tree(
+            &s,
+            &[
+                (".private", b"secrets/\n"),
+                (".env", b"TOKEN=1"),
+                ("secrets/a.key", b"A"),
+                ("src/main.rs", b"fn main() {}"),
+            ],
+        );
+        let proj = project_tree(&s, &extra, &key).unwrap();
+        assert_eq!(sealed_paths(&proj), vec![".env", "secrets"]);
+        assert!(proj.negated.is_empty());
+
+        let opened = tree(
+            &s,
+            &[
+                (".private", b"!.env\n"),
+                (".env", b"TOKEN=1"),
+                (".env.local", b"STILL"),
+                ("src/main.rs", b"fn main() {}"),
+            ],
+        );
+        let proj = project_tree(&s, &opened, &key).unwrap();
+        assert_eq!(sealed_paths(&proj), vec![".env.local"]);
+        assert_eq!(proj.negated, vec![p(".env")]);
+        assert_eq!(
+            lookup(&s, &proj.public_tree, &p(".env"))
+                .unwrap()
+                .unwrap()
+                .kind(),
+            EntryKind::File
+        );
     }
 
     #[test]

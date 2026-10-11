@@ -426,10 +426,18 @@ fn empty_deduplicated_symlink_and_executable_private_files_are_sealed() {
 fn absent_invalid_and_executable_rules_are_distinguished() {
     let store = MemoryStore::new();
     let key = EpochKey::generate(group("private", 1)).unwrap();
+    // No `.private` still applies the built-in floor, so `*.key` is sealed.
     let absent = tree(&store, &[("a.key", b"key")]);
+    let absent_public = project_tree(&store, &absent, &key).unwrap();
+    assert_ne!(absent_public.public_tree, absent);
+    assert_eq!(absent_public.sealed.len(), 1);
+    assert_eq!(absent_public.sealed[0].path, p("a.key"));
     assert_eq!(
-        project_tree(&store, &absent, &key).unwrap().public_tree,
-        absent
+        lookup(&store, &absent_public.public_tree, &p("a.key"))
+            .unwrap()
+            .unwrap()
+            .kind(),
+        EntryKind::Sealed
     );
     let invalid = tree(&store, &[(".private", b"[\n"), ("a.key", b"key")]);
     assert!(matches!(
