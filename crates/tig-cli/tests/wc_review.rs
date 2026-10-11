@@ -230,9 +230,21 @@ fn checkout_refuses_a_replaced_root() {
     let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
     ws.write(&repo, &path("new.txt"), b"new").unwrap();
     ws.snapshot(&mut repo).unwrap();
-    fs::rename(&root, dir.path().join("original-root")).unwrap();
+    // The store keeps its journal open; Windows will not rename a folder with
+    // an open file inside, so release the repo, move it, and reopen the store
+    // from its new place. `wc` still points at the old root path.
+    drop(repo);
+    let moved = dir.path().join("original-root");
+    fs::rename(&root, &moved).unwrap();
     let outside = TempDir::new().unwrap();
     junction(&root, outside.path());
+    let tig = moved.join(".tig");
+    let repo = tig_core::repo::Repo::load(
+        std::sync::Arc::new(tig_core::store::JournalStore::open(tig.join("store")).unwrap()),
+        std::sync::Arc::new(tig_core::ophead::FileOpHead::new(&tig)),
+        Settings::default(),
+    )
+    .unwrap();
     assert!(wc.checkout(&repo).is_err());
     assert!(!outside.path().join("new.txt").exists());
 }

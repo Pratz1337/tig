@@ -352,9 +352,33 @@ fn tig(root: &Path, args: &[&str]) -> String {
     )
 }
 
+/// Simulates a lost object: deletes its loose file, or drops its record
+/// from the object journal (`len u32 LE || kind u8 || id [32] || body`
+/// records after an 8-byte magic).
 fn remove_object(root: &Path, id: ObjectId) {
     let hex = id.to_hex();
-    fs::remove_file(root.join(".tig/store").join(&hex[..2]).join(&hex[2..])).unwrap();
+    let loose = root.join(".tig/store").join(&hex[..2]).join(&hex[2..]);
+    if loose.exists() {
+        fs::remove_file(loose).unwrap();
+        return;
+    }
+    let journal = root.join(".tig/store/journal");
+    let bytes = fs::read(&journal).unwrap();
+    let mut kept = bytes[..8].to_vec();
+    let mut pos = 8;
+    let mut found = false;
+    while pos + 37 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos + 37 + len;
+        if bytes[pos + 5..pos + 37] == id.0 {
+            found = true;
+        } else {
+            kept.extend_from_slice(&bytes[pos..end]);
+        }
+        pos = end;
+    }
+    assert!(found, "object {hex} is in neither the loose store nor the journal");
+    fs::write(&journal, kept).unwrap();
 }
 
 #[test]
@@ -455,11 +479,16 @@ fn recovery_during_reload_discards_the_lost_operation_cache() {
     fs::write(dir.path().join("work.txt"), b"after").unwrap();
     wc.snapshot(&mut repo).unwrap();
     remove_object(dir.path(), repo.op_id());
+    // Objects only go missing across a crash, i.e. in a new process (this
+    // process's journal still holds the record in memory), so reopen.
+    drop((repo, wc));
+    let (mut repo, mut wc) = WorkingCopy::open(dir.path(), Settings::default()).unwrap();
     let stats = wc.snapshot(&mut repo).unwrap();
-    assert!(stats
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("recovered operation")));
+    assert!(
+        stats.warnings.iter().any(|warning| warning.contains("recovered operation")),
+        "{:?}",
+        stats.warnings
+    );
     assert_eq!(fs::read(dir.path().join("work.txt")).unwrap(), b"after");
 }
 

@@ -4,3 +4,5 @@
 pub mod cmd;
 pub mod ui;
 pub mod wc;
+pub mod trace;
+pub mod walk;

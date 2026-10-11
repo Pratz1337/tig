@@ -21,14 +21,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ignore::WalkBuilder;
 use tig_core::encode::{Reader, Writer};
 use tig_core::index::PathIndex;
 use tig_core::object::{hash_object, EntryKind, ObjectKind};
 use tig_core::ophead::FileOpHead;
 use tig_core::path::RepoPath;
 use tig_core::repo::{Repo, Settings, DEFAULT_WORKSPACE};
-use tig_core::store::{empty_tree_id, DiskStore, StoreExt};
+use tig_core::store::{empty_tree_id, JournalStore, StoreExt};
 use tig_core::treeops::{apply_edits, diff_trees, walk, DiffEntry, Leaf};
 use tig_core::workspace::Workspace;
 use tig_core::ObjectId;
@@ -156,7 +155,7 @@ impl WorkingCopy {
         }
         fs::create_dir_all(tig_dir.join("store"))?;
         fs::create_dir_all(tig_dir.join("workspaces"))?;
-        let store = Arc::new(DiskStore::open(tig_dir.join("store"))?);
+        let store = Arc::new(JournalStore::open(tig_dir.join("store"))?);
         let op_head = Arc::new(FileOpHead::new(&tig_dir));
         let mut repo = Repo::init(store, op_head, settings)?;
 
@@ -189,17 +188,24 @@ impl WorkingCopy {
     /// Finds `.tig` (a directory, or a file pointing at one) from `start`
     /// upward and opens that workspace.
     pub fn open(start: &Path, settings: Settings) -> Result<(Repo, WorkingCopy)> {
+        let _open = crate::trace::span("open workspace");
         let start_dir = starting_dir(start)?;
         let (root, tig_dir) = find_tig(&start_dir)?;
         ensure_metadata_dirs(&tig_dir)?;
         let name = workspace_name_for(&tig_dir, &root)?;
-        let store = Arc::new(DiskStore::open(tig_dir.join("store"))?);
+        let store = Arc::new(JournalStore::open(tig_dir.join("store"))?);
         let op_head = Arc::new(FileOpHead::new(&tig_dir));
-        let repo = Repo::load(store, op_head, settings)?;
+        let repo = {
+            let _t = crate::trace::span("  load repo (op + view)");
+            Repo::load(store, op_head, settings)?
+        };
         // The view must actually have this workspace. A leftover root file
         // from a half-created workspace is not enough.
         repo.working_revision(&name)?;
-        let (state, trusted, load_warning) = load_state_file(&state_path(&tig_dir, &name))?;
+        let (state, trusted, load_warning) = {
+            let _t = crate::trace::span("  load workspace state");
+            load_state_file(&state_path(&tig_dir, &name))?
+        };
         let mut wc = WorkingCopy {
             root,
             tig_dir,
@@ -267,15 +273,28 @@ impl WorkingCopy {
 
     /// `rehash` bypasses stat cache hits without invalidating checkout state.
     pub fn snapshot_with_rehash(&mut self, repo: &mut Repo, rehash: bool) -> Result<SnapshotStats> {
+        let _snap = crate::trace::span("snapshot");
+        let pre = crate::trace::span("  snapshot: checks + reload");
         ensure_canonical_directory(&self.root)?;
         ensure_metadata_dirs(&self.tig_dir)?;
         repo.reload()?;
         self.notice_recovery(repo)?;
         let current = repo.working_revision(&self.name)?;
         let rev_tree = repo.revision(&current)?.tree;
+        drop(pre);
         let mut warnings = Vec::new();
         if let Some(warning) = &self.load_warning {
             warnings.push(warning.clone());
+        }
+        if self.trusted && self.state.working != current && state_is_ahead(repo, self.state.working, current) {
+            // Snapshot heads are not fsynced (see OpHeadStore). After a crash
+            // the repo can fall back to an older head while this state file
+            // remembers a later snapshot. The files are still on disk, so
+            // re-scan them against the repo's working revision.
+            self.trusted = false;
+            warnings.push(
+                "an unsaved snapshot was lost (crash?); re-scanning every file against the last saved state".into(),
+            );
         }
         if self.trusted && self.state.working != current {
             let before = repo.revision(&self.state.working)?;
@@ -315,6 +334,7 @@ impl WorkingCopy {
         }
 
         let mut ws = Workspace::open(repo, &self.name)?;
+        let scan = crate::trace::span("  snapshot: walk + stat + hash");
         let (mut stats, cache) = self.scan(
             repo,
             &mut ws,
@@ -322,14 +342,21 @@ impl WorkingCopy {
             rehash,
             rehash || !self.trusted,
         )?;
+        drop(scan);
         stats.changed = ws.pending().len();
         stats.warnings = warnings;
         stats.warnings.sort();
         stats.warnings.dedup();
         // `snapshot` writes one operation, or none when the overlay is empty.
-        ws.snapshot(repo)?;
+        {
+            let _t = crate::trace::span("  snapshot: write trees + operation");
+            ws.snapshot(repo)?;
+        }
         let working = ws.working_revision();
-        self.record_state(working, repo.revision(&working)?.tree, cache)?;
+        {
+            let _t = crate::trace::span("  snapshot: save workspace state");
+            self.record_state(working, repo.revision(&working)?.tree, cache)?;
+        }
         Ok(stats)
     }
 
@@ -588,6 +615,67 @@ impl WorkingCopy {
 
     /// One directory walk. Hashes a file only when the stat cache cannot
     /// prove it is unchanged.
+    /// Decides what the snapshot must do with one file, without touching
+    /// shared state, so it can run on the walk's worker threads.
+    fn classify(&self, found: crate::walk::Found<'_>, rehash: bool, baseline: &BTreeMap<RepoPath, Leaf>) -> Outcome {
+        let repo_path = match found.path {
+            Ok(path) => path,
+            Err(why) => return Outcome::Skipped(format!("skipping {why}")),
+        };
+        #[cfg(windows)]
+        if let Some(why) = path_name_block(&repo_path) {
+            // Opening `aux.c` or `TIG~1` can hit a device or `.tig`. Keep a
+            // cached row so a later snapshot does not delete it, and do not
+            // read the file.
+            let keep = self.state.cache.get(&repo_path).is_some().then(|| repo_path.clone());
+            return Outcome::Blocked(format!("skipping {repo_path}: {why}"), keep);
+        }
+        let meta = found.meta;
+        let shape = shape_of(meta);
+        if matches!(shape, Shape::Dir | Shape::Other) {
+            return Outcome::Skipped(format!("skipping special file {}", found.disk.display()));
+        }
+        let size = meta.len();
+        let mtime = observed_mtime(meta, self.now());
+        let mtime_known = mtime_parts(meta).is_some();
+        let prev = if self.trusted { self.state.cache.get(&repo_path) } else { None };
+        if let Some(prev) = prev {
+            if !rehash
+                && mtime_known
+                && !prev.racy
+                && prev.size == size
+                && prev.mtime == mtime
+                && prev.ctime == ctime_parts(meta)
+                && shape_agrees(prev, shape)
+            {
+                let (kind, stand_in) = desired_kind(meta, shape, Some(prev), None);
+                if kind == prev.kind && stand_in == prev.symlink_stand_in {
+                    return Outcome::Unchanged(repo_path);
+                }
+                let mut row = prev.clone();
+                row.kind = kind;
+                row.symlink_stand_in = stand_in;
+                return Outcome::Retyped(repo_path, row);
+            }
+        }
+        let (kind, stand_in) = desired_kind(meta, shape, prev, baseline.get(&repo_path).copied());
+        Outcome::Hash(ToHash {
+            disk: found.disk,
+            shape,
+            row: FileState {
+                size,
+                mtime,
+                ctime: ctime_parts(meta),
+                kind,
+                id: ObjectId([0; 32]), // filled in after hashing
+                racy: !mtime_known,
+                symlink_stand_in: stand_in,
+            },
+            prev: prev.cloned(),
+            repo_path,
+        })
+    }
+
     fn scan(
         &self,
         repo: &Repo,
@@ -622,124 +710,41 @@ impl WorkingCopy {
         let mut seen: BTreeSet<RepoPath> = BTreeSet::new();
         let mut to_hash: Vec<ToHash> = Vec::new();
 
-        for ent in walk_worktree(&self.root) {
-            let ent =
-                ent.map_err(|e| Error::Msg(format!("walking {}: {e}", self.root.display())))?;
-            if ent.depth() == 0 {
-                continue;
-            }
-            if let Some(err) = ent.error() {
-                warnings.push(format!("ignore rules near {}: {err}", ent.path().display()));
-            }
-            let rel = match ent.path().strip_prefix(&self.root) {
-                Ok(rel) => rel,
-                Err(_) => {
-                    return Err(Error::Msg(format!(
-                        "working-copy walk left {}: {}",
-                        self.root.display(),
-                        ent.path().display()
-                    )));
+        // One parallel walk; each file is classified on the worker threads.
+        let (outcomes, walk_warnings) = crate::walk::walk(&self.root, is_scratch_name, |found| {
+            self.classify(found, rehash, &baseline)
+        })
+        .map_err(|e| Error::Msg(format!("walking {}: {e}", self.root.display())))?;
+        warnings.extend(walk_warnings);
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Skipped(warning) => {
+                    stats.scanned += 1;
+                    warnings.push(warning);
                 }
-            };
-            if ent.path_is_symlink() {
-                // Recorded below as a symlink. Do not descend: the walker
-                // was built with `follow_links(false)`.
-            } else if ent.file_type().is_some_and(|t| t.is_dir()) {
-                continue;
-            } else if !ent.file_type().is_some_and(|t| t.is_file()) {
-                warnings.push(format!("skipping special file {}", ent.path().display()));
-                continue;
-            }
-
-            stats.scanned += 1;
-            let Some(text) = rel_to_string(rel) else {
-                warnings.push(format!(
-                    "skipping {}: path is not valid UTF-8",
-                    ent.path().display()
-                ));
-                continue;
-            };
-            let repo_path = match RepoPath::from_os_relative(&text) {
-                Ok(path) => path,
-                Err(e) => {
-                    warnings.push(format!("skipping {text}: {e}"));
-                    continue;
-                }
-            };
-            #[cfg(windows)]
-            if let Some(why) = path_name_block(&repo_path) {
-                // Opening `aux.c` or `TIG~1` can hit a device or `.tig`.
-                // Keep a cached row so a later snapshot does not delete it,
-                // and do not read the file.
-                warnings.push(format!("skipping {repo_path}: {why}"));
-                if self.state.cache.get(&repo_path).is_some() {
-                    seen.insert(repo_path);
-                }
-                continue;
-            }
-
-            let meta = ent
-                .metadata()
-                .map_err(|e| Error::Msg(format!("stat {}: {e}", ent.path().display())))?;
-            let shape = shape_of(&meta);
-            if matches!(shape, Shape::Dir | Shape::Other) {
-                warnings.push(format!("skipping special file {}", ent.path().display()));
-                continue;
-            }
-            let size = meta.len();
-            let mtime = observed_mtime(&meta, self.now());
-            let mtime_known = mtime_parts(&meta).is_some();
-            let prev = if self.trusted {
-                self.state.cache.get(&repo_path).cloned()
-            } else {
-                None
-            };
-
-            if let Some(prev) = prev.as_ref() {
-                if self.trusted
-                    && !rehash
-                    && mtime_known
-                    && !prev.racy
-                    && prev.size == size
-                    && prev.mtime == mtime
-                    && prev.ctime == ctime_parts(&meta)
-                    && shape_agrees(prev, shape)
-                {
-                    let (kind, stand_in) = desired_kind(&meta, shape, Some(prev), None);
-                    if kind != prev.kind || stand_in != prev.symlink_stand_in {
-                        let mut row = prev.clone();
-                        ws.set(repo, repo_path.clone(), Some(leaf_of(kind, row.id)?))?;
-                        row.kind = kind;
-                        row.symlink_stand_in = stand_in;
-                        cache.insert(repo_path.clone(), row);
+                Outcome::Blocked(warning, keep) => {
+                    stats.scanned += 1;
+                    warnings.push(warning);
+                    if let Some(path) = keep {
+                        seen.insert(path);
                     }
-                    seen.insert(repo_path);
-                    continue;
+                }
+                Outcome::Unchanged(path) => {
+                    stats.scanned += 1;
+                    seen.insert(path);
+                }
+                Outcome::Retyped(path, row) => {
+                    stats.scanned += 1;
+                    ws.set(repo, path.clone(), Some(leaf_of(row.kind, row.id)?))?;
+                    cache.insert(path.clone(), row);
+                    seen.insert(path);
+                }
+                Outcome::Hash(item) => {
+                    stats.scanned += 1;
+                    seen.insert(item.repo_path.clone());
+                    to_hash.push(item);
                 }
             }
-
-            let (kind, stand_in) = desired_kind(
-                &meta,
-                shape,
-                prev.as_ref(),
-                baseline.get(&repo_path).copied(),
-            );
-            seen.insert(repo_path.clone());
-            to_hash.push(ToHash {
-                repo_path,
-                disk: ent.path().to_path_buf(),
-                shape,
-                row: FileState {
-                    size,
-                    mtime,
-                    ctime: ctime_parts(&meta),
-                    kind,
-                    id: ObjectId([0; 32]), // filled in after hashing
-                    racy: !mtime_known,
-                    symlink_stand_in: stand_in,
-                },
-                prev,
-            });
         }
 
         // Reading is the slow part (on Windows, every first open of a new
@@ -935,8 +940,9 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
     let n = r.count(32).map_err(|e| e.to_string())?;
     let mut rows = Vec::with_capacity(n);
     for _ in 0..n {
-        let path = RepoPath::from_os_relative(r.str().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        // Stored paths are already normalized; validate strictly, without
+        // the OS-separator rewrite.
+        let path = RepoPath::new(r.str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         if path.is_root() {
             return Err("cache row names the workspace root".into());
         }
@@ -1532,6 +1538,20 @@ fn unix_executable(meta: &fs::Metadata) -> bool {
     meta.permissions().mode() & 0o111 != 0
 }
 
+/// What the snapshot does with one walked file (see `classify`).
+enum Outcome {
+    /// Not a usable path or file; the warning says why.
+    Skipped(String),
+    /// A Windows-reserved name: skipped, but still tracked if it was before.
+    Blocked(String, Option<RepoPath>),
+    /// The stat cache vouches for it.
+    Unchanged(RepoPath),
+    /// Same content, different kind (executable bit, symlink stand-in).
+    Retyped(RepoPath, FileState),
+    /// Must be read and hashed.
+    Hash(ToHash),
+}
+
 /// A file the stat cache could not vouch for; it must be read and hashed.
 struct ToHash {
     repo_path: RepoPath,
@@ -1828,62 +1848,6 @@ fn disk_path(root: &Path, rel: &RepoPath) -> PathBuf {
         out.push(component);
     }
     out
-}
-
-fn rel_to_string(rel: &Path) -> Option<String> {
-    let mut text = String::new();
-    for (i, component) in rel.components().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            return None;
-        };
-        let part = name.to_str()?;
-        if i > 0 {
-            text.push('/');
-        }
-        text.push_str(part);
-    }
-    Some(text)
-}
-
-fn walk_worktree(root: &Path) -> ignore::Walk {
-    // `.tigignore` uses gitignore syntax and outranks `.gitignore`.
-    // Global git excludes and `.ignore` files are off. Hidden files stay
-    // visible so `.env` is part of the working copy. Symlinks are not followed.
-    // `require_git(false)` applies `.gitignore` even though there is no `.git`.
-    WalkBuilder::new(root)
-        .standard_filters(false)
-        .hidden(false)
-        .ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .git_ignore(true)
-        .require_git(false)
-        .parents(false)
-        .follow_links(false)
-        .add_custom_ignore_filename(".tigignore")
-        .filter_entry(|ent| {
-            let name = ent.file_name();
-            if name == OsStr::new(".tig") || is_scratch_name(name) {
-                return false;
-            }
-            // Another VCS's metadata is never content. `.git/config` can
-            // hold credentials in remote URLs, so tracking it could publish
-            // them. (Covers both `.git` directories and worktree files.)
-            if [".git", ".hg", ".svn", ".jj"]
-                .iter()
-                .any(|vcs| name == OsStr::new(vcs))
-            {
-                return false;
-            }
-            // A subdirectory with its own `.tig` is another workspace or a
-            // nested repo: never sweep it into this one (git skips nested
-            // repos the same way). One stat per directory, not per file.
-            let nested = ent.depth() > 0
-                && ent.file_type().is_some_and(|t| t.is_dir())
-                && fs::symlink_metadata(ent.path().join(".tig")).is_ok();
-            !nested
-        })
-        .build()
 }
 
 fn is_scratch_name(name: &OsStr) -> bool {
@@ -2223,6 +2187,25 @@ fn system_time_from_parts(mtime: (i64, u32)) -> Option<SystemTime> {
     }
 }
 
+/// True if `recorded` (from the state file) is a later snapshot of
+/// `current` that the repo no longer points to: its object is gone, or
+/// following its predecessors (snapshots rewrite a change in place) reaches
+/// `current`. Bounded, so a long history never makes this slow.
+fn state_is_ahead(repo: &Repo, recorded: ObjectId, current: ObjectId) -> bool {
+    let mut id = recorded;
+    for _ in 0..64 {
+        let Ok(rev) = repo.revision(&id) else {
+            return true; // never synced to disk before the crash
+        };
+        match rev.predecessors.first() {
+            Some(prev) if *prev == current => return true,
+            Some(prev) => id = *prev,
+            None => return false,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2446,3 +2429,4 @@ mod tests {
         }
     }
 }
+

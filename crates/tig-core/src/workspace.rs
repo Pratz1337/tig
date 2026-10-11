@@ -238,6 +238,7 @@ impl Workspace {
         }
         let tree = apply_edits(&**repo.store(), &self.base_tree, &self.overlay)?;
         let mut tx = repo.start(format!("snapshot workspace {}", self.name));
+        tx.set_light();
         let new = tx.rewrite(self.working, |r| r.tree = tree)?;
         repo.commit(tx)?;
         self.working = new;

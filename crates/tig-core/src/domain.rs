@@ -47,3 +47,6 @@ pub const KEYRING_HEAD_SIGNATURE: &str = "tig keyring head signature v1";
 
 /// Prefix for the filesystem workspace state's BLAKE3 integrity checksum.
 pub const WORKSPACE_STATE: &[u8] = b"tig workspace state v2";
+
+/// First line of the unsynced snapshot head record (`op_head.light`).
+pub const LIGHT_OP_HEAD: &str = "tig light op head v1";

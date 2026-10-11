@@ -576,3 +576,58 @@ fn other_vcs_metadata_is_never_tracked() {
         );
     }
 }
+
+/// Ignore precedence matches git: the nearest directory decides first,
+/// `.tigignore` beats `.gitignore` in the same directory, and an ignored
+/// directory prunes everything inside it.
+#[test]
+fn ignore_precedence_matches_git() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join(".gitignore"), b"*.log\nbuild/\n").unwrap();
+    fs::create_dir_all(root.join("keep")).unwrap();
+    fs::write(root.join("keep/.gitignore"), b"!important.log\n").unwrap();
+    fs::write(root.join("keep/important.log"), b"k").unwrap();
+    fs::write(root.join("keep/other.log"), b"o").unwrap();
+    fs::write(root.join("app.log"), b"a").unwrap();
+    fs::create_dir_all(root.join("build/deep")).unwrap();
+    fs::write(root.join("build/deep/x.txt"), b"x").unwrap();
+    fs::create_dir_all(root.join("both")).unwrap();
+    fs::write(root.join("both/.gitignore"), b"!same.txt\n").unwrap();
+    fs::write(root.join("both/.tigignore"), b"same.txt\n").unwrap();
+    fs::write(root.join("both/same.txt"), b"s").unwrap();
+    fs::write(root.join("src.rs"), b"r").unwrap();
+
+    let (repo, _wc) = WorkingCopy::init(root, settings()).unwrap();
+    assert!(tracked(&repo, "src.rs").is_some());
+    assert!(tracked(&repo, "keep/important.log").is_some(), "nearer whitelist wins");
+    assert!(tracked(&repo, "keep/other.log").is_none());
+    assert!(tracked(&repo, "app.log").is_none());
+    assert!(tracked(&repo, "build/deep/x.txt").is_none(), "ignored dir prunes");
+    assert!(tracked(&repo, "both/same.txt").is_none(), ".tigignore beats .gitignore");
+}
+
+/// Snapshot heads are not fsynced. If a crash loses the light head record,
+/// the workspace state is one snapshot ahead of the repo; the next command
+/// must simply re-snapshot the files (which are still on disk), not report
+/// a stale workspace or lose anything.
+#[test]
+fn lost_unsynced_snapshot_head_is_recovered_from_disk() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.txt"), b"one").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    fs::write(dir.path().join("a.txt"), b"two").unwrap();
+    wc.snapshot(&mut repo).unwrap();
+    assert_eq!(tracked(&repo, "a.txt").unwrap(), b"two");
+
+    // Simulate the crash: the unsynced light record never reached the disk.
+    fs::remove_file(dir.path().join(".tig").join("op_head.light")).unwrap();
+
+    let (mut repo, mut wc) = WorkingCopy::open(dir.path(), settings()).unwrap();
+    // Both snapshots (init's and ours) were light, so the repo fell back to
+    // the synced head written by init, before any file was recorded.
+    assert_eq!(tracked(&repo, "a.txt"), None, "repo fell back to the synced head");
+    wc.snapshot(&mut repo).unwrap();
+    assert_eq!(tracked(&repo, "a.txt").unwrap(), b"two", "re-snapshotted from disk");
+    assert_eq!(file_bytes(&wc, "a.txt"), b"two");
+}

@@ -2,9 +2,11 @@
 //! bodies; typed helpers live on `StoreExt`.
 
 mod disk;
+mod journal;
 mod memory;
 
 pub use disk::DiskStore;
+pub use journal::JournalStore;
 pub use memory::MemoryStore;
 
 use crate::error::{Error, Result};

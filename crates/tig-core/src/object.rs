@@ -213,6 +213,11 @@ fn is_metadata_dir(name: &str) -> bool {
         '\u{202D}', '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}',
         '\u{206F}', '\u{FEFF}',
     ];
+    // Hot path (every path the walk builds): a plain ASCII name cannot hide
+    // ignorable characters, so compare without allocating.
+    if name.is_ascii() {
+        return name.eq_ignore_ascii_case(".tig");
+    }
     let visible: String = name.chars().filter(|c| !IGNORABLE.contains(c)).collect();
     visible.eq_ignore_ascii_case(".tig")
 }

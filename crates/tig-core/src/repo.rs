@@ -120,6 +120,7 @@ impl Repo {
             undo_of: None,
             base_op: None,
             skipped: Vec::new(),
+            light: false,
         };
         tx.view.heads.insert(root_revision_id());
         let wc = tx.new_change(&[root_revision_id()], "")?;
@@ -251,6 +252,7 @@ impl Repo {
             undo_of: None,
             base_op: Some(self.op_id),
             skipped: Vec::new(),
+            light: false,
         }
     }
 
@@ -272,7 +274,12 @@ impl Repo {
             ));
         }
         let (op_id, op) = tx.write_operation(Some(self.op_id))?;
-        if !self.op_head.compare_and_set(Some(self.op_id), op_id)? {
+        let moved = if tx.light {
+            self.op_head.compare_and_set_light(Some(self.op_id), op_id)?
+        } else {
+            self.op_head.compare_and_set(Some(self.op_id), op_id)?
+        };
+        if !moved {
             return Err(Error::Invalid(
                 "the repo changed while this command ran (another tig process?); run it again"
                     .into(),
@@ -501,6 +508,9 @@ pub struct Transaction {
     base_op: Option<ObjectId>,
     /// Descendants left on an older parent because rebasing would conflict.
     skipped: Vec<SkippedRebase>,
+    /// Records only what is already on disk (a working-copy snapshot), so
+    /// the head update may skip the fsync; see `OpHeadStore`.
+    light: bool,
 }
 
 /// A descendant that was not rebased onto a rewritten parent because the
@@ -517,6 +527,13 @@ fn same_store(a: &Arc<dyn Store>, b: &Arc<dyn Store>) -> bool {
 }
 
 impl Transaction {
+    /// Marks this transaction as recording only what is already on disk (a
+    /// working-copy snapshot). Its head update skips the fsync: if a crash
+    /// loses it, the next command snapshots the same files again.
+    pub fn set_light(&mut self) {
+        self.light = true;
+    }
+
     pub fn store(&self) -> &Arc<dyn Store> {
         &self.store
     }
