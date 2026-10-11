@@ -44,3 +44,6 @@ pub const GRANT_SIGNATURE: &str = "tig epoch grant signature v1";
 pub const PACK_INDEX_AAD: &[u8] = b"tig pack index v1";
 /// Prefix of the canonical encoding signed by a keyring head.
 pub const KEYRING_HEAD_SIGNATURE: &str = "tig keyring head signature v1";
+
+/// Prefix for the filesystem workspace state's BLAKE3 integrity checksum.
+pub const WORKSPACE_STATE: &[u8] = b"tig workspace state v2";

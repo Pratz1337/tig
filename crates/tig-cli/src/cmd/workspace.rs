@@ -18,7 +18,25 @@ pub(super) fn run(repository: Option<&Path>, action: WorkspaceAction) -> Result<
         } => add(repository, path, name, revision),
         WorkspaceAction::List => list(repository),
         WorkspaceAction::Forget { name } => forget(repository, &name),
+        WorkspaceAction::UpdateStale => update_stale(repository),
     }
+}
+
+fn update_stale(repository: Option<&Path>) -> Result<()> {
+    // Opening normally snapshots first, which correctly refuses a stale
+    // workspace. This command must preserve its recorded baseline instead.
+    let mut session = super::open_session(repository)?;
+    let stats = session.wc.update_stale(&mut session.repo)?;
+    for warning in stats.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(saved) = stats.saved {
+        let rev = session.repo.revision(&saved)?;
+        let label = RevLabel::from_revision(&session.repo, saved, &rev, &[]);
+        println!("saved local edits as {}", label.line());
+    }
+    println!("workspace updated to its current working revision");
+    super::announce(&session)
 }
 
 fn add(
@@ -105,7 +123,7 @@ fn directory_name(path: &Path) -> Result<String> {
 }
 
 /// The main `.tig` directory. A secondary workspace's `.tig` is a pointer file.
-fn main_tig_dir(root: &Path) -> Result<PathBuf> {
+pub(super) fn main_tig_dir(root: &Path) -> Result<PathBuf> {
     let pointer = root.join(".tig");
     let meta = fs::symlink_metadata(&pointer)
         .map_err(|err| CliError::msg(format!("cannot read {}: {err}", pointer.display())))?;

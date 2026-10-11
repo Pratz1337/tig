@@ -5,16 +5,25 @@
 mod abandon;
 mod bookmark;
 mod cat;
+mod clone;
 mod describe;
 mod diff;
+mod disk;
 mod edit;
+mod fetch;
+mod grant;
+mod identity;
 mod init;
 mod log;
 #[path = "new.rs"]
 mod new_change;
 mod op;
+mod publish;
+mod remote;
+mod revoke;
 mod settings;
 mod show;
+mod snapshot;
 mod status;
 mod undo;
 mod why;
@@ -77,6 +86,56 @@ impl From<std::io::Error> for CliError {
     }
 }
 
+impl From<tig_private::publish::PublishError> for CliError {
+    fn from(err: tig_private::publish::PublishError) -> Self {
+        use tig_private::publish::PublishError;
+        let message = match &err {
+            PublishError::AlreadyLeaked { paths } => format!(
+                "already leaked; rotate these paths: {}\npass --acknowledge-leaked to seal them from now on",
+                join_repo_paths(paths)
+            ),
+            PublishError::NegationNeedsConfirmation { paths } => format!(
+                "a negation makes these paths public; confirm them: {}\npass --confirm-negations to publish them",
+                join_repo_paths(paths)
+            ),
+            _ => err.to_string(),
+        };
+        CliError::msg(message)
+    }
+}
+
+impl From<tig_private::fetch::FetchError> for CliError {
+    fn from(err: tig_private::fetch::FetchError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+impl From<tig_private::keyring::KeyringError> for CliError {
+    fn from(err: tig_private::keyring::KeyringError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+impl From<tig_private::remote::RemoteError> for CliError {
+    fn from(err: tig_private::remote::RemoteError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+impl From<tig_private::keys::KeyError> for CliError {
+    fn from(err: tig_private::keys::KeyError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+fn join_repo_paths(paths: &[RepoPath]) -> String {
+    paths
+        .iter()
+        .map(RepoPath::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub type Result<T> = std::result::Result<T, CliError>;
 
 struct Session {
@@ -121,7 +180,12 @@ fn open_ready(repository: Option<&Path>) -> Result<(Session, ObjectId)> {
 /// version of its parent; say so, so nothing changes silently.
 fn report_skipped(repo: &tig_core::repo::Repo) {
     for skipped in repo.last_skipped_rebases() {
-        let paths: Vec<String> = skipped.paths.iter().take(5).map(|p| p.to_string()).collect();
+        let paths: Vec<String> = skipped
+            .paths
+            .iter()
+            .take(5)
+            .map(|p| p.to_string())
+            .collect();
         eprintln!(
             "warning: change {} was not rebased onto this edit because it would conflict in {}; it stays on the previous version (conflict support is coming)",
             skipped.change.short(8),
@@ -195,6 +259,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Cmd::Init { dir } => init::run(repository, dir)?,
         Cmd::Status => status::run(repository)?,
+        Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
         Cmd::Log { limit } => log::run(repository, limit)?,
         Cmd::Show { revision } => show::run(repository, revision.as_deref())?,
@@ -210,6 +275,26 @@ pub fn run() -> Result<()> {
         Cmd::Bookmark { action } => bookmark::run(repository, action)?,
         Cmd::Cat { path, revision } => cat::run(repository, &path, revision.as_deref())?,
         Cmd::Why { path } => why::run(repository, &path)?,
+        Cmd::Identity { show } => identity::run(show)?,
+        Cmd::Remote { action } => remote::run(repository, action)?,
+        Cmd::Publish {
+            remote,
+            bookmark,
+            revision,
+            acknowledge_leaked,
+            confirm_negations,
+        } => publish::run(
+            repository,
+            remote,
+            bookmark,
+            revision,
+            acknowledge_leaked,
+            confirm_negations,
+        )?,
+        Cmd::Fetch { remote } => fetch::run(repository, remote)?,
+        Cmd::Clone { path, dir } => clone::run(repository, path, dir)?,
+        Cmd::Grant { remote, token } => grant::run(repository, remote, token)?,
+        Cmd::Revoke { remote, token } => revoke::run(repository, remote, token)?,
     }
     Ok(())
 }
@@ -234,6 +319,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Record the disk in the working change
+    Snapshot {
+        /// Re-read every file instead of using the stat cache
+        #[arg(long)]
+        rehash: bool,
+    },
     /// Create a repository
     Init {
         /// Directory to create. Defaults to the current directory.
@@ -319,10 +410,66 @@ enum Cmd {
         /// Path to classify
         path: String,
     },
+    /// Show or create your identity
+    Identity {
+        /// Show the identity without creating one
+        #[arg(long)]
+        show: bool,
+    },
+    /// Directory remotes
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+    /// Publish a revision to a remote
+    Publish {
+        /// Remote name
+        remote: String,
+        /// Bookmark to publish. Defaults to `main`.
+        #[arg(short = 'b', long = "bookmark", default_value = "main")]
+        bookmark: String,
+        /// Revision to publish. Defaults to `@`, or `@-` when `@` is empty.
+        #[arg(short = 'r', long = "revision", value_name = "REV")]
+        revision: Option<String>,
+        /// Seal paths that were already published in the clear
+        #[arg(long)]
+        acknowledge_leaked: bool,
+        /// Publish paths a `!` rule makes public
+        #[arg(long)]
+        confirm_negations: bool,
+    },
+    /// Fetch bookmarks from a remote
+    Fetch {
+        /// Remote name
+        remote: String,
+    },
+    /// Copy a remote into a new repository
+    Clone {
+        /// Remote directory to copy
+        path: PathBuf,
+        /// Directory for the new repository
+        dir: PathBuf,
+    },
+    /// Grant a person access to a remote
+    Grant {
+        /// Remote name
+        remote: String,
+        /// Their `tig identity` token
+        token: String,
+    },
+    /// Revoke a person's access to a remote
+    Revoke {
+        /// Remote name
+        remote: String,
+        /// Their `tig identity` token
+        token: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum OpAction {
+    /// Verify stored content and recover the newest complete operation
+    Recover,
     /// List operations, newest first
     Log {
         /// Show at most N operations
@@ -338,6 +485,8 @@ enum OpAction {
 
 #[derive(Subcommand)]
 enum WorkspaceAction {
+    /// Update a stale workspace, saving any disk edits as a separate change
+    UpdateStale,
     /// Create a workspace at PATH
     Add {
         /// Directory for the new workspace
@@ -373,6 +522,24 @@ enum BookmarkAction {
     /// Remove a bookmark
     Delete {
         /// Bookmark name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Remember a remote directory
+    Add {
+        /// Remote name
+        name: String,
+        /// Path of the remote directory
+        path: PathBuf,
+    },
+    /// List remotes
+    List,
+    /// Forget a remote. Does not delete its files.
+    Remove {
+        /// Remote name
         name: String,
     },
 }

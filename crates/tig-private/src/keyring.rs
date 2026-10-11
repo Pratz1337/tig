@@ -188,6 +188,35 @@ impl Keyring {
         Ok((keyring, owner_keys))
     }
 
+    /// Initial keyring whose `private` epoch-1 secret is already in `keys`.
+    ///
+    /// The wrap is fresh; the epoch secret is not. Publish uses this when the
+    /// caller saved [`OwnerKeys`] before any keyring file exists, then writes
+    /// the result only after refusal checks. The owner still reads the epoch
+    /// from `keys`, not from the new self-grant.
+    pub fn from_saved_owner(owner: &Identity, keys: &OwnerKeys) -> Result<Self, KeyringError> {
+        if keys.keys.len() != 1 {
+            return Err(KeyringError::Invalid(
+                "a new remote keyring needs the first epoch key and no later ones".into(),
+            ));
+        }
+        let key = require_epoch_key(keys, keys.remote, 1)?;
+        let self_grant = grant(key, &owner.public(), owner)?;
+        let mut head = SignedHead {
+            remote: keys.remote,
+            counter: 1,
+            epochs: BTreeMap::from([(PRIVATE_GROUP.to_string(), 1)]),
+            signature: [0; 64],
+        };
+        head.signature = owner.sign(&head.signing_bytes());
+        Ok(Keyring {
+            remote: keys.remote,
+            owner: owner.public(),
+            head,
+            grants: vec![self_grant],
+        })
+    }
+
     /// Grants `member` the current `private` epoch and advances the head.
     pub fn grant(
         &mut self,
@@ -632,6 +661,26 @@ fn require_epoch_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_owner_keys_rebuild_the_same_epoch_secret() {
+        let owner = Identity::generate().unwrap();
+        let (created, keys) = Keyring::create([3; 16], &owner).unwrap();
+        let rebuilt = Keyring::from_saved_owner(&owner, &keys).unwrap();
+        assert_eq!(rebuilt.remote, created.remote);
+        assert_eq!(rebuilt.owner, owner.public());
+        assert_eq!(rebuilt.head.counter, 1);
+        assert_eq!(rebuilt.head.epochs, created.head.epochs);
+        let opened = rebuilt
+            .verify(&owner.public().signing, 0)
+            .unwrap()
+            .key_for(PRIVATE_GROUP, 1, &owner)
+            .unwrap();
+        let original = keys.keys.get(&(PRIVATE_GROUP.to_string(), 1)).unwrap();
+        assert_eq!(opened.to_bytes(), original.to_bytes());
+        // The self-grant wrap is fresh, so the files differ.
+        assert_ne!(rebuilt.encode().unwrap(), created.encode().unwrap());
+    }
 
     #[test]
     fn noncanonical_and_unsorted_epochs_are_refused() {

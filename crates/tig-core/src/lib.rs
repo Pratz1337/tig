@@ -12,6 +12,7 @@ pub mod merge;
 pub mod object;
 pub mod ophead;
 pub mod path;
+mod recovery;
 pub mod repo;
 pub mod seal;
 pub mod store;

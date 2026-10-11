@@ -29,7 +29,7 @@ use tig_core::ophead::FileOpHead;
 use tig_core::path::RepoPath;
 use tig_core::repo::{Repo, Settings, DEFAULT_WORKSPACE};
 use tig_core::store::{empty_tree_id, DiskStore, StoreExt};
-use tig_core::treeops::{diff_trees, walk, DiffEntry, Leaf};
+use tig_core::treeops::{apply_edits, diff_trees, walk, DiffEntry, Leaf};
 use tig_core::workspace::Workspace;
 use tig_core::ObjectId;
 use tig_private::rules::PRIVATE_FILE_TEMPLATE;
@@ -38,7 +38,7 @@ use tig_private::rules::PRIVATE_FILE_TEMPLATE;
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
 const STATE_MAGIC: &[u8; 4] = b"TIGW";
-const STATE_VERSION: u8 = 1;
+const STATE_VERSION: u8 = 2;
 const FLAG_RACY: u8 = 0b01;
 const FLAG_STAND_IN: u8 = 0b10;
 
@@ -76,6 +76,14 @@ pub struct CheckoutStats {
     pub removed: usize,
 }
 
+/// A stale workspace update preserves local edits in a separate change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateStaleStats {
+    pub saved: Option<ObjectId>,
+    pub checkout: CheckoutStats,
+    pub warnings: Vec<String>,
+}
+
 /// One stat-cache row: what we believe is on disk for a path.
 ///
 /// `mtime` is `(seconds, nanoseconds)` since the Unix epoch. Nanoseconds are
@@ -92,6 +100,8 @@ pub struct CheckoutStats {
 pub struct FileState {
     pub size: u64,
     pub mtime: (i64, u32),
+    /// Unix change-time also detects edits which restore size and mtime.
+    pub ctime: Option<(i64, u32)>,
     pub kind: EntryKind,
     pub id: ObjectId,
     pub racy: bool,
@@ -190,18 +200,17 @@ impl WorkingCopy {
         // from a half-created workspace is not enough.
         repo.working_revision(&name)?;
         let (state, trusted, load_warning) = load_state_file(&state_path(&tig_dir, &name))?;
-        Ok((
-            repo,
-            WorkingCopy {
-                root,
-                tig_dir,
-                name,
-                state,
-                trusted,
-                load_warning,
-                clock: None,
-            },
-        ))
+        let mut wc = WorkingCopy {
+            root,
+            tig_dir,
+            name,
+            state,
+            trusted,
+            load_warning,
+            clock: None,
+        };
+        wc.notice_recovery(&repo)?;
+        Ok((repo, wc))
     }
 
     pub fn root(&self) -> &Path {
@@ -210,6 +219,31 @@ impl WorkingCopy {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Discards the stat cache without changing files in the working directory.
+    /// Persist this before a later command can trust the old revision again.
+    pub fn invalidate_state(&mut self) -> Result<()> {
+        match fs::remove_file(state_path(&self.tig_dir, &self.name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.state = WcState::blank();
+        self.trusted = false;
+        Ok(())
+    }
+
+    fn notice_recovery(&mut self, repo: &Repo) -> Result<()> {
+        if let Some(lost) = repo.recovered_from() {
+            self.invalidate_state()?;
+            self.load_warning = Some(format!(
+                "recovered operation {} to {}; files on disk preserved; re-scanning every file",
+                lost.short(12),
+                repo.op_id().short(12)
+            ));
+        }
+        Ok(())
     }
 
     /// Overrides the clock used for the racy-git window.
@@ -228,9 +262,15 @@ impl WorkingCopy {
     /// against the old revision would drop that move, so this returns an
     /// error telling you to run `tig workspace update-stale`.
     pub fn snapshot(&mut self, repo: &mut Repo) -> Result<SnapshotStats> {
+        self.snapshot_with_rehash(repo, false)
+    }
+
+    /// `rehash` bypasses stat cache hits without invalidating checkout state.
+    pub fn snapshot_with_rehash(&mut self, repo: &mut Repo, rehash: bool) -> Result<SnapshotStats> {
         ensure_canonical_directory(&self.root)?;
         ensure_metadata_dirs(&self.tig_dir)?;
         repo.reload()?;
+        self.notice_recovery(repo)?;
         let current = repo.working_revision(&self.name)?;
         let rev_tree = repo.revision(&current)?.tree;
         let mut warnings = Vec::new();
@@ -238,6 +278,27 @@ impl WorkingCopy {
             warnings.push(warning.clone());
         }
         if self.trusted && self.state.working != current {
+            let before = repo.revision(&self.state.working)?;
+            let after = repo.revision(&current)?;
+            // Only a direct, content-only rewrite can be a completed snapshot
+            // whose state save failed. Moves, descriptions and rebases require
+            // an explicit stale update even if the disk happens to match.
+            if before.tree == self.state.tree
+                && after.predecessors == [self.state.working]
+                && after.change_id == before.change_id
+                && after.parents == before.parents
+                && after.description == before.description
+            {
+                let mut ws = Workspace::at_revision(repo, &self.name, self.state.working)?;
+                let (mut stats, cache) = self.scan(repo, &mut ws, &mut warnings, rehash, true)?;
+                let tree = apply_edits(repo.store().as_ref(), &self.state.tree, ws.pending())?;
+                if tree == rev_tree {
+                    warnings.push("recovered workspace state after a completed snapshot".into());
+                    self.record_state(current, tree, cache)?;
+                    stats.warnings = warnings;
+                    return Ok(stats);
+                }
+            }
             return Err(Error::Msg(format!(
                 "workspace is stale; run `tig workspace update-stale` ({})",
                 self.name
@@ -254,22 +315,87 @@ impl WorkingCopy {
         }
 
         let mut ws = Workspace::open(repo, &self.name)?;
-        let (mut stats, cache) = self.scan(repo, &mut ws, &mut warnings)?;
+        let (mut stats, cache) = self.scan(
+            repo,
+            &mut ws,
+            &mut warnings,
+            rehash,
+            rehash || !self.trusted,
+        )?;
         stats.changed = ws.pending().len();
         stats.warnings = warnings;
         stats.warnings.sort();
         stats.warnings.dedup();
         // `snapshot` writes one operation, or none when the overlay is empty.
         ws.snapshot(repo)?;
-        self.state.working = ws.working_revision();
-        self.state.tree = repo.revision(&self.state.working)?.tree;
-        self.state.cache = cache;
-        let now = self.now();
-        mark_racy(&mut self.state.cache, now);
-        self.save_state()?;
-        self.trusted = true;
-        self.load_warning = None;
+        let working = ws.working_revision();
+        self.record_state(working, repo.revision(&working)?.tree, cache)?;
         Ok(stats)
+    }
+
+    /// Preserves disk edits against the recorded revision in a new change,
+    /// then checks out the repo's current working revision. Never rewrites
+    /// that revision with content from the stale directory.
+    pub fn update_stale(&mut self, repo: &mut Repo) -> Result<UpdateStaleStats> {
+        ensure_canonical_directory(&self.root)?;
+        ensure_metadata_dirs(&self.tig_dir)?;
+        repo.reload()?;
+        if !self.trusted {
+            return Err(Error::Msg(
+                "workspace state is unusable; cannot identify the base of stale edits; snapshot the working copy before checkout".into(),
+            ));
+        }
+        let current = repo.working_revision(&self.name)?;
+        if current == self.state.working {
+            return Ok(UpdateStaleStats {
+                saved: None,
+                checkout: CheckoutStats {
+                    written: 0,
+                    removed: 0,
+                },
+                warnings: Vec::new(),
+            });
+        }
+        if repo.revision(&self.state.working)?.tree != self.state.tree {
+            return Err(Error::Msg("workspace state tree does not match its recorded revision; cannot identify the base of stale edits".into()));
+        }
+        let mut ws = Workspace::at_revision(repo, &self.name, self.state.working)?;
+        let mut warnings = Vec::new();
+        // This is a destructive checkout boundary: re-read tracked files,
+        // including ignored ones, so restored timestamps cannot lose edits.
+        let (_, cache) = self.scan(repo, &mut ws, &mut warnings, true, true)?;
+        let tree = apply_edits(repo.store().as_ref(), &self.state.tree, ws.pending())?;
+        let saved = if tree != self.state.tree {
+            let mut tx = repo.start(format!("save stale workspace {}", self.name));
+            let change = tx.new_change(
+                &[self.state.working],
+                "saved working copy before updating stale workspace",
+            )?;
+            let saved = tx.rewrite(change, |rev| rev.tree = tree)?;
+            repo.commit(tx)?;
+            self.record_state(saved, tree, cache).map_err(|err| {
+                Error::Msg(format!(
+                    "saved local edits as {}; could not save workspace state: {err}",
+                    saved.short(12)
+                ))
+            })?;
+            Some(saved)
+        } else {
+            self.state.cache = cache;
+            None
+        };
+        let checkout = self.checkout(repo).map_err(|err| match saved {
+            Some(id) => Error::Msg(format!(
+                "saved local edits as {}; stale checkout failed: {err}",
+                id.short(12)
+            )),
+            None => err,
+        })?;
+        Ok(UpdateStaleStats {
+            saved,
+            checkout,
+            warnings,
+        })
     }
 
     /// Makes the disk match the repo's current working revision.
@@ -288,7 +414,18 @@ impl WorkingCopy {
         }
         let current = repo.working_revision(&self.name)?;
         let new_tree = repo.revision(&current)?.tree;
-        let diff = diff_trees(repo.store().as_ref(), &self.state.tree, &new_tree)?;
+        if new_tree == self.state.tree {
+            self.record_state(current, new_tree, self.state.cache.clone())?;
+            return Ok(CheckoutStats {
+                written: 0,
+                removed: 0,
+            });
+        }
+        let diff = on_disk(diff_trees(
+            repo.store().as_ref(),
+            &self.state.tree,
+            &new_tree,
+        )?);
         let final_paths = final_tree_paths(&self.state.cache, &diff);
         preflight(self.root(), &final_paths, &diff)?;
         let deleted: BTreeSet<&RepoPath> = diff
@@ -339,6 +476,7 @@ impl WorkingCopy {
                 FileState {
                     size: meta.len(),
                     mtime,
+                    ctime: ctime_parts(&meta),
                     kind: leaf.kind(),
                     id: leaf.id(),
                     racy: false,
@@ -423,6 +561,31 @@ impl WorkingCopy {
         Ok(())
     }
 
+    fn record_state(
+        &mut self,
+        working: ObjectId,
+        tree: ObjectId,
+        mut cache: PathIndex<FileState>,
+    ) -> Result<()> {
+        mark_racy(&mut cache, self.now());
+        if self.trusted
+            && self.state.working == working
+            && self.state.tree == tree
+            && self.state.cache.iter().eq(cache.iter())
+            && state_path(&self.tig_dir, &self.name).try_exists()?
+        {
+            self.load_warning = None;
+            return Ok(());
+        }
+        self.state.working = working;
+        self.state.tree = tree;
+        self.state.cache = cache;
+        self.save_state()?;
+        self.trusted = true;
+        self.load_warning = None;
+        Ok(())
+    }
+
     /// One directory walk. Hashes a file only when the stat cache cannot
     /// prove it is unchanged.
     fn scan(
@@ -430,6 +593,8 @@ impl WorkingCopy {
         repo: &Repo,
         ws: &mut Workspace,
         warnings: &mut Vec<String>,
+        rehash: bool,
+        include_tracked: bool,
     ) -> Result<(SnapshotStats, PathIndex<FileState>)> {
         let mut stats = SnapshotStats {
             scanned: 0,
@@ -437,7 +602,23 @@ impl WorkingCopy {
             changed: 0,
             warnings: Vec::new(),
         };
-        let mut cache = PathIndex::new();
+        let mut cache = if self.trusted {
+            self.state.cache.clone()
+        } else {
+            PathIndex::new()
+        };
+        // Recover representation hints from the verified tree when the stat
+        // cache is unavailable. Windows cannot infer executable bits or a
+        // symlink stand-in from a regular file's metadata.
+        let baseline: BTreeMap<RepoPath, Leaf> = if self.trusted {
+            BTreeMap::new()
+        } else {
+            let tree = repo.revision(&ws.working_revision())?.tree;
+            walk(repo.store().as_ref(), &tree, &RepoPath::root())?
+                .into_iter()
+                .filter(|(_, leaf)| leaf.is_file_like())
+                .collect()
+        };
         let mut seen: BTreeSet<RepoPath> = BTreeSet::new();
         let mut to_hash: Vec<ToHash> = Vec::new();
 
@@ -491,8 +672,7 @@ impl WorkingCopy {
                 // Keep a cached row so a later snapshot does not delete it,
                 // and do not read the file.
                 warnings.push(format!("skipping {repo_path}: {why}"));
-                if let Some(prev) = self.state.cache.get(&repo_path) {
-                    cache.insert(repo_path.clone(), prev.clone());
+                if self.state.cache.get(&repo_path).is_some() {
                     seen.insert(repo_path);
                 }
                 continue;
@@ -517,26 +697,33 @@ impl WorkingCopy {
 
             if let Some(prev) = prev.as_ref() {
                 if self.trusted
+                    && !rehash
                     && mtime_known
                     && !prev.racy
                     && prev.size == size
                     && prev.mtime == mtime
+                    && prev.ctime == ctime_parts(&meta)
                     && shape_agrees(prev, shape)
                 {
-                    let (kind, stand_in) = desired_kind(&meta, shape, Some(prev));
-                    let mut row = prev.clone();
-                    if kind != row.kind || stand_in != row.symlink_stand_in {
+                    let (kind, stand_in) = desired_kind(&meta, shape, Some(prev), None);
+                    if kind != prev.kind || stand_in != prev.symlink_stand_in {
+                        let mut row = prev.clone();
                         ws.set(repo, repo_path.clone(), Some(leaf_of(kind, row.id)?))?;
                         row.kind = kind;
                         row.symlink_stand_in = stand_in;
+                        cache.insert(repo_path.clone(), row);
                     }
-                    cache.insert(repo_path.clone(), row);
                     seen.insert(repo_path);
                     continue;
                 }
             }
 
-            let (kind, stand_in) = desired_kind(&meta, shape, prev.as_ref());
+            let (kind, stand_in) = desired_kind(
+                &meta,
+                shape,
+                prev.as_ref(),
+                baseline.get(&repo_path).copied(),
+            );
             seen.insert(repo_path.clone());
             to_hash.push(ToHash {
                 repo_path,
@@ -545,6 +732,7 @@ impl WorkingCopy {
                 row: FileState {
                     size,
                     mtime,
+                    ctime: ctime_parts(&meta),
                     kind,
                     id: ObjectId([0; 32]), // filled in after hashing
                     racy: !mtime_known,
@@ -561,7 +749,12 @@ impl WorkingCopy {
         let ids = hash_in_parallel(repo.store().as_ref(), &to_hash)?;
         for (item, id) in to_hash.into_iter().zip(ids) {
             stats.hashed += 1;
-            let ToHash { repo_path, mut row, prev, .. } = item;
+            let ToHash {
+                repo_path,
+                mut row,
+                prev,
+                ..
+            } = item;
             row.id = id;
             let unchanged = self.trusted
                 && prev
@@ -582,25 +775,62 @@ impl WorkingCopy {
                 self.state
                     .cache
                     .iter()
-                    .map(|(path, _)| path.clone())
-                    .filter(|path| !seen.contains(path)),
+                    .filter(|(path, _)| !seen.contains(*path))
+                    .map(|(path, _)| path.clone()),
             );
         } else {
-            let base = repo.revision(&ws.working_revision())?.tree;
             absent.extend(
-                walk(repo.store().as_ref(), &base, &RepoPath::root())?
-                    .into_iter()
-                    .map(|(path, _)| path)
-                    .filter(|path| !seen.contains(path)),
+                baseline
+                    .keys()
+                    .filter(|path| !seen.contains(*path))
+                    .cloned(),
             );
         }
         for path in absent {
             let disk = disk_path(&self.root, &path);
             match symlink_metadata_kind(&disk)? {
-                None => ws.remove(repo, &path)?,
+                None => {
+                    ws.remove(repo, &path)?;
+                    cache.remove(&path);
+                }
                 Some(_) => {
-                    if let Some(prev) = self.state.cache.get(&path) {
-                        cache.insert(path, prev.clone());
+                    if include_tracked {
+                        ensure_ancestors_safe(&self.root, &path, &BTreeSet::new())?;
+                        let meta = fs::symlink_metadata(&disk)?;
+                        let shape = shape_of(&meta);
+                        if shape == Shape::Dir {
+                            if !seen.iter().any(|seen| seen.starts_with(&path)) {
+                                ws.remove(repo, &path)?;
+                            }
+                            cache.remove(&path);
+                            continue;
+                        }
+                        if shape == Shape::Other {
+                            return Err(dirty(&path, "is no longer a file"));
+                        }
+                        if shape != Shape::Symlink {
+                            ensure_not_metadata_alias(&disk)?;
+                        }
+                        let prev = self.state.cache.get(&path);
+                        let (kind, stand_in) =
+                            desired_kind(&meta, shape, prev, baseline.get(&path).copied());
+                        let id = repo.store().put_blob(&read_shape(&disk, shape)?)?;
+                        stats.scanned += 1;
+                        stats.hashed += 1;
+                        ws.set(repo, path.clone(), Some(leaf_of(kind, id)?))?;
+                        cache.insert(
+                            path,
+                            FileState {
+                                size: meta.len(),
+                                mtime: observed_mtime(&meta, self.now()),
+                                ctime: ctime_parts(&meta),
+                                kind,
+                                id,
+                                racy: mtime_parts(&meta).is_none(),
+                                symlink_stand_in: stand_in,
+                            },
+                        );
+                        continue;
                     }
                 }
             }
@@ -642,17 +872,20 @@ fn encode_state(state: &WcState) -> Vec<u8> {
     body.u8(STATE_VERSION);
     body.id(&state.working);
     body.id(&state.tree);
-    let rows: Vec<_> = state
-        .cache
-        .iter()
-        .map(|(path, row)| (path.clone(), row.clone()))
-        .collect();
-    body.varint(rows.len() as u64);
-    for (path, row) in &rows {
+    body.varint(state.cache.len() as u64);
+    for (path, row) in state.cache.iter() {
         body.str(path.as_str());
         body.varint(row.size);
         body.ivarint(row.mtime.0);
         body.varint(u64::from(row.mtime.1));
+        match row.ctime {
+            Some((secs, nanos)) => {
+                body.u8(1);
+                body.ivarint(secs);
+                body.varint(u64::from(nanos));
+            }
+            None => body.u8(0),
+        }
         body.u8(kind_byte(row.kind));
         body.id(&row.id);
         let mut flags = 0u8;
@@ -664,23 +897,38 @@ fn encode_state(state: &WcState) -> Vec<u8> {
         }
         body.u8(flags);
     }
-    let mut out = Vec::with_capacity(4 + body.buf.len());
+    let mut out = Vec::with_capacity(4 + body.buf.len() + 32);
     out.extend_from_slice(STATE_MAGIC);
     out.extend_from_slice(&body.finish());
+    let checksum = state_checksum(&out);
+    out.extend_from_slice(&checksum.0);
     out
+}
+
+fn state_checksum(payload: &[u8]) -> ObjectId {
+    let mut bytes = tig_core::domain::WORKSPACE_STATE.to_vec();
+    bytes.extend_from_slice(payload);
+    hash_object(ObjectKind::Blob, &bytes)
 }
 
 fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
     if bytes.len() < 5 || &bytes[..4] != STATE_MAGIC {
         return Err("bad magic; delete the state file and let tig re-scan".into());
     }
-    let mut r = Reader::new(&bytes[4..], "workspace state");
-    let version = r.u8().map_err(|e| e.to_string())?;
+    let version = bytes[4];
     if version != STATE_VERSION {
         return Err(format!(
             "unsupported version {version}; delete the state file and let tig re-scan"
         ));
     }
+    if bytes.len() < 37 {
+        return Err("missing checksum".into());
+    }
+    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+    if state_checksum(payload).0 != checksum {
+        return Err("checksum mismatch".into());
+    }
+    let mut r = Reader::new(&payload[5..], "workspace state");
     let working = r.id().map_err(|e| e.to_string())?;
     let tree = r.id().map_err(|e| e.to_string())?;
     // Each row carries a 32-byte id, so a huge count cannot allocate forever.
@@ -698,6 +946,18 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         if nanos > 999_999_999 {
             return Err("mtime nanoseconds out of range".into());
         }
+        let ctime = match r.u8().map_err(|e| e.to_string())? {
+            0 => None,
+            1 => {
+                let secs = r.ivarint().map_err(|e| e.to_string())?;
+                let nanos = r.varint().map_err(|e| e.to_string())?;
+                if nanos > 999_999_999 {
+                    return Err("ctime nanoseconds out of range".into());
+                }
+                Some((secs, nanos as u32))
+            }
+            other => return Err(format!("invalid ctime marker {other}")),
+        };
         let kind = kind_from_byte(r.u8().map_err(|e| e.to_string())?)?;
         let id = r.id().map_err(|e| e.to_string())?;
         let flags = r.u8().map_err(|e| e.to_string())?;
@@ -712,6 +972,7 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
             FileState {
                 size,
                 mtime: (secs, nanos as u32),
+                ctime,
                 kind,
                 id,
                 racy: flags & FLAG_RACY != 0,
@@ -760,27 +1021,48 @@ fn leaf_of(kind: EntryKind, id: ObjectId) -> Result<Leaf> {
 
 fn mark_racy(cache: &mut PathIndex<FileState>, now: SystemTime) {
     let cutoff = now.checked_sub(RACY_WINDOW);
-    let rows: Vec<_> = cache
+    let changed: Vec<_> = cache
         .iter()
-        .map(|(path, row)| (path.clone(), row.clone()))
-        .collect();
-    for (path, mut row) in rows {
-        let racy = match system_time_from_parts(row.mtime) {
-            Some(mtime) => match cutoff {
-                Some(cutoff) => mtime >= cutoff,
-                // `now` itself is within the window of the epoch.
+        .filter_map(|(path, row)| {
+            let racy = match system_time_from_parts(row.mtime) {
+                Some(mtime) => match cutoff {
+                    Some(cutoff) => mtime >= cutoff,
+                    // `now` itself is within the window of the epoch.
+                    None => true,
+                },
                 None => true,
-            },
-            None => true,
-        };
-        if row.racy != racy {
-            row.racy = racy;
-            cache.insert(path, row);
-        }
+            };
+            if row.racy != racy {
+                let mut row = row.clone();
+                row.racy = racy;
+                Some((path.clone(), row))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (path, row) in changed {
+        cache.insert(path, row);
     }
 }
 
 // --- checkout safety -------------------------------------------------------
+
+/// The part of a tree diff that touches the disk. A sealed entry (private
+/// content this person cannot open) is never materialized, so on disk it is
+/// "nothing": sealed -> sealed changes vanish, file -> sealed is a delete,
+/// sealed -> file is a write.
+fn on_disk(diff: Vec<DiffEntry>) -> Vec<DiffEntry> {
+    let visible = |leaf: Option<Leaf>| leaf.filter(|l| l.is_file_like());
+    diff.into_iter()
+        .map(|d| DiffEntry {
+            path: d.path,
+            old: visible(d.old),
+            new: visible(d.new),
+        })
+        .filter(|d| d.old.is_some() || d.new.is_some())
+        .collect()
+}
 
 fn final_tree_paths(cache: &PathIndex<FileState>, diff: &[DiffEntry]) -> BTreeSet<RepoPath> {
     let mut paths: BTreeSet<RepoPath> = cache.iter().map(|(path, _)| path.clone()).collect();
@@ -1079,7 +1361,7 @@ fn ensure_clean(
     let bytes = read_shape(&disk, shape)?;
     let id = hash_object(ObjectKind::Blob, &bytes);
     if let Some(leaf) = change.old {
-        let (kind, _) = desired_kind(&meta, shape, cache.get(&change.path));
+        let (kind, _) = desired_kind(&meta, shape, cache.get(&change.path), None);
         if leaf.id() == id && leaf.kind() == kind && leaf_matches_shape(leaf, shape) {
             return Ok(());
         }
@@ -1180,7 +1462,14 @@ fn shape_agrees(row: &FileState, shape: Shape) -> bool {
 /// Kind to record for `meta`. On Windows an executable stays executable,
 /// and a symlink stand-in stays a symlink, including after the bytes change:
 /// the disk has no other way to say which it was.
-fn desired_kind(meta: &fs::Metadata, shape: Shape, prev: Option<&FileState>) -> (EntryKind, bool) {
+fn desired_kind(
+    meta: &fs::Metadata,
+    shape: Shape,
+    prev: Option<&FileState>,
+    baseline: Option<Leaf>,
+) -> (EntryKind, bool) {
+    #[cfg(unix)]
+    let _ = baseline;
     match shape {
         Shape::Symlink => (EntryKind::Symlink, false),
         Shape::File => {
@@ -1204,6 +1493,14 @@ fn desired_kind(meta: &fs::Metadata, shape: Shape, prev: Option<&FileState>) -> 
                 if let Some(prev) = prev {
                     if matches!(prev.kind, EntryKind::File | EntryKind::Executable) {
                         return (prev.kind, false);
+                    }
+                }
+                if let Some(leaf) = baseline {
+                    if leaf.kind() == EntryKind::Symlink {
+                        return (EntryKind::Symlink, true);
+                    }
+                    if leaf.kind() == EntryKind::Executable {
+                        return (EntryKind::Executable, false);
                     }
                 }
                 (EntryKind::File, false)
@@ -1255,7 +1552,10 @@ fn hash_in_parallel(store: &dyn tig_core::Store, items: &[ToHash]) -> Result<Vec
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16).min(items.len());
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(1, 16)
+        .min(items.len());
     let next = AtomicUsize::new(0);
     let ids: Mutex<Vec<Option<ObjectId>>> = Mutex::new(vec![None; items.len()]);
     let failure: Mutex<Option<Error>> = Mutex::new(None);
@@ -1569,7 +1869,10 @@ fn walk_worktree(root: &Path) -> ignore::Walk {
             // Another VCS's metadata is never content. `.git/config` can
             // hold credentials in remote URLs, so tracking it could publish
             // them. (Covers both `.git` directories and worktree files.)
-            if [".git", ".hg", ".svn", ".jj"].iter().any(|vcs| name == OsStr::new(vcs)) {
+            if [".git", ".hg", ".svn", ".jj"]
+                .iter()
+                .any(|vcs| name == OsStr::new(vcs))
+            {
                 return false;
             }
             // A subdirectory with its own `.tig` is another workspace or a
@@ -1867,6 +2170,20 @@ fn mtime_parts(meta: &fs::Metadata) -> Option<(i64, u32)> {
     system_time_parts(meta.modified().ok()?)
 }
 
+fn ctime_parts(meta: &fs::Metadata) -> Option<(i64, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+        (nanos < 1_000_000_000).then(|| (meta.ctime(), nanos))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 fn observed_mtime(meta: &fs::Metadata, now: SystemTime) -> (i64, u32) {
     mtime_parts(meta)
         .or_else(|| system_time_parts(now))
@@ -1987,6 +2304,7 @@ mod tests {
             FileState {
                 size: 3,
                 mtime: (1_700_000_000, 12),
+                ctime: Some((1_700_000_001, 14)),
                 kind: EntryKind::Executable,
                 id: ObjectId([7; 32]),
                 racy: true,
@@ -1998,6 +2316,7 @@ mod tests {
             FileState {
                 size: 4,
                 mtime: (-5, 10),
+                ctime: None,
                 kind: EntryKind::Symlink,
                 id: ObjectId([9; 32]),
                 racy: false,
@@ -2020,6 +2339,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "dir/a.txt");
         assert!(rows[0].1.racy);
+        assert_eq!(rows[0].1.ctime, Some((1_700_000_001, 14)));
         assert_eq!(rows[0].1.kind, EntryKind::Executable);
         assert!(rows[1].1.symlink_stand_in);
         assert_eq!(rows[1].1.mtime, (-5, 10));
@@ -2029,6 +2349,22 @@ mod tests {
     fn corrupt_state_is_rejected() {
         assert!(decode_state(b"nope").is_err());
         assert!(decode_state(b"TIGW\x02").is_err());
+    }
+
+    #[test]
+    fn state_v2_checksum_is_frozen() {
+        let state = WcState {
+            working: ObjectId([1; 32]),
+            tree: ObjectId([2; 32]),
+            cache: PathIndex::new(),
+        };
+        let bytes = encode_state(&state);
+        assert_eq!(&bytes[..5], b"TIGW\x02");
+        assert_eq!(bytes.len(), 102);
+        assert_eq!(
+            hex::encode(&bytes[70..]),
+            "8a2104c1855864d20bb5904c6f1f79c09dbd466c9f330f4f0dd73ba1396076bc"
+        );
     }
 
     #[test]
@@ -2046,7 +2382,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Decision required: the state format has no integrity checksum"]
     fn syntactically_valid_state_corruption_is_rejected() {
         let mut cache = PathIndex::new();
         cache.insert(
@@ -2054,6 +2389,7 @@ mod tests {
             FileState {
                 size: 5,
                 mtime: (1_700_000_000, 0),
+                ctime: None,
                 kind: EntryKind::File,
                 id: ObjectId([7; 32]),
                 racy: true,
@@ -2067,7 +2403,8 @@ mod tests {
         };
         let mut bytes = encode_state(&state);
         // A single flipped racy bit is still a valid encoding.
-        *bytes.last_mut().unwrap() ^= FLAG_RACY;
+        let flag_offset = bytes.len() - 33;
+        bytes[flag_offset] ^= FLAG_RACY;
         assert!(decode_state(&bytes).is_err());
     }
 
@@ -2081,12 +2418,7 @@ mod tests {
             old: Some(Leaf::file(ObjectId([7; 32]))),
             new: None,
         }];
-        assert!(preflight(
-            &canon(dir.path()).unwrap(),
-            &BTreeSet::new(),
-            &diff
-        )
-        .is_err());
+        assert!(preflight(&canon(dir.path()).unwrap(), &BTreeSet::new(), &diff).is_err());
     }
 
     #[test]
@@ -2098,6 +2430,7 @@ mod tests {
                 FileState {
                     size: 5,
                     mtime: (0, 0),
+                    ctime: None,
                     kind: EntryKind::File,
                     id: ObjectId([7; 32]),
                     racy: true,

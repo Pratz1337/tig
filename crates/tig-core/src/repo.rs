@@ -31,14 +31,22 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { user_name: "tig user".into(), user_email: "user@localhost".into(), tz_offset_min: 0, fixed_time_ms: None }
+        Settings {
+            user_name: "tig user".into(),
+            user_email: "user@localhost".into(),
+            tz_offset_min: 0,
+            fixed_time_ms: None,
+        }
     }
 }
 
 impl Settings {
     pub fn now_ms(&self) -> i64 {
         self.fixed_time_ms.unwrap_or_else(|| {
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
         })
     }
 
@@ -59,7 +67,12 @@ impl Settings {
 /// The revision every history starts from: empty tree, no parents, all-zero
 /// change id. Identical in every repo.
 pub fn root_revision() -> Revision {
-    let zero = Signature { name: String::new(), email: String::new(), timestamp_ms: 0, tz_offset_min: 0 };
+    let zero = Signature {
+        name: String::new(),
+        email: String::new(),
+        timestamp_ms: 0,
+        tz_offset_min: 0,
+    };
     Revision {
         tree: empty_tree_id(),
         parents: vec![],
@@ -84,11 +97,16 @@ pub struct Repo {
     view: View,
     /// Rebases skipped by the latest commit, for the caller to report.
     last_skipped: Vec<SkippedRebase>,
+    recovered_from: Option<ObjectId>,
 }
 
 impl Repo {
     /// Creates a new repo with an empty `default` workspace on top of root.
-    pub fn init(store: Arc<dyn Store>, op_head: Arc<dyn OpHeadStore>, settings: Settings) -> Result<Repo> {
+    pub fn init(
+        store: Arc<dyn Store>,
+        op_head: Arc<dyn OpHeadStore>,
+        settings: Settings,
+    ) -> Result<Repo> {
         if op_head.get()?.is_some() {
             return Err(Error::Invalid("a repo already exists here".into()));
         }
@@ -108,21 +126,80 @@ impl Repo {
         tx.view.workspaces.insert(DEFAULT_WORKSPACE.into(), wc);
         let (op_id, op) = tx.write_operation(None)?;
         if !op_head.compare_and_set(None, op_id)? {
-            return Err(Error::Invalid("a repo was created here concurrently".into()));
+            return Err(Error::Invalid(
+                "a repo was created here concurrently".into(),
+            ));
         }
-        Ok(Repo { store, op_head, settings, op_id, op, view: tx.view, last_skipped: Vec::new() })
+        Ok(Repo {
+            store,
+            op_head,
+            settings,
+            op_id,
+            op,
+            view: tx.view,
+            last_skipped: Vec::new(),
+            recovered_from: None,
+        })
     }
 
-    pub fn load(store: Arc<dyn Store>, op_head: Arc<dyn OpHeadStore>, settings: Settings) -> Result<Repo> {
-        let op_id = op_head.get()?.ok_or_else(|| Error::Invalid("no repo here (no operation head)".into()))?;
-        let op = store.get_operation(&op_id)?;
-        let view = store.get_view(&op.view)?;
-        Ok(Repo { store, op_head, settings, op_id, op, view, last_skipped: Vec::new() })
+    pub fn load(
+        store: Arc<dyn Store>,
+        op_head: Arc<dyn OpHeadStore>,
+        settings: Settings,
+    ) -> Result<Repo> {
+        let op_id = op_head
+            .get()?
+            .ok_or_else(|| Error::Invalid("no repo here (no operation head)".into()))?;
+        let metadata = store
+            .get_operation(&op_id)
+            .and_then(|op| store.get_view(&op.view).map(|view| (op, view)));
+        let (loaded_id, op, view) = match metadata {
+            Ok((op, view)) => (op_id, op, view),
+            Err(error) if crate::recovery::damaged(&error) => {
+                crate::recovery::recover(store.as_ref(), op_head.as_ref(), op_id)?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Repo {
+            store,
+            op_head,
+            settings,
+            op_id: loaded_id,
+            op,
+            view,
+            last_skipped: Vec::new(),
+            recovered_from: (loaded_id != op_id).then_some(op_id),
+        })
+    }
+
+    /// Checks all content reachable from the view, then falls back to the
+    /// newest complete prior operation if necessary. Never touches disk files.
+    pub fn recover(&mut self) -> Result<bool> {
+        let current = self
+            .op_head
+            .get()?
+            .ok_or_else(|| Error::Invalid("no operation head".into()))?;
+        let (id, op, view) =
+            crate::recovery::recover(self.store.as_ref(), self.op_head.as_ref(), current)?;
+        self.op_id = id;
+        self.op = op;
+        self.view = view;
+        self.recovered_from = (id != current).then_some(current);
+        self.last_skipped.clear();
+        Ok(id != current)
+    }
+
+    pub fn recovered_from(&self) -> Option<ObjectId> {
+        self.recovered_from
     }
 
     /// Re-reads the op head (after another process or workspace changed it).
     pub fn reload(&mut self) -> Result<()> {
-        let fresh = Repo::load(self.store.clone(), self.op_head.clone(), self.settings.clone())?;
+        let fresh = Repo::load(
+            self.store.clone(),
+            self.op_head.clone(),
+            self.settings.clone(),
+        )?;
         *self = fresh;
         Ok(())
     }
@@ -185,7 +262,9 @@ impl Repo {
         // it on top of anything else would silently drop the operations in
         // between, so it must belong to this repo and this exact operation.
         if !same_store(&tx.store, &self.store) {
-            return Err(Error::Invalid("transaction belongs to a different repo".into()));
+            return Err(Error::Invalid(
+                "transaction belongs to a different repo".into(),
+            ));
         }
         if tx.base_op != Some(self.op_id) {
             return Err(Error::Invalid(
@@ -195,7 +274,8 @@ impl Repo {
         let (op_id, op) = tx.write_operation(Some(self.op_id))?;
         if !self.op_head.compare_and_set(Some(self.op_id), op_id)? {
             return Err(Error::Invalid(
-                "the repo changed while this command ran (another tig process?); run it again".into(),
+                "the repo changed while this command ran (another tig process?); run it again"
+                    .into(),
             ));
         }
         self.op_id = op_id;
@@ -212,11 +292,15 @@ impl Repo {
         let target = self.logical_position(self.op_id)?;
         let target_op = self.store.get_operation(&target)?;
         let Some(parent) = target_op.parents.first() else {
-            return Err(Error::Invalid("nothing left to undo: the repo is back at its first operation".into()));
+            return Err(Error::Invalid(
+                "nothing left to undo: the repo is back at its first operation".into(),
+            ));
         };
         let restore = self.logical_position(*parent)?;
         let mut tx = self.start(format!("undo: {}", target_op.description));
-        tx.view = self.store.get_view(&self.store.get_operation(&restore)?.view)?;
+        tx.view = self
+            .store
+            .get_view(&self.store.get_operation(&restore)?.view)?;
         tx.undo_of = Some(target);
         self.commit(tx)
     }
@@ -275,11 +359,9 @@ impl Repo {
         let steps = spec.len() - base.len();
         let mut id = self.resolve_base(workspace, base)?;
         for _ in 0..steps {
-            id = *self
-                .revision(&id)?
-                .parents
-                .first()
-                .ok_or_else(|| Error::Invalid(format!("{spec:?}: the root revision has no parent")))?;
+            id = *self.revision(&id)?.parents.first().ok_or_else(|| {
+                Error::Invalid(format!("{spec:?}: the root revision has no parent"))
+            })?;
         }
         // Stored views and parent references may be malformed. Validate the
         // final target too, including @, bookmarks, and the last parent step.
@@ -315,7 +397,11 @@ impl Repo {
         let mut matches: Vec<ObjectId> = Vec::new();
         for (id, rev) in self.visible_revisions()? {
             if (is_change && rev.change_id.to_text().starts_with(spec))
-                || (is_hex && id.to_hex().get(..spec.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(spec)))
+                || (is_hex
+                    && id
+                        .to_hex()
+                        .get(..spec.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(spec)))
             {
                 matches.push(id);
             }
@@ -323,7 +409,9 @@ impl Repo {
         match matches.len() {
             0 => Err(Error::Invalid(format!("unknown revision {spec:?}"))),
             1 => Ok(matches[0]),
-            n => Err(Error::Invalid(format!("revision {spec:?} is ambiguous ({n} matches); use a longer prefix"))),
+            n => Err(Error::Invalid(format!(
+                "revision {spec:?} is ambiguous ({n} matches); use a longer prefix"
+            ))),
         }
     }
 
@@ -331,7 +419,11 @@ impl Repo {
     pub fn short_change_id(&self, change: &ChangeId, all: &[(ObjectId, Revision)]) -> String {
         let text = change.to_text();
         let mut n = 4;
-        while n < 32 && all.iter().any(|(_, r)| r.change_id != *change && r.change_id.to_text().starts_with(&text[..n])) {
+        while n < 32
+            && all.iter().any(|(_, r)| {
+                r.change_id != *change && r.change_id.to_text().starts_with(&text[..n])
+            })
+        {
             n += 1;
         }
         text[..n].to_string()
@@ -341,26 +433,42 @@ impl Repo {
 /// Visible revisions: everything reachable from heads, workspaces, and bookmarks.
 pub fn visible_revisions(store: &dyn Store, view: &View) -> Result<Vec<(ObjectId, Revision)>> {
     let mut revs: HashMap<ObjectId, Revision> = HashMap::new();
-    let mut stack: Vec<ObjectId> =
-        view.heads.iter().chain(view.workspaces.values()).chain(view.bookmarks.values()).copied().collect();
+    let mut stack: Vec<ObjectId> = view
+        .heads
+        .iter()
+        .chain(view.workspaces.values())
+        .chain(view.bookmarks.values())
+        .copied()
+        .collect();
     while let Some(id) = stack.pop() {
         if revs.contains_key(&id) {
             continue;
         }
         let rev = store.get_revision(&id)?;
-        stack.extend(rev.parents.iter().filter(|p| !revs.contains_key(p)).copied());
+        stack.extend(
+            rev.parents
+                .iter()
+                .filter(|p| !revs.contains_key(p))
+                .copied(),
+        );
         revs.insert(id, rev);
     }
     // Kahn's algorithm from childless revisions; newest committer time first.
     let mut child_count: HashMap<ObjectId, usize> = revs.keys().map(|id| (*id, 0)).collect();
     for rev in revs.values() {
         for p in &rev.parents {
-            *child_count.get_mut(p).expect("parents of visible revisions are visible") += 1;
+            *child_count
+                .get_mut(p)
+                .expect("parents of visible revisions are visible") += 1;
         }
     }
-    let key = |id: &ObjectId, revs: &HashMap<ObjectId, Revision>| (revs[id].committer.timestamp_ms, *id);
-    let mut ready: BTreeSet<(i64, ObjectId)> =
-        child_count.iter().filter(|(_, n)| **n == 0).map(|(id, _)| key(id, &revs)).collect();
+    let key =
+        |id: &ObjectId, revs: &HashMap<ObjectId, Revision>| (revs[id].committer.timestamp_ms, *id);
+    let mut ready: BTreeSet<(i64, ObjectId)> = child_count
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(id, _)| key(id, &revs))
+        .collect();
     let mut out = Vec::with_capacity(revs.len());
     while let Some(entry) = ready.pop_last() {
         let id = entry.1;
@@ -373,7 +481,13 @@ pub fn visible_revisions(store: &dyn Store, view: &View) -> Result<Vec<(ObjectId
         }
         out.push(id);
     }
-    Ok(out.into_iter().map(|id| { let r = revs.remove(&id).expect("present"); (id, r) }).collect())
+    Ok(out
+        .into_iter()
+        .map(|id| {
+            let r = revs.remove(&id).expect("present");
+            (id, r)
+        })
+        .collect())
 }
 
 /// A set of changes to the view, committed atomically by `Repo::commit`.
@@ -478,17 +592,21 @@ impl Transaction {
     }
 
     fn merged_tree(&self, parents: &[ObjectId]) -> Result<ObjectId> {
+        match self.merge_parents(parents)? {
+            MergeOutcome::Clean(tree) => Ok(tree),
+            MergeOutcome::Conflict(paths) => Err(conflict_error("merge", &paths)),
+        }
+    }
+
+    fn merge_parents(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
         let Some((first, rest)) = parents.split_first() else {
             return Err(Error::Invalid("a change needs at least one parent".into()));
         };
         if rest.is_empty() {
             // A normal new change never walks its parent's history.
-            return Ok(self.store.get_revision(first)?.tree);
+            return Ok(MergeOutcome::Clean(self.store.get_revision(first)?.tree));
         }
-        match merge_revisions(&*self.store, parents)? {
-            MergeOutcome::Clean(tree) => Ok(tree),
-            MergeOutcome::Conflict(paths) => Err(conflict_error("merge", &paths)),
-        }
+        merge_revisions(&*self.store, parents)
     }
 
     /// Writes a new revision of the same change and points everything that
@@ -498,7 +616,11 @@ impl Transaction {
         self.atomically(|tx| tx.rewrite_inner(old, edit))
     }
 
-    fn rewrite_inner(&mut self, old: ObjectId, edit: impl FnOnce(&mut Revision)) -> Result<ObjectId> {
+    fn rewrite_inner(
+        &mut self,
+        old: ObjectId,
+        edit: impl FnOnce(&mut Revision),
+    ) -> Result<ObjectId> {
         if old == root_revision_id() {
             return Err(Error::Invalid("the root revision cannot be changed".into()));
         }
@@ -507,19 +629,29 @@ impl Transaction {
         edit(&mut rev);
         // A rewrite is a new revision of the *same* change.
         rev.change_id = before.change_id;
-        if rev.tree == before.tree && rev.parents == before.parents && rev.description == before.description {
+        if rev.tree == before.tree
+            && rev.parents == before.parents
+            && rev.description == before.description
+        {
             return Ok(old);
         }
         if rev.tree != before.tree && self.store.kind(&rev.tree)? != Some(ObjectKind::Tree) {
-            return Err(Error::Invalid(format!("revision tree {} must refer to an existing tree object", rev.tree)));
+            return Err(Error::Invalid(format!(
+                "revision tree {} must refer to an existing tree object",
+                rev.tree
+            )));
         }
         if rev.parents.is_empty() {
-            return Err(Error::Invalid("only the root revision may have no parents".into()));
+            return Err(Error::Invalid(
+                "only the root revision may have no parents".into(),
+            ));
         }
         if rev.parents != before.parents {
             for parent in &rev.parents {
                 if ancestors(&*self.store, parent)?.contains(&old) {
-                    return Err(Error::Invalid("cannot reparent a change onto itself or its descendant".into()));
+                    return Err(Error::Invalid(
+                        "cannot reparent a change onto itself or its descendant".into(),
+                    ));
                 }
             }
         }
@@ -546,13 +678,18 @@ impl Transaction {
 
     fn abandon_inner(&mut self, id: ObjectId) -> Result<()> {
         if id == root_revision_id() {
-            return Err(Error::Invalid("the root revision cannot be abandoned".into()));
+            return Err(Error::Invalid(
+                "the root revision cannot be abandoned".into(),
+            ));
         }
         let rev = self.store.get_revision(&id)?;
         // Only the root may be parentless; a stored revision that claims
         // otherwise is malformed, and must not crash us.
         let Some(&first_parent) = rev.parents.first() else {
-            return Err(Error::Invalid(format!("revision {} has no parents and cannot be abandoned", id.short(12))));
+            return Err(Error::Invalid(format!(
+                "revision {} has no parents and cannot be abandoned",
+                id.short(12)
+            )));
         };
         self.view.heads.remove(&id);
         for p in &rev.parents {
@@ -563,8 +700,13 @@ impl Transaction {
                 *target = first_parent;
             }
         }
-        let on_it: Vec<String> =
-            self.view.workspaces.iter().filter(|(_, wc)| **wc == id).map(|(n, _)| n.clone()).collect();
+        let on_it: Vec<String> = self
+            .view
+            .workspaces
+            .iter()
+            .filter(|(_, wc)| **wc == id)
+            .map(|(n, _)| n.clone())
+            .collect();
         for ws in on_it {
             let fresh = self.new_change_inner(&rev.parents, "")?;
             self.view.workspaces.insert(ws, fresh);
@@ -646,7 +788,9 @@ impl Transaction {
         if id == root_revision_id() || !self.view.heads.contains(&id) {
             return Ok(false);
         }
-        if self.view.workspaces.values().any(|w| *w == id) || self.view.bookmarks.values().any(|b| *b == id) {
+        if self.view.workspaces.values().any(|w| *w == id)
+            || self.view.bookmarks.values().any(|b| *b == id)
+        {
             return Ok(false);
         }
         let rev = self.store.get_revision(&id)?;
@@ -658,7 +802,12 @@ impl Transaction {
 
     fn replace(&mut self, old: ObjectId, new: ObjectId) {
         self.view.heads.remove(&old);
-        for target in self.view.workspaces.values_mut().chain(self.view.bookmarks.values_mut()) {
+        for target in self
+            .view
+            .workspaces
+            .values_mut()
+            .chain(self.view.bookmarks.values_mut())
+        {
             if *target == old {
                 *target = new;
             }
@@ -670,13 +819,23 @@ impl Transaction {
         // Children of rewritten revisions, processed parents-first.
         let visible = visible_revisions(&*self.store, &self.view)?;
         for (id, rev) in visible.into_iter().rev() {
-            if rewritten.contains_key(&id) || !rev.parents.iter().any(|p| rewritten.contains_key(p)) {
+            if rewritten.contains_key(&id) || !rev.parents.iter().any(|p| rewritten.contains_key(p))
+            {
                 continue;
             }
-            let new_parents: Vec<ObjectId> = rev.parents.iter().map(|p| *rewritten.get(p).unwrap_or(p)).collect();
+            let new_parents: Vec<ObjectId> = rev
+                .parents
+                .iter()
+                .map(|p| *rewritten.get(p).unwrap_or(p))
+                .collect();
             let old_base = self.merged_tree(&rev.parents)?;
-            let new_base = self.merged_tree(&new_parents)?;
-            let tree = match merge_trees(&*self.store, &old_base, &new_base, &rev.tree)? {
+            let rebased = match self.merge_parents(&new_parents)? {
+                MergeOutcome::Clean(new_base) => {
+                    merge_trees(&*self.store, &old_base, &new_base, &rev.tree)?
+                }
+                conflict => conflict,
+            };
+            let tree = match rebased {
                 MergeOutcome::Clean(t) => t,
                 MergeOutcome::Conflict(paths) => {
                     // Refusing here would make every command fail (each one
@@ -684,7 +843,10 @@ impl Transaction {
                     // are objects, the descendant stays on the previous
                     // version of its parent, which stays visible: nothing is
                     // lost, and the caller reports it.
-                    self.skipped.push(SkippedRebase { change: rev.change_id, paths });
+                    self.skipped.push(SkippedRebase {
+                        change: rev.change_id,
+                        paths,
+                    });
                     continue;
                 }
             };
@@ -742,7 +904,13 @@ impl Transaction {
     fn normalize_heads(&mut self) -> Result<()> {
         // Reparenting can leave a workspace or bookmark at a childless
         // revision that was previously reachable only through another head.
-        self.view.heads.extend(self.view.workspaces.values().chain(self.view.bookmarks.values()).copied());
+        self.view.heads.extend(
+            self.view
+                .workspaces
+                .values()
+                .chain(self.view.bookmarks.values())
+                .copied(),
+        );
         let heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
         let mut covered: HashSet<ObjectId> = HashSet::new();
         for h in &heads {
@@ -763,7 +931,11 @@ impl Transaction {
 
 fn conflict_error(what: &str, paths: &[crate::path::RepoPath]) -> Error {
     let list: Vec<String> = paths.iter().take(10).map(|p| p.to_string()).collect();
-    let more = if paths.len() > 10 { format!(" and {} more", paths.len() - 10) } else { String::new() };
+    let more = if paths.len() > 10 {
+        format!(" and {} more", paths.len() - 10)
+    } else {
+        String::new()
+    };
     Error::Invalid(format!(
         "{what} would conflict in {}{more}. Conflicts as first-class objects are not built yet, so tig made no changes",
         list.join(", ")
@@ -776,7 +948,9 @@ fn validate_bookmark(name: &str) -> Result<()> {
         && name != "root"
         && !name.starts_with('-')
         && !name.ends_with('-')
-        && name.chars().all(|c| c.is_alphanumeric() || "-_./".contains(c));
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_./".contains(c));
     if ok {
         Ok(())
     } else {

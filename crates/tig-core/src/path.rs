@@ -3,8 +3,8 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
-use std::ops::Bound;
 use std::fmt;
+use std::ops::Bound;
 
 use crate::error::Result;
 use crate::object::validate_name;
@@ -171,12 +171,30 @@ mod portable_names {
     #[test]
     fn dangerous_names_are_rejected() {
         for bad in [
-            "C:\\outside", "..\\outside", "a:b", ".env.", ".env ", "x\u{7}", ".tig", ".TIG", ".t\u{200C}ig",
-            "dir/.tig/op_head", "a/b./c",
+            "C:\\outside",
+            "..\\outside",
+            "a:b",
+            ".env.",
+            ".env ",
+            "x\u{7}",
+            ".tig",
+            ".TIG",
+            ".t\u{200C}ig",
+            "dir/.tig/op_head",
+            "a/b./c",
         ] {
             assert!(RepoPath::from_os_relative(bad).is_err(), "{bad:?} accepted");
         }
-        for ok in ["aux.c", "CON", "A", "a", ".tigrc", "tig", ".env.local", "my file.txt"] {
+        for ok in [
+            "aux.c",
+            "CON",
+            "A",
+            "a",
+            ".tigrc",
+            "tig",
+            ".env.local",
+            "my file.txt",
+        ] {
             assert!(RepoPath::new(ok).is_ok(), "{ok:?} rejected");
         }
     }

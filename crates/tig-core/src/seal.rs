@@ -110,6 +110,9 @@ mod tests {
 
     #[test]
     fn salt_debug_hides_bytes() {
-        assert_eq!(format!("{:?}", SealSalt::from_bytes([9; 32])), "SealSalt(..)");
+        assert_eq!(
+            format!("{:?}", SealSalt::from_bytes([9; 32])),
+            "SealSalt(..)"
+        );
     }
 }

@@ -56,7 +56,11 @@ impl RevLabel {
         // The root is the same empty start in every repo; its zero change id
         // and 1970 timestamp are noise.
         if id == tig_core::repo::root_revision_id() {
-            return RevLabel { change_id: "root".into(), object_id: String::new(), summary: String::new() };
+            return RevLabel {
+                change_id: "root".into(),
+                object_id: String::new(),
+                summary: String::new(),
+            };
         }
         RevLabel {
             change_id: change_label(repo, &rev.change_id, all),
@@ -124,6 +128,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Shareable public identity: `tig1:` plus hex(encryption key || signing key).
+pub fn identity_token(identity: &tig_private::keys::PublicIdentity) -> String {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&identity.encryption);
+    bytes[32..].copy_from_slice(&identity.signing);
+    format!("tig1:{}", hex::encode(bytes))
+}
+
+/// Parses a token from [`identity_token`]. The hex may be any case.
+pub fn parse_identity_token(text: &str) -> Result<tig_private::keys::PublicIdentity, String> {
+    let text = text.trim();
+    let hex_part = text
+        .strip_prefix("tig1:")
+        .ok_or("identity token must start with tig1:")?;
+    if hex_part.len() != 128 || !hex_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("identity token must be tig1: followed by 128 hex characters".into());
+    }
+    let bytes = hex::decode(hex_part).map_err(|_| "identity token is not hex".to_string())?;
+    if bytes.len() != 64 {
+        return Err("identity token must be tig1: followed by 128 hex characters".into());
+    }
+    let mut encryption = [0u8; 32];
+    let mut signing = [0u8; 32];
+    encryption.copy_from_slice(&bytes[..32]);
+    signing.copy_from_slice(&bytes[32..]);
+    Ok(tig_private::keys::PublicIdentity {
+        encryption,
+        signing,
+    })
+}
+
 /// A path as people expect to read it. On Windows, canonical paths carry the
 /// verbatim prefix (`\?\C:\...`); drop it when the rest is a plain drive path.
 pub fn show_path(path: &std::path::Path) -> String {
@@ -143,8 +178,38 @@ mod tests {
         use std::path::Path;
         assert_eq!(show_path(Path::new(r"\\?\C:\work\repo")), r"C:\work\repo");
         // UNC verbatim paths keep their prefix: stripping it would change meaning.
-        assert_eq!(show_path(Path::new(r"\\?\UNC\server\share")), r"\\?\UNC\server\share");
+        assert_eq!(
+            show_path(Path::new(r"\\?\UNC\server\share")),
+            r"\\?\UNC\server\share"
+        );
         assert_eq!(show_path(Path::new("/home/me/repo")), "/home/me/repo");
+    }
+
+    #[test]
+    fn identity_token_round_trip() {
+        let identity = tig_private::keys::PublicIdentity {
+            encryption: [0xab; 32],
+            signing: [0xcd; 32],
+        };
+        let token = identity_token(&identity);
+        assert_eq!(token.len(), "tig1:".len() + 128);
+        assert_eq!(parse_identity_token(&token).unwrap(), identity);
+        assert_eq!(
+            parse_identity_token(&format!("  {token}\n")).unwrap(),
+            identity
+        );
+        let upper = format!(
+            "tig1:{}",
+            hex::encode_upper({
+                let mut bytes = [0u8; 64];
+                bytes[..32].copy_from_slice(&identity.encryption);
+                bytes[32..].copy_from_slice(&identity.signing);
+                bytes
+            })
+        );
+        assert_eq!(parse_identity_token(&upper).unwrap(), identity);
+        assert!(parse_identity_token("tig1:abcd").is_err());
+        assert!(parse_identity_token("nope").is_err());
     }
 
     #[test]
@@ -157,4 +222,3 @@ mod tests {
         assert_eq!(format_time(-1000), "1969-12-31 23:59");
     }
 }
-

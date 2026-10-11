@@ -25,8 +25,19 @@ impl Workspace {
     /// Opens an existing workspace of the repo. O(1): nothing is copied.
     pub fn open(repo: &Repo, name: &str) -> Result<Self> {
         let working = repo.working_revision(name)?;
+        Self::at_revision(repo, name, working)
+    }
+
+    /// Opens an overlay against a recorded revision, even if the workspace
+    /// has since moved. Snapshotting still checks that it is current.
+    pub fn at_revision(repo: &Repo, name: &str, working: ObjectId) -> Result<Self> {
         let base_tree = repo.revision(&working)?.tree;
-        Ok(Workspace { name: name.to_string(), working, base_tree, overlay: BTreeMap::new() })
+        Ok(Workspace {
+            name: name.to_string(),
+            working,
+            base_tree,
+            overlay: BTreeMap::new(),
+        })
     }
 
     /// Creates a new workspace with an empty change on top of `parent`.
@@ -77,7 +88,13 @@ impl Workspace {
         self.write_kind(repo, path, data, EntryKind::File)
     }
 
-    pub fn write_kind(&mut self, repo: &Repo, path: &RepoPath, data: &[u8], kind: EntryKind) -> Result<()> {
+    pub fn write_kind(
+        &mut self,
+        repo: &Repo,
+        path: &RepoPath,
+        data: &[u8],
+        kind: EntryKind,
+    ) -> Result<()> {
         if path.is_root() || !kind.is_file_like() {
             return Err(Error::Invalid(format!("cannot write a file at {path}")));
         }
@@ -95,10 +112,14 @@ impl Workspace {
     /// path, including a whole directory).
     pub fn set(&mut self, repo: &Repo, path: RepoPath, leaf: Option<Leaf>) -> Result<()> {
         if path.is_root() || leaf.is_some_and(|found| !found.is_file_like()) {
-            return Err(Error::Invalid(format!("workspace edits must be files; got {leaf:?} at {path}")));
+            return Err(Error::Invalid(format!(
+                "workspace edits must be files; got {leaf:?} at {path}"
+            )));
         }
         if path.components().count() > MAX_TREE_DEPTH {
-            return Err(Error::Invalid(format!("tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})")));
+            return Err(Error::Invalid(format!(
+                "tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})"
+            )));
         }
         if let Some(parent) = path.parent() {
             if let Some((at, edit)) = self.covering_edit(&parent) {
@@ -178,8 +199,9 @@ impl Workspace {
                 _ => Ok(Vec::new()),
             };
         }
-        let mut files: BTreeMap<RepoPath, Leaf> =
-            walk(&**repo.store(), &self.base_tree, dir)?.into_iter().collect();
+        let mut files: BTreeMap<RepoPath, Leaf> = walk(&**repo.store(), &self.base_tree, dir)?
+            .into_iter()
+            .collect();
         // Only overlay edits inside `dir` matter; cost is O(edits · log n).
         for (path, edit) in range_inside(&self.overlay, dir) {
             remove_inside(&mut files, path);
@@ -228,7 +250,9 @@ impl Workspace {
     /// undo). Fails if there are unsnapshotted edits.
     pub fn sync(&mut self, repo: &Repo) -> Result<()> {
         if self.is_dirty() {
-            return Err(Error::Invalid("snapshot the workspace before switching revisions".into()));
+            return Err(Error::Invalid(
+                "snapshot the workspace before switching revisions".into(),
+            ));
         }
         self.working = repo.working_revision(&self.name)?;
         self.base_tree = repo.revision(&self.working)?.tree;
@@ -246,16 +270,22 @@ fn relative_path(path: &RepoPath, ancestor: &RepoPath) -> Result<RepoPath> {
     RepoPath::new(&path.as_str()[ancestor.as_str().len() + 1..])
 }
 
-fn graft_files(repo: &Repo, at: &RepoPath, tree: ObjectId, dir: &RepoPath) -> Result<Vec<(RepoPath, Leaf)>> {
+fn graft_files(
+    repo: &Repo,
+    at: &RepoPath,
+    tree: ObjectId,
+    dir: &RepoPath,
+) -> Result<Vec<(RepoPath, Leaf)>> {
     walk(&**repo.store(), &tree, dir)?
         .into_iter()
         .map(|(path, leaf)| {
             let path = RepoPath::new(&format!("{}/{}", at.as_str(), path.as_str()))?;
             if path.components().count() > MAX_TREE_DEPTH {
-                return Err(Error::Invalid(format!("tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})")));
+                return Err(Error::Invalid(format!(
+                    "tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})"
+                )));
             }
             Ok((path, leaf))
         })
         .collect()
 }
-

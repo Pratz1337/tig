@@ -216,10 +216,11 @@ pub fn fetch(
     let mut unsealed = 0usize;
     let mut still_sealed = 0usize;
     for public_id in order {
-        if mapped.contains_key(&public_id) {
+        let (internal, opened, closed) =
+            rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
+        if mapped.get(&public_id) == Some(&internal) {
             continue;
         }
-        let (internal, opened, closed) = rebuild_one(store, public_id, &mapped, &records)?;
         unsealed += opened;
         still_sealed += closed;
         mapped.insert(public_id, internal);
@@ -515,9 +516,16 @@ fn rebuild_one(
     public_id: ObjectId,
     mapped: &BTreeMap<ObjectId, ObjectId>,
     records: &BTreeMap<SealedId, SealedRecord>,
+    budget: &mut Budget,
 ) -> Result<(ObjectId, usize, usize), FetchError> {
     let public = store.get_revision(&public_id)?;
-    let (tree, unsealed, still_sealed) = unseal(store, public.tree, records)?;
+    // Keep content already opened locally, while a later grant can open
+    // seals left by an earlier fetch. Parent mappings may change too.
+    let previous_tree = match mapped.get(&public_id) {
+        Some(id) => store.get_revision(id)?.tree,
+        None => public.tree,
+    };
+    let (tree, unsealed, still_sealed) = unseal(store, previous_tree, records, budget)?;
     let mut parents = Vec::with_capacity(public.parents.len());
     for parent in &public.parents {
         parents.push(map_parent(*parent, mapped)?);
@@ -539,11 +547,12 @@ fn unseal(
     store: &dyn Store,
     public_tree: ObjectId,
     records: &BTreeMap<SealedId, SealedRecord>,
+    budget: &mut Budget,
 ) -> Result<(ObjectId, usize, usize), FetchError> {
     let mut edits = BTreeMap::new();
     let mut unsealed = 0usize;
     let mut still_sealed = 0usize;
-    for (path, sid) in sealed_leaves(store, public_tree)? {
+    for (path, sid) in sealed_leaves(store, public_tree, budget)? {
         let Some(record) = records.get(&sid) else {
             still_sealed += 1;
             continue;
@@ -562,23 +571,23 @@ fn unseal(
     } else {
         apply_edits(store, &public_tree, &edits)?
     };
+    if tree != public_tree {
+        // Decrypted subtrees are subject to the same expansion/depth limits.
+        sealed_leaves(store, tree, budget)?;
+    }
     Ok((tree, unsealed, still_sealed))
 }
 
 fn sealed_leaves(
     store: &dyn Store,
     root: ObjectId,
+    budget: &mut Budget,
 ) -> Result<Vec<(RepoPath, SealedId)>, FetchError> {
     let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut entries = 0usize;
     let mut stack = vec![(root, RepoPath::root(), 0usize)];
     while let Some((id, prefix, depth)) = stack.pop() {
         if depth > MAX_TREE_DEPTH {
             return Err(too_deep());
-        }
-        if !seen.insert(id) {
-            continue;
         }
         let tree = store.get_tree(&id)?;
         if !tree.entries().is_empty() && depth + 1 > MAX_TREE_DEPTH {
@@ -586,7 +595,7 @@ fn sealed_leaves(
         }
         let mut nested = Vec::new();
         for entry in tree.entries() {
-            bump(&mut entries, MAX_ENTRIES)?;
+            budget.entry()?;
             let path = prefix.join(entry.name())?;
             match entry.kind() {
                 EntryKind::Tree => nested.push((entry.id(), path, depth + 1)),
@@ -596,7 +605,14 @@ fn sealed_leaves(
                     })?;
                     out.push((path, sid));
                 }
-                EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {}
+                EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
+                    if store.kind(&entry.id())? != Some(ObjectKind::Blob) {
+                        return Err(FetchError::Invalid(format!(
+                            "file target {} is missing or is not a blob",
+                            entry.id()
+                        )));
+                    }
+                }
             }
         }
         for item in nested.into_iter().rev() {
@@ -696,6 +712,95 @@ fn read_array<const N: usize>(r: &mut Reader<'_>) -> Result<[u8; N], FetchError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_a_private_tree_rejects_missing_file_targets() {
+        use tig_core::{MemoryStore, TreeEntry};
+        let store = MemoryStore::new();
+        let missing = hash_object(ObjectKind::Blob, b"secret");
+        let tree = store
+            .put(&Object::Tree(
+                Tree::new(vec![
+                    TreeEntry::new("file", EntryKind::File, missing).unwrap()
+                ])
+                .unwrap(),
+            ))
+            .unwrap();
+        let sid = SealedId::from_stored([7; 32]);
+        let public = store
+            .put(&Object::Tree(
+                Tree::new(vec![TreeEntry::sealed("secrets", sid).unwrap()]).unwrap(),
+            ))
+            .unwrap();
+        let records = BTreeMap::from([(
+            sid,
+            SealedRecord {
+                sealed_id: sid,
+                path: RepoPath::new("secrets").unwrap(),
+                kind: EntryKind::Tree,
+                target: tree,
+            },
+        )]);
+        let mut budget = Budget {
+            objects: 0,
+            entries: 0,
+        };
+        assert!(matches!(unseal(&store, public, &records, &mut budget),
+            Err(FetchError::Invalid(ref reason)) if reason.contains("file target")));
+        store.put_blob(b"secret").unwrap();
+        assert!(unseal(&store, public, &records, &mut budget).is_ok());
+    }
+
+    #[test]
+    fn shared_subtrees_keep_each_path_and_cannot_bypass_expansion_limit() {
+        use tig_core::{MemoryStore, TreeEntry};
+        let store = MemoryStore::new();
+        let sid = SealedId::from_stored([7; 32]);
+        let child = store
+            .put(&Object::Tree(
+                Tree::new(vec![TreeEntry::sealed("secret", sid).unwrap()]).unwrap(),
+            ))
+            .unwrap();
+        let root = store
+            .put(&Object::Tree(
+                Tree::new(vec![
+                    TreeEntry::new("a", EntryKind::Tree, child).unwrap(),
+                    TreeEntry::new("b", EntryKind::Tree, child).unwrap(),
+                ])
+                .unwrap(),
+            ))
+            .unwrap();
+        let mut budget = Budget {
+            objects: 0,
+            entries: 0,
+        };
+        let paths = sealed_leaves(&store, root, &mut budget).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                (RepoPath::new("a/secret").unwrap(), sid),
+                (RepoPath::new("b/secret").unwrap(), sid),
+            ]
+        );
+
+        // Only twenty unique trees, but over a million expanded paths.
+        let mut tree = store.put(&Object::Tree(Tree::empty())).unwrap();
+        for _ in 0..20 {
+            tree = store
+                .put(&Object::Tree(
+                    Tree::new(vec![
+                        TreeEntry::new("a", EntryKind::Tree, tree).unwrap(),
+                        TreeEntry::new("b", EntryKind::Tree, tree).unwrap(),
+                    ])
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
+        assert!(matches!(
+            sealed_leaves(&store, tree, &mut budget),
+            Err(FetchError::TooLarge)
+        ));
+    }
 
     #[test]
     fn state_roundtrip_rejects_unsorted_and_trailing_bytes() {

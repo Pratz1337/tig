@@ -12,8 +12,16 @@ fn p(s: &str) -> RepoPath {
 }
 
 fn repo() -> Repo {
-    let settings = Settings { fixed_time_ms: Some(1_700_000_000_000), ..Settings::default() };
-    Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), settings).unwrap()
+    let settings = Settings {
+        fixed_time_ms: Some(1_700_000_000_000),
+        ..Settings::default()
+    };
+    Repo::init(
+        Arc::new(MemoryStore::new()),
+        Arc::new(MemoryOpHead::new()),
+        settings,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -37,10 +45,16 @@ fn snapshot_keeps_change_id_and_records_predecessor() {
     assert!(ws.snapshot(&mut repo).unwrap());
     let after = ws.working_revision();
     assert_ne!(before, after);
-    let (a, b) = (repo.revision(&before).unwrap(), repo.revision(&after).unwrap());
+    let (a, b) = (
+        repo.revision(&before).unwrap(),
+        repo.revision(&after).unwrap(),
+    );
     assert_eq!(a.change_id, b.change_id);
     assert_eq!(b.predecessors, vec![before]);
-    assert_eq!(ws.read(&repo, &p("src/main.rs")).unwrap().unwrap(), b"fn main() {}");
+    assert_eq!(
+        ws.read(&repo, &p("src/main.rs")).unwrap().unwrap(),
+        b"fn main() {}"
+    );
     // Old revision is hidden, not deleted.
     assert_eq!(repo.visible_revisions().unwrap().len(), 2);
     assert!(repo.revision(&before).is_ok());
@@ -96,7 +110,11 @@ fn new_describe_and_undo() {
     assert!(repo.undo().is_err());
     // restore jumps anywhere, including forward.
     let ops = repo.op_log(100).unwrap();
-    let describe_op = ops.iter().find(|(_, o)| o.description == "describe").unwrap().0;
+    let describe_op = ops
+        .iter()
+        .find(|(_, o)| o.description == "describe")
+        .unwrap()
+        .0;
     repo.restore_operation(&describe_op).unwrap();
     let wc = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
     assert_eq!(repo.revision(&wc).unwrap().description, "first");
@@ -161,7 +179,10 @@ fn conflicting_snapshot_succeeds_and_leaves_the_child_in_place() {
     assert_eq!(repo.last_skipped_rebases()[0].paths, vec![p("a.txt")]);
     let child_now = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
     assert_eq!(repo.revision(&child_now).unwrap().parents, vec![parent]);
-    assert_eq!(other.read(&repo, &p("a.txt")).unwrap().unwrap(), b"parent edit");
+    assert_eq!(
+        other.read(&repo, &p("a.txt")).unwrap().unwrap(),
+        b"parent edit"
+    );
 }
 
 #[test]
@@ -172,7 +193,12 @@ fn moving_away_from_empty_change_abandons_it() {
     let sibling = tx.new_change(&[root_revision_id()], "").unwrap();
     tx.set_working(DEFAULT_WORKSPACE, sibling).unwrap();
     repo.commit(tx).unwrap();
-    let visible: Vec<_> = repo.visible_revisions().unwrap().into_iter().map(|(id, _)| id).collect();
+    let visible: Vec<_> = repo
+        .visible_revisions()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     assert!(!visible.contains(&wc));
     assert_eq!(visible.len(), 2);
 }
@@ -186,8 +212,15 @@ fn resolve_specs() {
     let wc = ws.working_revision();
     let rev = repo.revision(&wc).unwrap();
     assert_eq!(repo.resolve(DEFAULT_WORKSPACE, "@").unwrap(), wc);
-    assert_eq!(repo.resolve(DEFAULT_WORKSPACE, "@-").unwrap(), root_revision_id());
-    assert_eq!(repo.resolve(DEFAULT_WORKSPACE, &rev.change_id.short(8)).unwrap(), wc);
+    assert_eq!(
+        repo.resolve(DEFAULT_WORKSPACE, "@-").unwrap(),
+        root_revision_id()
+    );
+    assert_eq!(
+        repo.resolve(DEFAULT_WORKSPACE, &rev.change_id.short(8))
+            .unwrap(),
+        wc
+    );
     assert_eq!(repo.resolve(DEFAULT_WORKSPACE, &wc.short(10)).unwrap(), wc);
     let mut tx = repo.start("bookmark");
     tx.set_bookmark("main", wc).unwrap();
@@ -226,6 +259,11 @@ fn stale_transaction_is_rejected() {
     assert!(repo.commit(b).is_err());
     assert!(repo.view().bookmarks.contains_key("first"));
 
-    let other = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
+    let other = Repo::init(
+        Arc::new(MemoryStore::new()),
+        Arc::new(MemoryOpHead::new()),
+        Settings::default(),
+    )
+    .unwrap();
     assert!(repo.commit(other.start("foreign")).is_err());
 }

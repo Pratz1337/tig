@@ -43,6 +43,44 @@ fn describe(r: &mut Repo, text: &str) {
 }
 
 #[test]
+fn snapshot_skips_a_merge_when_its_rewritten_parents_conflict() {
+    let mut r = repo();
+    let mut w = Workspace::open(&r, "default").unwrap();
+    let old_parent = w.working_revision();
+    let other_tree = tree(&**r.store(), &[("x", b"other")]);
+    let mut tx = r.start("other branch");
+    let other = tx.new_change(&[root_revision_id()], "other").unwrap();
+    let other = tx.rewrite(other, |rev| rev.tree = other_tree).unwrap();
+    r.commit(tx).unwrap();
+
+    let mut tx = r.start("merge branches");
+    let merged = tx.new_change(&[old_parent, other], "merged").unwrap();
+    tx.set_bookmark("merged", merged).unwrap();
+    r.commit(tx).unwrap();
+    let merged_before = r.revision(&merged).unwrap();
+
+    w.write(&r, &p("x"), b"parent edit").unwrap();
+    assert!(w.snapshot(&mut r).unwrap());
+    assert_ne!(w.working_revision(), old_parent);
+    assert!(!w.is_dirty());
+    assert_eq!(w.read(&r, &p("x")).unwrap().unwrap(), b"parent edit");
+    assert_eq!(r.view().bookmarks["merged"], merged);
+    assert_eq!(r.revision(&merged).unwrap(), merged_before);
+    assert_eq!(r.last_skipped_rebases().len(), 1);
+    assert_eq!(r.last_skipped_rebases()[0].change, merged_before.change_id);
+    assert_eq!(r.last_skipped_rebases()[0].paths, vec![p("x")]);
+    let visible = r.visible_revisions().unwrap();
+    assert!(visible.iter().any(|(id, _)| *id == old_parent));
+    assert!(visible.iter().any(|(id, _)| *id == w.working_revision()));
+
+    // The same conflict remains a refusal for an explicit merge.
+    let mut tx = r.start("explicit merge");
+    let before = tx.view().clone();
+    assert!(tx.new_change(&[w.working_revision(), other], "").is_err());
+    assert_eq!(tx.view(), &before);
+}
+
+#[test]
 fn deleting_directory_then_recreating_child_keeps_siblings_deleted() {
     let mut r = repo();
     let mut w = Workspace::open(&r, "default").unwrap();
@@ -354,7 +392,12 @@ fn conflicting_descendant_stays_on_previous_parent() {
     // The child kept its old parent, and both stay visible.
     assert_eq!(r.working_revision("default").unwrap(), child);
     assert_eq!(r.revision(&child).unwrap().parents, vec![a]);
-    let visible: Vec<_> = r.visible_revisions().unwrap().into_iter().map(|(id, _)| id).collect();
+    let visible: Vec<_> = r
+        .visible_revisions()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     assert!(visible.contains(&a) && visible.contains(&a2) && visible.contains(&child));
 }
 

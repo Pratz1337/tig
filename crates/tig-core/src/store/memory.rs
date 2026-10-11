@@ -32,7 +32,12 @@ impl Store for MemoryStore {
     }
 
     fn kind(&self, id: &ObjectId) -> Result<Option<ObjectKind>> {
-        Ok(self.objects.read().expect("lock poisoned").get(id).map(|(kind, _)| *kind))
+        Ok(self
+            .objects
+            .read()
+            .expect("lock poisoned")
+            .get(id)
+            .map(|(kind, _)| *kind))
     }
 
     fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> Result<()> {

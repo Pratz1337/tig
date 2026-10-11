@@ -441,12 +441,17 @@ fn rewrite_checks_kind_only_when_tree_changes() {
     let old = r.working_revision("default").unwrap();
     let mut tx = r.start("kind checks");
     assert_eq!(tx.rewrite(old, |_| {}).unwrap(), old);
-    let described = tx.rewrite(old, |rev| rev.description = "description".into()).unwrap();
+    let described = tx
+        .rewrite(old, |rev| rev.description = "description".into())
+        .unwrap();
     assert_eq!(store.kind_calls.load(Ordering::Relaxed), 0);
 
-    let edits = [(p("file"), Some(Leaf::file(store.put_blob(b"file").unwrap())))]
-        .into_iter()
-        .collect();
+    let edits = [(
+        p("file"),
+        Some(Leaf::file(store.put_blob(b"file").unwrap())),
+    )]
+    .into_iter()
+    .collect();
     let tree = apply_edits(&*store, &empty_tree_id(), &edits).unwrap();
     let rewritten = tx.rewrite(described, |rev| rev.tree = tree).unwrap();
     assert_eq!(store.get_revision(&rewritten).unwrap().tree, tree);

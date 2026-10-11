@@ -3,6 +3,9 @@
 Both tools are driven through their real command-line binaries, so the
 numbers include process start-up, exactly what a user sees.
 
+Generated repositories are a fairness fixture. They are not proof of
+real monorepo performance.
+
     python bench/compare.py --files 10000 100000 --runs 5
 
 Prints a markdown table; --json writes raw samples. Release build first:
@@ -44,9 +47,17 @@ def make_tree(root: Path, files: int, seed: int = 7) -> None:
         (d / f"file{i:07d}.txt").write_bytes(rng.randbytes(size // 2).hex().encode()[:size])
 
 
-def run(cmd, cwd):
+def run(cmds, cwd):
+    """Wall time for one argv, or several argv lists back to back.
+
+    Each entry is a real CLI process, so start-up is included. A list of
+    lists is one sample: git's first scenario is init, add, and commit.
+    """
+    if isinstance(cmds[0], str):
+        cmds = [cmds]
     start = time.perf_counter()
-    subprocess.run(cmd, cwd=cwd, env=ENV, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for cmd in cmds:
+        subprocess.run(cmd, cwd=cwd, env=ENV, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return time.perf_counter() - start
 
 
@@ -56,16 +67,29 @@ def touch_one(root: Path, n: int) -> None:
 
 
 def scenarios(tool: str):
-    """(name, setup-or-None, command) in the order they run on one repo."""
+    """(name, setup-or-None, command) in the order they run on one repo.
+
+    command is one argv list, or a list of them timed as a single sample.
+    Git's first sample is init, add, and the initial commit. tig init
+    snapshots the initial change; new then records it as the parent of an
+    empty working change, so both tools begin the status samples clean.
+    """
     if tool == "git":
         return [
-            ("init + first snapshot", ["git", "init", "-q"], ["git", "add", "-A"]),
+            ("init + first snapshot", None, [
+                ["git", "init", "-q"],
+                ["git", "add", "-A"],
+                ["git", "commit", "-qm", "base"],
+            ]),
             ("status, no change", None, ["git", "status", "--porcelain"]),
             ("status, 1 file edited", "edit", ["git", "status", "--porcelain"]),
             ("record change", "edit", ["git", "commit", "-qam", "x"]),
         ]
     return [
-        ("init + first snapshot", None, [str(TIG), "init", "."]),
+        ("init + first snapshot", None, [
+            [str(TIG), "init", "."],
+            [str(TIG), "new", "-m", "base"],
+        ]),
         ("status, no change", None, [str(TIG), "status"]),
         ("status, 1 file edited", "edit", [str(TIG), "status"]),
         ("record change", "edit", [str(TIG), "new", "-m", "x"]),
@@ -80,14 +104,9 @@ def bench(files: int, runs: int):
             with tempfile.TemporaryDirectory(prefix=f"tigbench-{tool}-") as tmp:
                 root = Path(tmp)
                 make_tree(root, files)
-                # git needs an initial commit before 'commit -a' style flows.
                 for i, (name, setup, cmd) in enumerate(scenarios(tool)):
                     if setup == "edit":
                         touch_one(root, r * 10 + i)
-                    elif setup:
-                        subprocess.run(setup, cwd=root, env=ENV, check=True, stdout=subprocess.DEVNULL)
-                    if tool == "git" and name == "status, no change":
-                        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, env=ENV, check=True)
                     samples[name].append(run(cmd, root))
         results[tool] = samples
     return results

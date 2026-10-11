@@ -7,6 +7,15 @@
 //! The caller keeps [`PublishState`] and, on the first publish, the
 //! [`OwnerKeys`] in the report. The owner passes those keys back on later
 //! publishes and never takes an epoch key from the remote.
+//!
+//! Empty remote, keys already saved: pass `Some(owner_keys)` when the
+//! keyring file is absent. Publish builds the keyring from that epoch
+//! secret and writes the file only after the refusal checks. The caller
+//! must save the keys before `publish` returns, so a crash cannot leave a
+//! remote keyring whose secret existed only in a dead process. Passing
+//! `None` still mints the keys inside this call and returns them; that
+//! path writes the keyring before the caller can save, so the CLI does
+//! not use it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -260,7 +269,8 @@ pub struct PublishReport {
     pub public_objects_written: usize,
     pub private_objects_sealed: usize,
     pub sealed_roots: usize,
-    /// Set when this call created the remote's keyring. The caller saves it.
+    /// Set when this call minted the epoch secret. The caller saves it.
+    /// Absent when the caller passed keys it had already saved.
     pub new_owner_keys: Option<OwnerKeys>,
     pub warnings: Vec<String>,
 }
@@ -270,20 +280,29 @@ struct Plan {
     projection: Projection,
 }
 
+struct Fresh {
+    keyring: Keyring,
+    /// `None` when the caller already saved the epoch secret and passed it in.
+    new_keys: Option<OwnerKeys>,
+}
+
 struct Session {
     epoch_key: EpochKey,
     counter: u64,
     pin: [u8; 32],
-    /// Keyring not yet written, and the owner's new local keys.
-    fresh: Option<(Keyring, OwnerKeys)>,
+    /// Keyring not yet written. Held until refusal checks have passed.
+    fresh: Option<Fresh>,
 }
 
 /// Publishes `rev` and its unpublished ancestors to `remote` under `bookmark`.
 ///
-/// The first call on an empty remote (no keyring) makes `identity` the owner,
-/// pins that signing key, and returns fresh [`OwnerKeys`]. Later calls check
-/// the pinned key and `state.counter`, then encrypt with the owner's local
-/// key or, for a member, with [`crate::keyring::VerifiedKeyring::current_key`].
+/// The first call on an empty remote (no keyring) makes `identity` the owner
+/// and pins that signing key. With `owner_keys == None` it mints
+/// [`OwnerKeys`] and returns them. With `Some` keys whose remote id matches,
+/// it reuses that saved epoch secret instead (see the module docs). Later
+/// calls check the pinned key and `state.counter`, then encrypt with the
+/// owner's local key or, for a member, with
+/// [`crate::keyring::VerifiedKeyring::current_key`].
 ///
 /// On `Err`, `state` is unchanged and nothing new has been written. A failure
 /// after the remote accepted some objects (a crash, or a disk error) can
@@ -316,11 +335,13 @@ pub fn publish(
             projection,
         });
     }
-    let checked = check_refusals(state, &plans, options)?;
+    let mut ever_public = state.ever_public.clone();
+    ever_public.extend(remote_public_paths(remote)?);
+    let checked = check_refusals(state, &ever_public, &plans, options)?;
 
     let mut written = 0usize;
-    if let Some((keyring, _)) = &session.fresh {
-        remote.write_keyring(&keyring.encode()?)?;
+    if let Some(fresh) = &session.fresh {
+        remote.write_keyring(&fresh.keyring.encode()?)?;
     }
     write_canonical(
         remote.public_store(),
@@ -370,10 +391,9 @@ pub fn publish(
         let public_id = public_ids[&plan.internal];
         state.revisions.insert(plan.internal, public_id);
     }
-    state.ever_public.extend(checked.new_public);
-    state
-        .confirmed_negations
-        .extend(checked.confirmed);
+    ever_public.extend(checked.new_public);
+    state.ever_public = ever_public;
+    state.confirmed_negations.extend(checked.confirmed);
     if !new_wires.is_empty() {
         state
             .sent
@@ -381,7 +401,7 @@ pub fn publish(
             .or_default()
             .extend(new_wires);
     }
-    let new_owner_keys = session.fresh.map(|(_, keys)| keys);
+    let new_owner_keys = session.fresh.and_then(|fresh| fresh.new_keys);
     Ok(PublishReport {
         revisions_published: plans.len(),
         public_objects_written: written,
@@ -407,15 +427,42 @@ fn open_session(
                     "this publish state is already bound, but the remote has no keyring".into(),
                 ));
             }
-            let (keyring, keys) = Keyring::create(remote_id, identity)?;
+            // Saved keys win over minting a new epoch. The caller stored them
+            // before this call; the keyring file is written only after the
+            // refusal checks, from this same secret.
+            let (keyring, new_keys) = match owner_keys {
+                Some(saved) => {
+                    if saved.remote != remote_id {
+                        return Err(PublishError::Invalid(
+                            "owner keys are for a different remote".into(),
+                        ));
+                    }
+                    (Keyring::from_saved_owner(identity, saved)?, None)
+                }
+                None => {
+                    let (keyring, keys) = Keyring::create(remote_id, identity)?;
+                    (keyring, Some(keys))
+                }
+            };
             let pin = identity.public().signing;
             keyring.verify(&pin, 0)?;
-            let epoch_key = owner_epoch_key(&keys, remote_id, 1)?;
+            let epoch_source = match &new_keys {
+                Some(keys) => keys,
+                None => match owner_keys {
+                    Some(saved) => saved,
+                    None => {
+                        return Err(PublishError::Invalid(
+                            "owner keys disappeared while opening the remote".into(),
+                        ))
+                    }
+                },
+            };
+            let epoch_key = owner_epoch_key(epoch_source, remote_id, 1)?;
             Ok(Session {
                 epoch_key,
                 counter: keyring.head.counter,
                 pin,
-                fresh: Some((keyring, keys)),
+                fresh: Some(Fresh { keyring, new_keys }),
             })
         }
         Err(error) => Err(error.into()),
@@ -574,13 +621,47 @@ struct Checked {
     confirmed: BTreeSet<RepoPath>,
 }
 
+/// A different publisher or branch may have exposed a path before this
+/// caller's state existed. Include the remote's reachable public history.
+fn remote_public_paths(remote: &DirRemote) -> Result<BTreeSet<RepoPath>, PublishError> {
+    let tips: Vec<_> = remote.read_refs()?.values().copied().collect();
+    let store = remote.public_store();
+    let revisions = parent_first(store, &tips, |id| id == root_revision_id())?;
+    let mut paths = BTreeSet::new();
+    let mut entries = 0usize;
+    for id in revisions {
+        let mut stack = vec![(store.get_revision(&id)?.tree, RepoPath::root(), 0usize)];
+        while let Some((tree, prefix, depth)) = stack.pop() {
+            if depth > MAX_TREE_DEPTH {
+                return Err(PublishError::Invalid("remote tree is too deep".into()));
+            }
+            for entry in store.get_tree(&tree)?.entries() {
+                entries += 1;
+                if entries > MAX_PATHS {
+                    return Err(PublishError::Invalid(
+                        "remote history has too many paths".into(),
+                    ));
+                }
+                let path = prefix.join(entry.name())?;
+                if entry.kind() == EntryKind::Tree {
+                    stack.push((entry.id(), path, depth + 1));
+                } else if entry.kind().is_file_like() {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
 fn check_refusals(
     state: &PublishState,
+    ever_public: &BTreeSet<RepoPath>,
     plans: &[Plan],
     options: &PublishOptions,
 ) -> Result<Checked, PublishError> {
     let empty = empty_blob();
-    let mut seen_public = state.ever_public.clone();
+    let mut seen_public = ever_public.clone();
     let mut leaked = BTreeSet::new();
     let mut pastes = BTreeSet::new();
     let mut negations = BTreeSet::new();
@@ -593,7 +674,7 @@ fn check_refusals(
         }
         pastes.extend(pastes_in(&plan.projection, empty));
         for path in &plan.projection.negated {
-            if !state.confirmed_negations.contains(path) {
+            if !seen_public.contains(path) && !state.confirmed_negations.contains(path) {
                 negations.insert(path.clone());
             }
         }

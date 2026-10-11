@@ -51,7 +51,7 @@ pub(super) fn load() -> Result<Loaded> {
     })
 }
 
-fn env_nonempty(key: &str) -> Result<Option<String>> {
+pub(super) fn env_nonempty(key: &str) -> Result<Option<String>> {
     match env::var(key) {
         Ok(value) => {
             let value = value.trim();
@@ -79,7 +79,7 @@ fn os_user() -> String {
 }
 
 /// `HOME` when it is set, otherwise `USERPROFILE`. Git for Windows does the same.
-fn home_dir() -> Option<PathBuf> {
+pub(super) fn home_dir() -> Option<PathBuf> {
     let home = env::var_os("HOME").filter(|value| !value.is_empty());
     let profile = env::var_os("USERPROFILE").filter(|value| !value.is_empty());
     home.or(profile).map(PathBuf::from)

@@ -1,4 +1,4 @@
-//! `tig op log` and `tig op restore`
+//! Operation history, restoration and integrity recovery.
 
 use std::path::Path;
 
@@ -10,9 +10,34 @@ use crate::ui;
 
 pub(super) fn run(repository: Option<&Path>, action: OpAction) -> Result<()> {
     match action {
+        OpAction::Recover => recover(repository),
         OpAction::Log { limit } => log(repository, limit),
         OpAction::Restore { op } => restore(repository, &op),
     }
+}
+
+fn recover(repository: Option<&Path>) -> Result<()> {
+    let mut session = super::open_session(repository)?;
+    let original = session
+        .repo
+        .recovered_from()
+        .unwrap_or(session.repo.op_id());
+    session.repo.recover()?;
+    let restored = session.repo.op_id();
+    // Keep disk bytes intact. The next snapshot reads them against the
+    // verified view instead of trusting a cache from the lost operation.
+    if original != restored {
+        session.wc.invalidate_state()?;
+        println!(
+            "recovered operation {} to {}",
+            original.short(12),
+            restored.short(12)
+        );
+        println!("files on disk preserved; next snapshot will re-scan every file");
+    } else {
+        println!("operation {} is complete", restored.short(12));
+    }
+    Ok(())
 }
 
 fn log(repository: Option<&Path>, limit: Option<usize>) -> Result<()> {

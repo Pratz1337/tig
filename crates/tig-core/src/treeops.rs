@@ -46,24 +46,39 @@ impl Leaf {
     }
 
     pub fn file(id: ObjectId) -> Self {
-        Leaf { kind: EntryKind::File, id }
+        Leaf {
+            kind: EntryKind::File,
+            id,
+        }
     }
 
     pub fn executable(id: ObjectId) -> Self {
-        Leaf { kind: EntryKind::Executable, id }
+        Leaf {
+            kind: EntryKind::Executable,
+            id,
+        }
     }
 
     pub fn symlink(id: ObjectId) -> Self {
-        Leaf { kind: EntryKind::Symlink, id }
+        Leaf {
+            kind: EntryKind::Symlink,
+            id,
+        }
     }
 
     pub fn tree(id: ObjectId) -> Self {
-        Leaf { kind: EntryKind::Tree, id }
+        Leaf {
+            kind: EntryKind::Tree,
+            id,
+        }
     }
 
     /// A public stand-in. `id` is a [`SealedId`], not an object id.
     pub fn sealed(id: SealedId) -> Self {
-        Leaf { kind: EntryKind::Sealed, id: ObjectId(*id.as_bytes()) }
+        Leaf {
+            kind: EntryKind::Sealed,
+            id: ObjectId(*id.as_bytes()),
+        }
     }
 
     pub fn kind(self) -> EntryKind {
@@ -87,7 +102,10 @@ impl Leaf {
     /// Copies a stored entry, including a sealed one decoded from a tree.
     /// Does not go through [`Leaf::new`], which rejects `Sealed`.
     pub(crate) fn from_entry(entry: &TreeEntry) -> Self {
-        Leaf { kind: entry.kind(), id: entry.id() }
+        Leaf {
+            kind: entry.kind(),
+            id: entry.id(),
+        }
     }
 
     /// Builds a [`TreeEntry`]. Sealed leaves go through [`TreeEntry::sealed`];
@@ -227,7 +245,14 @@ pub fn diff_trees_under(
     let mut out = Vec::new();
     let old_leaf = resolved_leaf(resolve(store, *old, dir)?);
     let new_leaf = resolved_leaf(resolve(store, *new, dir)?);
-    diff_work(store, dir.clone(), path_depth(dir), old_leaf, new_leaf, &mut out)?;
+    diff_work(
+        store,
+        dir.clone(),
+        path_depth(dir),
+        old_leaf,
+        new_leaf,
+        &mut out,
+    )?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
@@ -239,7 +264,9 @@ fn path_depth(path: &RepoPath) -> usize {
 }
 
 fn too_deep() -> Error {
-    Error::Invalid(format!("tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})"))
+    Error::Invalid(format!(
+        "tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})"
+    ))
 }
 
 fn ensure_depth(path: &RepoPath) -> Result<()> {
@@ -348,14 +375,16 @@ fn index_edits(edits: &BTreeMap<RepoPath, Option<Leaf>>) -> Result<BTreeMap<Repo
     nodes.insert(RepoPath::root(), DirNode::default());
     for (path, leaf) in edits {
         if path.is_root() {
-            return Err(Error::Invalid("root edit belongs in root_replacement".into()));
+            return Err(Error::Invalid(
+                "root edit belongs in root_replacement".into(),
+            ));
         }
-        let name = path.file_name().ok_or_else(|| {
-            Error::Invalid("empty path has no component".into())
-        })?;
-        let parent = path.parent().ok_or_else(|| {
-            Error::Invalid("empty path has no component".into())
-        })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
         nodes
             .entry(parent.clone())
             .or_default()
@@ -364,12 +393,12 @@ fn index_edits(edits: &BTreeMap<RepoPath, Option<Leaf>>) -> Result<BTreeMap<Repo
 
         let mut dir = parent;
         while !dir.is_root() {
-            let child_name = dir.file_name().ok_or_else(|| {
-                Error::Invalid("empty path has no component".into())
-            })?;
-            let up = dir.parent().ok_or_else(|| {
-                Error::Invalid("empty path has no component".into())
-            })?;
+            let child_name = dir
+                .file_name()
+                .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
+            let up = dir
+                .parent()
+                .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
             nodes
                 .entry(up.clone())
                 .or_default()
@@ -421,15 +450,15 @@ fn directory_base(
     if path.is_root() {
         return Ok(*root);
     }
-    let parent = path.parent().ok_or_else(|| {
-        Error::Invalid("empty path has no component".into())
-    })?;
-    let name = path.file_name().ok_or_else(|| {
-        Error::Invalid("empty path has no component".into())
-    })?;
-    let (_, parent_tree) = loaded.get(&parent).ok_or_else(|| {
-        Error::Invalid(format!("missing parent tree for {}", display_path(path)))
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Invalid("empty path has no component".into()))?;
+    let (_, parent_tree) = loaded
+        .get(&parent)
+        .ok_or_else(|| Error::Invalid(format!("missing parent tree for {}", display_path(path))))?;
     // A file, symlink, executable, or seal is not a directory. Deletes
     // underneath are a no-op; a put builds a fresh directory.
     Ok(match parent_tree.get(name) {
@@ -478,7 +507,11 @@ fn apply_dir(
     }
     if entries.is_empty() {
         // The root may be empty. Any other empty directory is omitted.
-        return Ok(if path.is_root() { Some(empty_tree_id()) } else { None });
+        return Ok(if path.is_root() {
+            Some(empty_tree_id())
+        } else {
+            None
+        });
     }
     if entries.as_slice() == base_tree.entries() {
         return Ok(Some(base_id));
@@ -511,11 +544,7 @@ fn write_slot(entries: &mut Vec<TreeEntry>, name: &str, slot: Slot, leaf: Leaf) 
     Ok(())
 }
 
-fn apply_action(
-    entries: &mut Vec<TreeEntry>,
-    name: &str,
-    action: DirAction,
-) -> Result<()> {
+fn apply_action(entries: &mut Vec<TreeEntry>, name: &str, action: DirAction) -> Result<()> {
     let slot = find_slot(entries, name);
     match action {
         DirAction::Here(None) => {
@@ -644,14 +673,34 @@ fn diff_work(
     new: Option<Leaf>,
     out: &mut Vec<DiffEntry>,
 ) -> Result<()> {
-    let mut stack = vec![Work::Pair { path, depth, old, new }];
+    let mut stack = vec![Work::Pair {
+        path,
+        depth,
+        old,
+        new,
+    }];
     while let Some(work) = stack.pop() {
         match work {
-            Work::Pair { path, depth, old, new } => queue_pair(path, depth, old, new, &mut stack, out)?,
-            Work::Join { old, new, prefix, depth } => {
+            Work::Pair {
+                path,
+                depth,
+                old,
+                new,
+            } => queue_pair(path, depth, old, new, &mut stack, out)?,
+            Work::Join {
+                old,
+                new,
+                prefix,
+                depth,
+            } => {
                 queue_join(store, old, new, &prefix, depth, &mut stack)?;
             }
-            Work::Emit { id, prefix, side, depth } => {
+            Work::Emit {
+                id,
+                prefix,
+                side,
+                depth,
+            } => {
                 queue_emit(store, id, &prefix, side, depth, &mut stack, out)?;
             }
         }
@@ -673,38 +722,83 @@ fn queue_pair(
     match (old.map(as_node), new.map(as_node)) {
         (Some(Node::Tree(a)), Some(Node::Tree(b))) if a == b => Ok(()),
         (Some(Node::Tree(a)), Some(Node::Tree(b))) => {
-            stack.push(Work::Join { old: a, new: b, prefix: path, depth });
+            stack.push(Work::Join {
+                old: a,
+                new: b,
+                prefix: path,
+                depth,
+            });
             Ok(())
         }
         (Some(Node::Leaf(a)), Some(Node::Leaf(b))) if a != b => {
-            out.push(DiffEntry { path, old: Some(a), new: Some(b) });
+            out.push(DiffEntry {
+                path,
+                old: Some(a),
+                new: Some(b),
+            });
             Ok(())
         }
         (Some(Node::Leaf(_)), Some(Node::Leaf(_))) => Ok(()),
         (Some(Node::Tree(id)), Some(Node::Leaf(leaf))) => {
-            out.push(DiffEntry { path: path.clone(), old: None, new: Some(leaf) });
-            stack.push(Work::Emit { id, prefix: path, side: Side::Old, depth });
+            out.push(DiffEntry {
+                path: path.clone(),
+                old: None,
+                new: Some(leaf),
+            });
+            stack.push(Work::Emit {
+                id,
+                prefix: path,
+                side: Side::Old,
+                depth,
+            });
             Ok(())
         }
         (Some(Node::Leaf(leaf)), Some(Node::Tree(id))) => {
-            out.push(DiffEntry { path: path.clone(), old: Some(leaf), new: None });
-            stack.push(Work::Emit { id, prefix: path, side: Side::New, depth });
+            out.push(DiffEntry {
+                path: path.clone(),
+                old: Some(leaf),
+                new: None,
+            });
+            stack.push(Work::Emit {
+                id,
+                prefix: path,
+                side: Side::New,
+                depth,
+            });
             Ok(())
         }
         (Some(Node::Tree(id)), None) => {
-            stack.push(Work::Emit { id, prefix: path, side: Side::Old, depth });
+            stack.push(Work::Emit {
+                id,
+                prefix: path,
+                side: Side::Old,
+                depth,
+            });
             Ok(())
         }
         (Some(Node::Leaf(leaf)), None) => {
-            out.push(DiffEntry { path, old: Some(leaf), new: None });
+            out.push(DiffEntry {
+                path,
+                old: Some(leaf),
+                new: None,
+            });
             Ok(())
         }
         (None, Some(Node::Tree(id))) => {
-            stack.push(Work::Emit { id, prefix: path, side: Side::New, depth });
+            stack.push(Work::Emit {
+                id,
+                prefix: path,
+                side: Side::New,
+                depth,
+            });
             Ok(())
         }
         (None, Some(Node::Leaf(leaf))) => {
-            out.push(DiffEntry { path, old: None, new: Some(leaf) });
+            out.push(DiffEntry {
+                path,
+                old: None,
+                new: Some(leaf),
+            });
             Ok(())
         }
         (None, None) => Ok(()),
@@ -813,8 +907,16 @@ fn queue_emit(
         } else {
             let leaf = Some(Leaf::from_entry(entry));
             out.push(match side {
-                Side::Old => DiffEntry { path, old: leaf, new: None },
-                Side::New => DiffEntry { path, old: None, new: leaf },
+                Side::Old => DiffEntry {
+                    path,
+                    old: leaf,
+                    new: None,
+                },
+                Side::New => DiffEntry {
+                    path,
+                    old: None,
+                    new: leaf,
+                },
             });
         }
     }
@@ -1513,18 +1615,18 @@ mod tests {
 
         let listed = walk(&store, &next, &RepoPath::root()).unwrap();
         assert_eq!(paths_of(&listed), vec!["pub.txt", "secret"]);
-        let found = listed.iter().find(|(path, _)| path.as_str() == "secret").unwrap().1;
+        let found = listed
+            .iter()
+            .find(|(path, _)| path.as_str() == "secret")
+            .unwrap()
+            .1;
         assert_eq!(found.kind(), EntryKind::Sealed);
         assert_eq!(found.sealed_id(), Some(sid));
         assert_ne!(found.id(), private);
 
         // A walked sealed leaf can be written back. into_entry uses SealedId.
-        let copied = apply_edits(
-            &store,
-            &empty_tree_id(),
-            &batch(&[("copy", Some(found))]),
-        )
-        .unwrap();
+        let copied =
+            apply_edits(&store, &empty_tree_id(), &batch(&[("copy", Some(found))])).unwrap();
         let copy = store.get_tree(&copied).unwrap();
         assert_eq!(copy.get("copy").unwrap().sealed_id(), Some(sid));
         assert_eq!(copy.get("copy").unwrap().kind(), EntryKind::Sealed);
@@ -1546,7 +1648,9 @@ mod tests {
     /// file path has `depth` components.
     fn chain_bottom_up(store: &MemoryStore, depth: usize, leaf: Leaf) -> ObjectId {
         let mut id = store
-            .put(&Object::Tree(Tree::new(vec![leaf.into_entry("f").unwrap()]).unwrap()))
+            .put(&Object::Tree(
+                Tree::new(vec![leaf.into_entry("f").unwrap()]).unwrap(),
+            ))
             .unwrap();
         for _ in 1..depth {
             id = store

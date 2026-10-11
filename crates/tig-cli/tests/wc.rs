@@ -57,7 +57,10 @@ fn settle(wc: &mut WorkingCopy, repo: &mut tig_core::repo::Repo, clock: SystemTi
     wc.snapshot(repo).unwrap();
     let quiet = wc.snapshot(repo).unwrap();
     assert_eq!(quiet.hashed, 0, "unchanged files were hashed: {quiet:?}");
-    assert_eq!(quiet.changed, 0, "unchanged files wrote an operation: {quiet:?}");
+    assert_eq!(
+        quiet.changed, 0,
+        "unchanged files wrote an operation: {quiet:?}"
+    );
 }
 
 fn file_bytes(wc: &WorkingCopy, rel: &str) -> Vec<u8> {
@@ -118,6 +121,62 @@ fn snapshot_detects_add_modify_delete_and_skips_unchanged() {
     assert_eq!(tracked(&repo, "hello.txt").unwrap(), b"changed\r\n");
     assert_eq!(tracked(&repo, "added.txt").unwrap(), b"added");
     assert_eq!(tracked(&repo, "gone.txt"), None);
+    let op = repo.op_id();
+    let quiet = wc.snapshot(&mut repo).unwrap();
+    assert_eq!(quiet.changed, 0, "deleted rows must leave the stat cache");
+    assert_eq!(repo.op_id(), op);
+}
+
+#[test]
+fn clean_snapshots_preserve_state_but_stat_changes_are_persisted() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("work.txt"), b"same content").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    let clock = SystemTime::now() + Duration::from_secs(3600);
+    wc.set_clock(Some(clock));
+    wc.snapshot(&mut repo).unwrap();
+    let state = dir.path().join(".tig/workspaces/default/state");
+    set_mtime(&state, clock - Duration::from_secs(7200));
+    let time = fs::metadata(&state).unwrap().modified().unwrap();
+    let bytes = fs::read(&state).unwrap();
+    assert_eq!(wc.snapshot(&mut repo).unwrap().hashed, 0);
+    assert_eq!(fs::metadata(&state).unwrap().modified().unwrap(), time);
+    assert_eq!(fs::read(&state).unwrap(), bytes);
+
+    // The blob is identical, but the next command must retain the new stat row.
+    set_mtime(
+        &dir.path().join("work.txt"),
+        clock - Duration::from_secs(1800),
+    );
+    let stats = wc.snapshot(&mut repo).unwrap();
+    assert_eq!(stats.hashed, 1);
+    assert_eq!(stats.changed, 0);
+    assert_ne!(fs::read(&state).unwrap(), bytes);
+    let (mut repo, mut wc) = WorkingCopy::open(dir.path(), settings()).unwrap();
+    wc.set_clock(Some(clock));
+    assert_eq!(wc.snapshot(&mut repo).unwrap().hashed, 0);
+}
+
+#[test]
+fn checkout_of_identical_tree_preserves_dirty_files_and_records_the_revision_move() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("work.txt"), b"snapshot").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    let working = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+    let mut tx = repo.start("new");
+    let child = tx.new_change(&[working], "child").unwrap();
+    tx.set_working(DEFAULT_WORKSPACE, child).unwrap();
+    repo.commit(tx).unwrap();
+    fs::write(dir.path().join("work.txt"), b"unsnapshotted edit").unwrap();
+    let stats = wc.checkout(&repo).unwrap();
+    assert_eq!((stats.written, stats.removed), (0, 0));
+    assert_eq!(
+        fs::read(dir.path().join("work.txt")).unwrap(),
+        b"unsnapshotted edit"
+    );
+    let (mut repo, mut wc) = WorkingCopy::open(dir.path(), settings()).unwrap();
+    assert_eq!(wc.snapshot_with_rehash(&mut repo, true).unwrap().changed, 1);
+    assert_eq!(tracked(&repo, "work.txt").unwrap(), b"unsnapshotted edit");
 }
 
 #[test]
@@ -177,10 +236,7 @@ fn ignore_files_and_tig_dir_are_not_scanned() {
         "metadata dir was snapshotted: {files:?}"
     );
     assert!(
-        stats
-            .warnings
-            .iter()
-            .all(|w| !w.contains("not-in-repo")),
+        stats.warnings.iter().all(|w| !w.contains("not-in-repo")),
         "{stats:?}"
     );
 }
@@ -244,7 +300,10 @@ fn checkout_refuses_device_names_case_collisions_and_short_names() {
     let err = wc.checkout(&repo).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("aux.c"), "{msg}");
-    assert!(!wc.root().join("ok.txt").exists(), "partial checkout wrote ok.txt");
+    assert!(
+        !wc.root().join("ok.txt").exists(),
+        "partial checkout wrote ok.txt"
+    );
     assert!(!wc.root().join("aux.c").exists());
     assert_eq!(file_bytes(&wc, "keep.txt"), b"keep");
 
@@ -291,7 +350,9 @@ fn secondary_workspace_shares_the_store() {
     let pointed = fs::canonicalize(pointer.trim()).unwrap();
     assert_eq!(pointed, fs::canonicalize(wc.root().join(".tig")).unwrap());
     assert!(fs::metadata(wc.root().join(".tig")).unwrap().is_dir());
-    assert!(fs::metadata(secondary.root().join(".tig")).unwrap().is_file());
+    assert!(fs::metadata(secondary.root().join(".tig"))
+        .unwrap()
+        .is_file());
 
     let root_file = fs::read_to_string(
         wc.root()
@@ -307,7 +368,9 @@ fn secondary_workspace_shares_the_store() {
     );
     assert_eq!(file_bytes(&secondary, "hello.txt"), b"hello");
 
-    let feature_rev = repo.revision(&repo.working_revision("feature").unwrap()).unwrap();
+    let feature_rev = repo
+        .revision(&repo.working_revision("feature").unwrap())
+        .unwrap();
     assert_eq!(feature_rev.parents, vec![parent]);
 
     fs::write(secondary.root().join("only-feature.txt"), b"feat").unwrap();
@@ -397,12 +460,16 @@ fn symlink_round_trip() {
 
     let id = repo.store().put_blob(b"target.txt").unwrap();
     let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
-    ws.set(&repo, path("link"), Some(Leaf::symlink(id))).unwrap();
+    ws.set(&repo, path("link"), Some(Leaf::symlink(id)))
+        .unwrap();
     assert!(ws.snapshot(&mut repo).unwrap());
     wc.checkout(&repo).unwrap();
 
     let link = wc.root().join("link");
-    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("target.txt"));
 
     let clock = SystemTime::now();
@@ -422,7 +489,8 @@ fn symlink_round_trip_or_stand_in() {
 
     let id = repo.store().put_blob(b"target.txt").unwrap();
     let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
-    ws.set(&repo, path("link"), Some(Leaf::symlink(id))).unwrap();
+    ws.set(&repo, path("link"), Some(Leaf::symlink(id)))
+        .unwrap();
     assert!(ws.snapshot(&mut repo).unwrap());
     wc.checkout(&repo).unwrap();
 
@@ -472,8 +540,16 @@ fn nested_workspaces_and_repos_are_not_scanned() {
 
     wc.snapshot(&mut repo).unwrap();
     assert!(tracked(&repo, "main.txt").is_some());
-    for nested in ["inner/only-inner.txt", "inner/main.txt", "other/only-other.txt", "other/.private"] {
-        assert!(tracked(&repo, nested).is_none(), "{nested} leaked into the outer repo");
+    for nested in [
+        "inner/only-inner.txt",
+        "inner/main.txt",
+        "other/only-other.txt",
+        "other/.private",
+    ] {
+        assert!(
+            tracked(&repo, nested).is_none(),
+            "{nested} leaked into the outer repo"
+        );
     }
 }
 
@@ -484,12 +560,19 @@ fn other_vcs_metadata_is_never_tracked() {
     let dir = TempDir::new().unwrap();
     for vcs in [".git", ".hg", ".svn", ".jj"] {
         fs::create_dir(dir.path().join(vcs)).unwrap();
-        fs::write(dir.path().join(vcs).join("config"), b"url = https://user:token@example.com").unwrap();
+        fs::write(
+            dir.path().join(vcs).join("config"),
+            b"url = https://user:token@example.com",
+        )
+        .unwrap();
     }
     fs::write(dir.path().join("real.txt"), b"r").unwrap();
     let (repo, _wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
     assert!(tracked(&repo, "real.txt").is_some());
     for vcs in [".git", ".hg", ".svn", ".jj"] {
-        assert!(tracked(&repo, &format!("{vcs}/config")).is_none(), "{vcs} was tracked");
+        assert!(
+            tracked(&repo, &format!("{vcs}/config")).is_none(),
+            "{vcs} was tracked"
+        );
     }
 }

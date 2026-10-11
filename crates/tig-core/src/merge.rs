@@ -22,15 +22,22 @@ pub enum MergeOutcome {
 /// Applies the changes `base -> theirs` on top of `ours`.
 ///
 /// Cost is proportional to the two diffs, not to the tree size.
-pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: &ObjectId) -> Result<MergeOutcome> {
+pub fn merge_trees(
+    store: &dyn Store,
+    base: &ObjectId,
+    ours: &ObjectId,
+    theirs: &ObjectId,
+) -> Result<MergeOutcome> {
     if base == theirs || ours == theirs {
         return Ok(MergeOutcome::Clean(*ours));
     }
     if base == ours {
         return Ok(MergeOutcome::Clean(*theirs));
     }
-    let our_changes: BTreeMap<RepoPath, Option<Leaf>> =
-        diff_trees(store, base, ours)?.into_iter().map(|d| (d.path, d.new)).collect();
+    let our_changes: BTreeMap<RepoPath, Option<Leaf>> = diff_trees(store, base, ours)?
+        .into_iter()
+        .map(|d| (d.path, d.new))
+        .collect();
     let mut edits = BTreeMap::new();
     let mut conflicts = Vec::new();
     for d in diff_trees(store, base, theirs)? {
@@ -45,7 +52,7 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
                 let mut overlap = (has_inside(&our_changes, &d.path)
                     || (our_changes.contains_key(&d.path)
                         && lookup(store, ours, &d.path)? != lookup(store, theirs, &d.path)?))
-                    .then(|| d.path.clone());
+                .then(|| d.path.clone());
                 let mut parent = d.path.parent();
                 while let Some(at) = parent.filter(|at| !at.is_root()) {
                     if our_changes.contains_key(&at) {
@@ -61,8 +68,9 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
                 let incompatible = if let Some(at) = overlap {
                     let ours = lookup(store, ours, &at)?;
                     let theirs = lookup(store, theirs, &at)?;
-                    ours != theirs && !(ours.is_some_and(|leaf| leaf.kind() == EntryKind::Tree)
-                        && theirs.is_some_and(|leaf| leaf.kind() == EntryKind::Tree))
+                    ours != theirs
+                        && !(ours.is_some_and(|leaf| leaf.kind() == EntryKind::Tree)
+                            && theirs.is_some_and(|leaf| leaf.kind() == EntryKind::Tree))
                 } else {
                     false
                 };
@@ -166,8 +174,14 @@ impl MergeGraph {
             tree: ObjectId,
             next: usize,
         }
-        let first = heads.first().ok_or_else(|| Error::Invalid("a merge needs at least one parent".into()))?;
-        let mut stack = vec![Frame { heads: heads.to_vec(), tree: self.revision(first)?.0, next: 1 }];
+        let first = heads
+            .first()
+            .ok_or_else(|| Error::Invalid("a merge needs at least one parent".into()))?;
+        let mut stack = vec![Frame {
+            heads: heads.to_vec(),
+            tree: self.revision(first)?.0,
+            next: 1,
+        }];
         let mut virtual_trees = BTreeMap::new();
         // Explicit frames keep nested criss-cross histories off the call stack.
         while let Some(frame) = stack.last_mut() {
@@ -189,7 +203,11 @@ impl MergeGraph {
                     Some(tree) => *tree,
                     None => {
                         let tree = self.revision(&bases[0])?.0;
-                        stack.push(Frame { heads: bases, tree, next: 1 });
+                        stack.push(Frame {
+                            heads: bases,
+                            tree,
+                            next: 1,
+                        });
                         continue;
                     }
                 },
@@ -252,7 +270,10 @@ mod tests {
         let ours = tree(&s, &[("a", b"2"), ("b", b"1")]);
         let theirs = tree(&s, &[("a", b"1"), ("b", b"2"), ("c", b"new")]);
         let want = tree(&s, &[("a", b"2"), ("b", b"2"), ("c", b"new")]);
-        assert_eq!(merge_trees(&s, &base, &ours, &theirs).unwrap(), MergeOutcome::Clean(want));
+        assert_eq!(
+            merge_trees(&s, &base, &ours, &theirs).unwrap(),
+            MergeOutcome::Clean(want)
+        );
     }
 
     #[test]
@@ -274,11 +295,17 @@ mod tests {
         let ours = tree(&s, &[("a", b"file"), ("z", b"2")]);
         let theirs = tree(&s, &[("a/x", b"in dir"), ("z", b"1")]);
         let want = tree(&s, &[("a/x", b"in dir"), ("z", b"2")]);
-        assert_eq!(merge_trees(&s, &base, &ours, &theirs).unwrap(), MergeOutcome::Clean(want));
+        assert_eq!(
+            merge_trees(&s, &base, &ours, &theirs).unwrap(),
+            MergeOutcome::Clean(want)
+        );
         // And back: directory to file.
         let want_back = tree(&s, &[("a", b"file"), ("z", b"2")]);
         let ours2 = tree(&s, &[("a/x", b"in dir"), ("z", b"2")]);
-        assert_eq!(merge_trees(&s, &theirs, &ours2, &base).unwrap(), MergeOutcome::Clean(want_back));
+        assert_eq!(
+            merge_trees(&s, &theirs, &ours2, &base).unwrap(),
+            MergeOutcome::Clean(want_back)
+        );
     }
 
     #[test]
@@ -287,7 +314,10 @@ mod tests {
         let base = tree(&s, &[("a/x", b"1")]);
         let ours = tree(&s, &[("a", b"now a file")]);
         let theirs = tree(&s, &[("a/x", b"2")]);
-        assert!(matches!(merge_trees(&s, &base, &ours, &theirs).unwrap(), MergeOutcome::Conflict(_)));
+        assert!(matches!(
+            merge_trees(&s, &base, &ours, &theirs).unwrap(),
+            MergeOutcome::Conflict(_)
+        ));
     }
 
     #[test]
@@ -304,16 +334,22 @@ mod tests {
 
         let base = tree_leaves(&s, &[("a", Leaf::file(a1)), ("secret", secret)]);
         let ours = tree_leaves(&s, &[("a", Leaf::file(a2)), ("secret", secret)]);
-        let theirs = tree_leaves(&s, &[
-            ("a", Leaf::file(a1)),
-            ("secret", secret2),
-            ("note", Leaf::file(note)),
-        ]);
-        let want = tree_leaves(&s, &[
-            ("a", Leaf::file(a2)),
-            ("secret", secret2),
-            ("note", Leaf::file(note)),
-        ]);
+        let theirs = tree_leaves(
+            &s,
+            &[
+                ("a", Leaf::file(a1)),
+                ("secret", secret2),
+                ("note", Leaf::file(note)),
+            ],
+        );
+        let want = tree_leaves(
+            &s,
+            &[
+                ("a", Leaf::file(a2)),
+                ("secret", secret2),
+                ("note", Leaf::file(note)),
+            ],
+        );
         let merged = merge_trees(&s, &base, &ours, &theirs).unwrap();
         assert_eq!(merged, MergeOutcome::Clean(want));
 
@@ -324,11 +360,14 @@ mod tests {
 
         // The same sealed update on both sides is not a conflict.
         let ours_same = tree_leaves(&s, &[("a", Leaf::file(a2)), ("secret", secret2)]);
-        let theirs_same = tree_leaves(&s, &[
-            ("a", Leaf::file(a1)),
-            ("secret", secret2),
-            ("note", Leaf::file(note)),
-        ]);
+        let theirs_same = tree_leaves(
+            &s,
+            &[
+                ("a", Leaf::file(a1)),
+                ("secret", secret2),
+                ("note", Leaf::file(note)),
+            ],
+        );
         assert_eq!(
             merge_trees(&s, &base, &ours_same, &theirs_same).unwrap(),
             MergeOutcome::Clean(want)

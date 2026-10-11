@@ -294,6 +294,83 @@ fn alice_publishes_secrets_bob_reads_them_carol_does_not() {
 }
 
 #[test]
+fn fresh_publisher_still_detects_previously_public_paths() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[("src/main.rs", MAIN)], &[]);
+    let alice = Identity::generate().unwrap();
+    let (_dir, remote) = remote_at([13; 16]);
+    let mut state = PublishState::new();
+    let keys = publish_at(
+        &repo,
+        &remote,
+        &alice,
+        None,
+        &mut state,
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap()
+    .new_owner_keys
+    .unwrap();
+    let mut other = self::repo();
+    let rev = save(
+        &mut other,
+        &[(".private", b"src/\n"), ("src/main.rs", MAIN)],
+        &[],
+    );
+    let before = files_of(_dir.path());
+    let result = publish_at(
+        &other,
+        &remote,
+        &alice,
+        Some(&keys),
+        &mut PublishState::new(),
+        rev,
+        &PublishOptions::default(),
+    );
+    assert!(
+        matches!(result, Err(PublishError::AlreadyLeaked { ref paths })
+        if paths.contains(&p("src/main.rs")))
+    );
+    assert_eq!(files_of(_dir.path()), before);
+}
+
+#[test]
+fn later_grant_opens_already_fetched_revisions() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[(".env", ENV), ("src/main.rs", MAIN)], &[]);
+    let alice = Identity::generate().unwrap();
+    let bob = Identity::generate().unwrap();
+    let (_dir, remote) = remote_at([12; 16]);
+    let mut published = PublishState::new();
+    let keys = publish_at(
+        &repo,
+        &remote,
+        &alice,
+        None,
+        &mut published,
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap()
+    .new_owner_keys
+    .unwrap();
+    let store = MemoryStore::new();
+    let mut state = FetchState::new();
+    let first = fetch(&remote, &store, Some(&bob), &mut state).unwrap();
+    let first_tree = store.get_revision(&tip(&first)).unwrap().tree;
+    assert_eq!(kind_at(&store, first_tree, ".env"), Some(EntryKind::Sealed));
+    grant(&remote, &keys, &alice, &bob);
+    let opened = fetch(&remote, &store, Some(&bob), &mut state).unwrap();
+    let tree = store.get_revision(&tip(&opened)).unwrap().tree;
+    assert_eq!(file_at(&store, tree, ".env"), ENV);
+    assert_eq!(opened.unsealed, 1);
+    let again = fetch(&remote, &store, None, &mut state).unwrap();
+    assert_eq!(tip(&again), tip(&opened));
+    assert_eq!(again.unsealed, 0);
+}
+
+#[test]
 fn built_in_floor_keeps_env_private_without_and_after_deleting_private() {
     let mut repo = repo();
     let rev = save(&mut repo, &[(".env", ENV), ("src/main.rs", MAIN)], &[]);

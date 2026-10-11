@@ -171,7 +171,11 @@ impl TreeEntry {
     pub fn sealed(name: impl Into<String>, sealed: SealedId) -> Result<Self> {
         let name = name.into();
         validate_name(&name)?;
-        Ok(TreeEntry { name, kind: EntryKind::Sealed, id: ObjectId(*sealed.as_bytes()) })
+        Ok(TreeEntry {
+            name,
+            kind: EntryKind::Sealed,
+            id: ObjectId(*sealed.as_bytes()),
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -205,8 +209,9 @@ pub struct Tree {
 /// ignores removed (git guards `.git` the same way).
 fn is_metadata_dir(name: &str) -> bool {
     const IGNORABLE: &[char] = &[
-        '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
-        '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}', '\u{206F}', '\u{FEFF}',
+        '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}',
+        '\u{202D}', '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}',
+        '\u{206F}', '\u{FEFF}',
     ];
     let visible: String = name.chars().filter(|c| !IGNORABLE.contains(c)).collect();
     visible.eq_ignore_ascii_case(".tig")
@@ -642,17 +647,29 @@ mod tests {
             hash_object(ObjectKind::Blob, b"hello\n").to_hex(),
             "887c6633a8c3d0b715bac9b815307d47430c8a2d679dae9e84e9e7735eb4444e"
         );
-        assert_eq!(Object::Tree(Tree::empty()).id().to_hex(), "43581fee33ae552ce24395c7610880617df277cef408a4988fe120e996bc2935");
+        assert_eq!(
+            Object::Tree(Tree::empty()).id().to_hex(),
+            "43581fee33ae552ce24395c7610880617df277cef408a4988fe120e996bc2935"
+        );
     }
 
     #[test]
     fn sealed_entries_need_a_sealed_id() {
         use crate::seal::SealSalt;
         assert!(TreeEntry::new("x", EntryKind::Sealed, ObjectId([1; 32])).is_err());
-        let sid = SealedId::compute(&SealSalt::from_bytes([3; 32]), EntryKind::File, &ObjectId([1; 32]));
+        let sid = SealedId::compute(
+            &SealSalt::from_bytes([3; 32]),
+            EntryKind::File,
+            &ObjectId([1; 32]),
+        );
         let e = TreeEntry::sealed("x", sid).unwrap();
         assert_eq!(e.sealed_id(), Some(sid));
-        assert_eq!(TreeEntry::new("f", EntryKind::File, ObjectId([1; 32])).unwrap().sealed_id(), None);
+        assert_eq!(
+            TreeEntry::new("f", EntryKind::File, ObjectId([1; 32]))
+                .unwrap()
+                .sealed_id(),
+            None
+        );
     }
 
     #[test]

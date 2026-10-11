@@ -144,8 +144,8 @@ fn directory_replacement_preserves_untracked_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-#[ignore = "Decision required: size + mtime cannot detect restored-timestamp edits"]
 fn snapshot_detects_same_size_edit_with_restored_mtime() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("work.txt");
@@ -453,10 +453,16 @@ fn checkout_refuses_generated_metadata_aliases() {
     }
     let (mut repo, mut wc) = WorkingCopy::init(dir.path(), Settings::default()).unwrap();
     let output = std::process::Command::new("cmd")
-        .args(["/c", "dir", "/x"]).arg(dir.path()).output().unwrap();
+        .args(["/c", "dir", "/x"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
     assert!(output.status.success());
     let listing = String::from_utf8_lossy(&output.stdout);
-    let line = listing.lines().find(|line| line.trim_end().ends_with(" .tig")).unwrap();
+    let line = listing
+        .lines()
+        .find(|line| line.trim_end().ends_with(" .tig"))
+        .unwrap();
     let columns: Vec<_> = line.split_whitespace().collect();
     let alias = columns[columns.len() - 2];
     if alias == "<DIR>" {
@@ -464,8 +470,12 @@ fn checkout_refuses_generated_metadata_aliases() {
         return;
     }
     let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
-    ws.write(&repo, &path(&format!("{alias}/intruder.txt")), b"intruder").unwrap();
+    ws.write(&repo, &path(&format!("{alias}/intruder.txt")), b"intruder")
+        .unwrap();
     ws.snapshot(&mut repo).unwrap();
-    assert!(wc.checkout(&repo).is_err(), "checkout wrote through metadata alias {alias}");
+    assert!(
+        wc.checkout(&repo).is_err(),
+        "checkout wrote through metadata alias {alias}"
+    );
     assert!(!wc.root().join(".tig/intruder.txt").exists());
 }
