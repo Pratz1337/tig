@@ -162,7 +162,8 @@ fn close_moved(session: &mut Session, before: ObjectId) -> Result<bool> {
 fn announce(session: &Session) -> Result<()> {
     let id = session.working()?;
     let rev = session.repo.revision(&id)?;
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
     println!("{}", ui::working_change_line(&label));
     Ok(())

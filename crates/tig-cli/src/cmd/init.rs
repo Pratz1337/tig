@@ -44,7 +44,8 @@ pub(super) fn run(repository: Option<&Path>, dir: Option<PathBuf>) -> Result<()>
     }
     let id = repo.working_revision(wc.name())?;
     let rev = repo.revision(&id)?;
-    let all = repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     let label = RevLabel::from_revision(&repo, id, &rev, &all);
     println!("{}", ui::working_change_line(&label));
     Ok(())

@@ -11,7 +11,8 @@ pub(super) fn run(repository: Option<&Path>) -> Result<()> {
     let (session, _before) = super::open_ready(repository)?;
     let id = session.working()?;
     let rev = session.repo.revision(&id)?;
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
     println!("working change: {}", label.line());
 

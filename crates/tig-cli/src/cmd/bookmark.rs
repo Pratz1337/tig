@@ -25,7 +25,8 @@ fn set(repository: Option<&Path>, name: String, revision: Option<String>) -> Res
     tx.set_bookmark(&name, id)?;
     session.commit(tx)?;
     let rev = session.repo.revision(&id)?;
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
     println!("bookmark {name}: {}", label.line());
     super::announce_if_moved(&mut session, before)
@@ -44,7 +45,8 @@ fn list(repository: Option<&Path>) -> Result<()> {
         println!("No bookmarks.");
         return Ok(());
     }
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     for (name, id) in bookmarks {
         let rev = session.repo.revision(&id)?;
         let label = RevLabel::from_revision(&session.repo, id, &rev, &all);

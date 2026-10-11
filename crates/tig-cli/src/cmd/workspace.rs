@@ -39,7 +39,8 @@ fn add(
     let created = WorkingCopy::add_workspace(&mut session.repo, &session.wc, &name, &path, parent)?;
     let id = session.repo.working_revision(created.name())?;
     let rev = session.repo.revision(&id)?;
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
     println!(
         "added workspace {} at {}",
@@ -64,7 +65,8 @@ fn list(repository: Option<&Path>) -> Result<()> {
         println!("No workspaces.");
         return Ok(());
     }
-    let all = session.repo.visible_revisions()?;
+    // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
     for (name, id) in workspaces {
         let rev = session.repo.revision(&id)?;
         let label = RevLabel::from_revision(&session.repo, id, &rev, &all);

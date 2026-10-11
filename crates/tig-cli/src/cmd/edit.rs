@@ -10,7 +10,8 @@ pub(super) fn run(repository: Option<&Path>, revision: &str) -> Result<()> {
     let id = session.resolve(revision)?;
     if session.working()? != id {
         let rev = session.repo.revision(&id)?;
-        let all = session.repo.visible_revisions()?;
+        // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
         let label = ui::change_label(&session.repo, &rev.change_id, &all);
         let name = session.name().to_string();
         let mut tx = session.repo.start(format!("edit {label}"));

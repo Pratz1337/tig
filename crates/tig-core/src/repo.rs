@@ -455,6 +455,9 @@ impl Transaction {
     fn new_change_inner(&mut self, parents: &[ObjectId], description: &str) -> Result<ObjectId> {
         let tree = self.merged_tree(parents)?;
         let sig = self.settings.signature();
+        // If every parent is already a head, swapping them for the new
+        // revision keeps the heads exact: no history walk.
+        let parents_were_heads = parents.iter().all(|p| self.view.heads.contains(p));
         self.write_revision(Revision {
             tree,
             parents: parents.to_vec(),
@@ -467,7 +470,9 @@ impl Transaction {
         .and_then(|id| {
             // A parent may have been hidden (e.g. after undo), leaving one of
             // its ancestors as a head.
-            self.normalize_heads()?;
+            if !parents_were_heads {
+                self.normalize_heads()?;
+            }
             Ok(id)
         })
     }
@@ -518,11 +523,18 @@ impl Transaction {
                 }
             }
         }
+        // Fast path for the common case (snapshotting a working change): a
+        // head has no visible descendants (the heads invariant), so if the
+        // parents are unchanged there is nothing to rebase and the heads
+        // stay exact after swapping old for new. No history walk.
+        let leaf_in_place = self.view.heads.contains(&old) && rev.parents == before.parents;
         rev.predecessors = vec![old];
         rev.committer = self.settings.signature();
         let new = self.write_revision(rev)?;
         self.replace(old, new);
-        self.rebase_descendants(HashMap::from([(old, new)]))?;
+        if !leaf_in_place {
+            self.rebase_descendants(HashMap::from([(old, new)]))?;
+        }
         Ok(new)
     }
 
@@ -578,8 +590,10 @@ impl Transaction {
         }
         self.store.get_revision(&rev)?;
         // Visible first, so `is_discardable` sees `rev` as using its parents.
-        self.view.heads.insert(rev);
-        self.normalize_heads()?;
+        // Only a newly visible head can break the heads invariant.
+        if self.view.heads.insert(rev) {
+            self.normalize_heads()?;
+        }
         let old = self.view.workspaces.insert(workspace.to_string(), rev);
         if let Some(old) = old {
             if old != rev && self.is_discardable(old)? {

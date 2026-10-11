@@ -32,7 +32,8 @@ pub(super) fn run(
     }
     if !was_working {
         let described = session.repo.revision(&new_id)?;
-        let all = session.repo.visible_revisions()?;
+        // Labels use a fixed 8-char change id: no history walk on the hot path.
+    let all: Vec<(tig_core::ObjectId, tig_core::Revision)> = Vec::new();
         let label = RevLabel::from_revision(&session.repo, new_id, &described, &all);
         println!("described {}", label.line());
     }
