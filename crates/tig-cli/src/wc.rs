@@ -1566,6 +1566,12 @@ fn walk_worktree(root: &Path) -> ignore::Walk {
             if name == OsStr::new(".tig") || is_scratch_name(name) {
                 return false;
             }
+            // Another VCS's metadata is never content. `.git/config` can
+            // hold credentials in remote URLs, so tracking it could publish
+            // them. (Covers both `.git` directories and worktree files.)
+            if [".git", ".hg", ".svn", ".jj"].iter().any(|vcs| name == OsStr::new(vcs)) {
+                return false;
+            }
             // A subdirectory with its own `.tig` is another workspace or a
             // nested repo: never sweep it into this one (git skips nested
             // repos the same way). One stat per directory, not per file.
@@ -1651,9 +1657,24 @@ fn symlink_metadata_kind(path: &Path) -> io::Result<Option<Shape>> {
     }
 }
 
+/// `fs::canonicalize`, minus Windows' verbatim prefix (`\\?\C:\...` becomes
+/// `C:\...`) when the path is short enough not to need it. Every
+/// canonicalization in this file goes through here, so path comparisons
+/// stay consistent; long paths keep the prefix they require.
+fn canon(path: &Path) -> io::Result<PathBuf> {
+    let full = fs::canonicalize(path)?;
+    let text = full.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if rest.as_bytes().get(1) == Some(&b':') && rest.len() < 248 {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(full)
+}
+
 fn canonicalize_creating(path: &Path) -> Result<PathBuf> {
     fs::create_dir_all(path)?;
-    Ok(fs::canonicalize(path)?)
+    Ok(canon(path)?)
 }
 
 fn starting_dir(start: &Path) -> Result<PathBuf> {
@@ -1667,7 +1688,7 @@ fn starting_dir(start: &Path) -> Result<PathBuf> {
             .map(Path::to_path_buf)
             .ok_or_else(|| Error::Msg(format!("{} has no parent directory", start.display())))?
     };
-    Ok(fs::canonicalize(&dir)?)
+    Ok(canon(&dir)?)
 }
 
 /// `(workspace root, main .tig directory)`.
@@ -1692,7 +1713,7 @@ fn find_tig(start_dir: &Path) -> Result<(PathBuf, PathBuf)> {
                         candidate.display()
                     )));
                 }
-                let tig = fs::canonicalize(&target).map_err(|e| {
+                let tig = canon(&target).map_err(|e| {
                     Error::Msg(format!(
                         "{} points at {}, which cannot be opened: {e}",
                         candidate.display(),
@@ -1725,7 +1746,7 @@ fn find_tig(start_dir: &Path) -> Result<(PathBuf, PathBuf)> {
 
 fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
     let ws_dir = tig_dir.join("workspaces");
-    let root = fs::canonicalize(root)?;
+    let root = canon(root)?;
     let mut found: Option<String> = None;
     let entries = fs::read_dir(&ws_dir)
         .map_err(|e| Error::Msg(format!("cannot read {}: {e}", ws_dir.display())))?;
@@ -1741,7 +1762,7 @@ fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
             continue;
         };
         let recorded = PathBuf::from(text.trim());
-        let Ok(recorded) = fs::canonicalize(&recorded) else {
+        let Ok(recorded) = canon(&recorded) else {
             continue;
         };
         if recorded == root {
@@ -1805,7 +1826,7 @@ fn ensure_real_directory(path: &Path) -> Result<()> {
 
 fn ensure_canonical_directory(path: &Path) -> Result<()> {
     ensure_real_directory(path)?;
-    if fs::canonicalize(path)? != path {
+    if canon(path)? != path {
         return Err(Error::Msg(format!(
             "refusing redirected directory {}",
             path.display()
@@ -1818,7 +1839,7 @@ fn ensure_canonical_directory(path: &Path) -> Result<()> {
 fn ensure_not_metadata_alias(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        let resolved = fs::canonicalize(path)?;
+        let resolved = canon(path)?;
         if resolved
             .file_name()
             .and_then(OsStr::to_str)
@@ -2061,7 +2082,7 @@ mod tests {
             new: None,
         }];
         assert!(preflight(
-            &fs::canonicalize(dir.path()).unwrap(),
+            &canon(dir.path()).unwrap(),
             &BTreeSet::new(),
             &diff
         )

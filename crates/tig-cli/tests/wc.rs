@@ -303,7 +303,7 @@ fn secondary_workspace_shares_the_store() {
     .unwrap();
     assert_eq!(
         fs::canonicalize(PathBuf::from(root_file.trim())).unwrap(),
-        secondary.root()
+        fs::canonicalize(secondary.root()).unwrap()
     );
     assert_eq!(file_bytes(&secondary, "hello.txt"), b"hello");
 
@@ -474,5 +474,22 @@ fn nested_workspaces_and_repos_are_not_scanned() {
     assert!(tracked(&repo, "main.txt").is_some());
     for nested in ["inner/only-inner.txt", "inner/main.txt", "other/only-other.txt", "other/.private"] {
         assert!(tracked(&repo, nested).is_none(), "{nested} leaked into the outer repo");
+    }
+}
+
+/// Other version-control metadata is never content: `.git/config` can hold
+/// credentials, and tracking it would publish them.
+#[test]
+fn other_vcs_metadata_is_never_tracked() {
+    let dir = TempDir::new().unwrap();
+    for vcs in [".git", ".hg", ".svn", ".jj"] {
+        fs::create_dir(dir.path().join(vcs)).unwrap();
+        fs::write(dir.path().join(vcs).join("config"), b"url = https://user:token@example.com").unwrap();
+    }
+    fs::write(dir.path().join("real.txt"), b"r").unwrap();
+    let (repo, _wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    assert!(tracked(&repo, "real.txt").is_some());
+    for vcs in [".git", ".hg", ".svn", ".jj"] {
+        assert!(tracked(&repo, &format!("{vcs}/config")).is_none(), "{vcs} was tracked");
     }
 }
