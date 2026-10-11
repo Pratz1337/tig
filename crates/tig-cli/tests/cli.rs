@@ -192,16 +192,12 @@ fn end_to_end_session() {
     assert_eq!(cat.code, Some(0), "{}", cat.stderr);
     assert_eq!(cat.stdout, "fn main() {}\n");
 
-    let private_text = fs::read_to_string(repo.join(".private")).unwrap();
-    let line_no = private_text
-        .lines()
-        .position(|line| line == ".env*")
-        .expect("default .env* rule")
-        + 1;
+    // `.env` is private through the built-in floor, which applies even if
+    // `.private` is deleted; `why` names that source honestly.
     let why_env = expect_ok(tig(&repo).args(["why", ".env"]));
     assert_eq!(
         why_env.trim(),
-        format!(".env is private (group: private) because of .private line {line_no}: .env*")
+        ".env is private (group: private) because of the built-in default rule: .env*"
     );
     let why_src = expect_ok(tig(&repo).args(["why", "src/main.rs"]));
     assert_eq!(why_src.trim(), "src/main.rs is public (no rule matches)");

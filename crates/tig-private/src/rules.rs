@@ -27,11 +27,29 @@ use unicode_normalization::UnicodeNormalization;
 /// Built-in access group for a positive rule that names no roles.
 const BUILTIN_ROLE: &str = "private";
 
-/// Built-in floor, and the `.private` text `tig init` writes so people can see it.
-///
-/// These rules apply underneath the repository file even when that file is
-/// missing or empty. Environment files and private keys are private. The
-/// header comment in the string describes the rule format.
+/// The `.private` file `tig init` writes. It holds no rules of its own: the
+/// defaults are the built-in floor ([`DEFAULT_PRIVATE`]), which applies
+/// anyway. Copying them into the file would turn the floor's own `!` lines
+/// into the user's negations, which publish then asks them to confirm.
+pub const PRIVATE_FILE_TEMPLATE: &str = "\
+# .private: paths matched here are private. The repository is public by default.
+# gitignore syntax. The last matching line wins. Write a space as \"\\ \".
+# Optional @role tags choose who can read a path (default: the private group).
+#
+# Always private, even if this file is deleted (built-in defaults):
+#   .env* (except .env.example, .env.sample, .env.template),
+#   *.pem, *.key, *.p12, *.pfx, id_rsa, id_dsa, id_ecdsa, id_ed25519
+# To publish one of those on purpose, add a line like:  !.env.public
+# (publish asks you to confirm the first time).
+#
+# Add your own private paths below, for example:
+#   secrets/
+#   config/production.yml
+";
+
+/// The built-in floor. These rules apply underneath the repository's
+/// `.private` even when that file is missing or empty. Environment files and
+/// private keys are private.
 pub const DEFAULT_PRIVATE: &str = "\
 # .private: paths matched here are private. The repository is public by default.
 # gitignore syntax. The last matching line wins. A leading ! makes a path public.

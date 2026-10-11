@@ -16,16 +16,10 @@ pub(super) fn run(repository: Option<&Path>, path: &str) -> Result<()> {
     match rules.classify(&path) {
         Verdict::Private { readers, rule } => {
             let group = readers.into_iter().collect::<Vec<_>>().join(", ");
-            println!(
-                "{path} is private (group: {group}) because of .private line {}: {}",
-                rule.line, rule.text
-            );
+            println!("{path} is private (group: {group}) because of the {}", rule.explanation());
         }
         Verdict::Public { rule: Some(rule) } => {
-            println!(
-                "{path} is public because of .private line {}: {}",
-                rule.line, rule.text
-            );
+            println!("{path} is public because of the {}", rule.explanation());
         }
         Verdict::Public { rule: None } => {
             println!("{path} is public (no rule matches)");

@@ -32,7 +32,7 @@ use tig_core::store::{empty_tree_id, DiskStore, StoreExt};
 use tig_core::treeops::{diff_trees, walk, DiffEntry, Leaf};
 use tig_core::workspace::Workspace;
 use tig_core::ObjectId;
-use tig_private::rules::DEFAULT_PRIVATE;
+use tig_private::rules::PRIVATE_FILE_TEMPLATE;
 
 /// Files touched this close to a state save are hashed again next time.
 const RACY_WINDOW: Duration = Duration::from_secs(2);
@@ -152,7 +152,7 @@ impl WorkingCopy {
 
         let private = root.join(".private");
         if symlink_metadata_kind(&private)?.is_none() {
-            atomic_write(&private, DEFAULT_PRIVATE.as_bytes(), false)?;
+            atomic_write(&private, PRIVATE_FILE_TEMPLATE.as_bytes(), false)?;
         }
 
         let name = DEFAULT_WORKSPACE.to_string();

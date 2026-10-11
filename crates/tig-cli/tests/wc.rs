@@ -13,7 +13,7 @@ use tig_core::repo::{Settings, DEFAULT_WORKSPACE};
 use tig_core::store::StoreExt;
 use tig_core::treeops::Leaf;
 use tig_core::workspace::Workspace;
-use tig_private::rules::DEFAULT_PRIVATE;
+use tig_private::rules::PRIVATE_FILE_TEMPLATE;
 
 fn settings() -> Settings {
     Settings::default()
@@ -79,7 +79,7 @@ fn init_snapshots_env_in_plaintext_and_open_finds_it() {
     assert_eq!(wc.name(), DEFAULT_WORKSPACE);
     assert_eq!(
         fs::read_to_string(wc.root().join(".private")).unwrap(),
-        DEFAULT_PRIVATE
+        PRIVATE_FILE_TEMPLATE
     );
     assert_eq!(file_bytes(&wc, ".env"), b"SECRET=1\n");
     assert_eq!(tracked(&repo, ".env").unwrap(), b"SECRET=1\n");
