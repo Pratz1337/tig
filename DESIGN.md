@@ -126,6 +126,28 @@ These are non-negotiable. Reviewers check every publish/fetch change against the
 5. **Every key gets its own subkey.** The epoch key is never used directly. Each purpose (`CONTENT_KEY`, `NONCE_KEY`, `SEAL_SALT_KEY`, `WIRE_ID_KEY`) derives its own subkey with `blake3::derive_key`.
 6. **Paste detection** compares keyed IDs of changed public blobs against keyed IDs of private blobs at publish time. The empty blob is exempt, because an empty `.env` matches every empty file.
 
+### Publish and fetch (phase 1: simple mode, local directory remotes)
+
+**Sealing plan.** At publish, the tree is classified with the `.private` rules *of the revision being published*. A directory is sealed as **one** entry when every file under it is private to the same readers. Otherwise tig recurses, and private files are sealed individually. So a fully private `secrets/` shows up only as `secrets` → sealed, while a folder with one re-included file reveals the names of its sealed siblings (honest, and documented in `tig why`). `.private` itself must classify as public; publish refuses otherwise.
+
+**Public projection.** Each published revision gets a public twin: same change ID, author, committer and description, a public tree (private entries replaced by `TreeEntry::sealed`), public parents, and no predecessors. The root revision projects to itself. A local map (internal revision → public revision, per remote) makes republishing incremental.
+
+**Sealed packs.** Objects reachable under a sealed entry go into one pack per group, epoch and publish:
+- an **index**, encrypted with a random nonce under the content subkey: `(wire_id, kind, object_id)` for every object, plus `(sealed_id, path, kind, target_id)` for every sealed entry;
+- the **objects**, as `(wire_id, ciphertext)`, encrypted with `EpochKey::encrypt_object`.
+
+The server sees group, epoch, wire IDs and sizes, never plain IDs or names. Readers decrypt the index, then each object, verify `hash_object(kind, body) == id`, verify each sealed ID with the derived salt, and rebuild internal trees by substituting sealed entries. Objects already sent for that group and epoch (tracked by wire ID) are not sent again.
+
+**Keyring.** Phase 1 has one group, `private`. The remote holds a keyring: owner public key, and per epoch the list of `(member public key, WrappedKey)`. Granting access wraps the current epoch key. Revoking starts a new epoch, wrapped for the remaining members; old packs stay under old epochs, because their data already left. Phase 1 keyrings are not signed yet. Without the epoch key a server cannot add a reader, only remove one, so this is a denial-of-service risk, not a confidentiality one. Signed grants arrive with roles.
+
+**Publish refuses, naming the paths, when:**
+1. a path that was public in any earlier publish to this remote is now private: it already leaked, so rotate it. This is overridable with an explicit acknowledgment that still seals from now on.
+2. a public file's content equals a non-empty private file's content (paste detection);
+3. a negation makes a path public that was not public before. This needs an explicit confirmation the first time.
+4. the rules name roles (phase 2) or `.private` would be private.
+
+**Remote layout (a plain directory).** `objects/` (a DiskStore of public objects only), `packs/<group>/<epoch>/<pack-id>.pack`, `keyring`, `refs` (bookmark → public revision). It is dumb storage: no server-side decryption, ever.
+
 ### Paths
 
 `object::validate_name` enforces a portable-name policy everywhere, including when decoding stored trees. It rejects `\`, `:`, control characters, a trailing `.` or space (Windows silently strips them, so `.env.` would land on disk as `.env`), and anything that aliases `.tig` (any case, or with HFS+-ignorable characters). Some names are only dangerous on some filesystems but exist in real repos, such as `aux.c` in Linux and `A` next to `a`. The filesystem working copy must check those before writing anything: Windows device names, case collisions on case-insensitive volumes, NTFS 8.3 aliases such as `TIG~1`, and never writing through a symlink or reparse-point ancestor.
