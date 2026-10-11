@@ -82,7 +82,7 @@ The working-copy index is a **frozen sorted snapshot plus a small mutation ledge
 
 ### Workspaces
 
-A workspace is `(working revision, overlay)`. The overlay maps path → `Some(file)` or `None` (deleted). Reads check the overlay first and fall back to the base tree. A snapshot folds the overlay into new trees, reusing every unchanged subtree by ID, so the cost is proportional to the changed paths. Many workspaces share one store, so ten agents cost one repo plus their deltas.
+A workspace is `(working revision, overlay)`. The overlay maps path → `Some(file)`, `None` (deleted), or an internal `Some(tree)` graft that fully replaces a deleted or replaced directory. Edits under a graft update that subtree; reads and listings resolve through it without bringing back base siblings. Restoring the base subtree ID cancels the graft. The public workspace edit API only accepts files and deletions. A snapshot folds the overlay into new trees, reusing every unchanged subtree by ID, so the cost is proportional to the changed paths. Many workspaces share one store, so ten agents cost one repo plus their deltas.
 
 The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (path → size, mtime, id) to find changed files and feeds them into the overlay.
 

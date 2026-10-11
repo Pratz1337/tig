@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::EntryKind;
-use crate::path::{has_ancestor, range_inside, remove_inside, RepoPath};
+use crate::path::{range_inside, remove_inside, RepoPath};
 use crate::repo::Repo;
-use crate::store::StoreExt;
-use crate::treeops::{apply_edits, lookup, walk, Leaf};
+use crate::store::{empty_tree_id, StoreExt};
+use crate::treeops::{apply_edits, lookup, walk, Leaf, MAX_TREE_DEPTH};
 
 pub struct Workspace {
     name: String,
@@ -59,15 +59,13 @@ impl Workspace {
     }
 
     pub fn read(&self, repo: &Repo, path: &RepoPath) -> Result<Option<Vec<u8>>> {
-        let leaf = match self.overlay.get(path) {
-            Some(edit) => *edit,
-            None => {
-                if has_ancestor(&self.overlay, path) {
-                    // An ancestor was deleted or replaced by a file.
-                    return Ok(None);
-                }
-                lookup(&**repo.store(), &self.base_tree, path)?
+        let leaf = match self.covering_edit(path) {
+            Some((at, edit)) if at == path => edit,
+            Some((at, Some(graft))) if graft.kind() == EntryKind::Tree => {
+                lookup(&**repo.store(), &graft.id(), &relative_path(path, at)?)?
             }
+            Some(_) => None,
+            None => lookup(&**repo.store(), &self.base_tree, path)?,
         };
         match leaf {
             Some(found) if found.is_file_like() => Ok(Some(repo.store().get_blob(&found.id())?)),
@@ -99,29 +97,85 @@ impl Workspace {
         if path.is_root() || leaf.is_some_and(|found| !found.is_file_like()) {
             return Err(Error::Invalid(format!("workspace edits must be files; got {leaf:?} at {path}")));
         }
-        // Edits to a path and its ancestor in one overlay would be ambiguous;
-        // the newer edit wins.
-        remove_inside(&mut self.overlay, &path);
-        let mut cur = path.parent();
-        while let Some(a) = cur.filter(|a| !a.is_root()) {
-            self.overlay.remove(&a);
-            cur = a.parent();
+        if path.components().count() > MAX_TREE_DEPTH {
+            return Err(Error::Invalid(format!("tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})")));
+        }
+        if let Some(parent) = path.parent() {
+            if let Some((at, edit)) = self.covering_edit(&parent) {
+                let at = at.clone();
+                return self.edit_graft(repo, at, edit, &path, leaf);
+            }
+            // Find a non-directory base ancestor in one descent, rather than
+            // looking up each prefix from the root. A child write replaces it.
+            let mut tree = self.base_tree;
+            let mut at = RepoPath::root();
+            for name in parent.components() {
+                at = at.join(name)?;
+                let dir = repo.store().get_tree(&tree)?;
+                match dir.get(name) {
+                    Some(entry) if entry.kind() == EntryKind::Tree => tree = entry.id(),
+                    Some(_) => return self.edit_graft(repo, at, None, &path, leaf),
+                    None => break,
+                }
+            }
         }
         let base = lookup(&**repo.store(), &self.base_tree, &path)?;
+        self.record(path, leaf, base);
+        Ok(())
+    }
+
+    /// The overlay has no ancestor/descendant pairs. A tree edit is a graft
+    /// that fully replaces the base subtree, including its deleted siblings.
+    fn covering_edit(&self, path: &RepoPath) -> Option<(&RepoPath, Option<Leaf>)> {
+        let mut cur = Some(path.clone());
+        while let Some(at) = cur {
+            if let Some((path, edit)) = self.overlay.get_key_value(&at) {
+                return Some((path, *edit));
+            }
+            cur = at.parent();
+        }
+        None
+    }
+
+    fn edit_graft(
+        &mut self,
+        repo: &Repo,
+        at: RepoPath,
+        edit: Option<Leaf>,
+        path: &RepoPath,
+        leaf: Option<Leaf>,
+    ) -> Result<()> {
+        let tree = match edit {
+            Some(graft) if graft.kind() == EntryKind::Tree => graft.id(),
+            _ if leaf.is_none() => return Ok(()), // removing below a non-directory is a no-op
+            _ => empty_tree_id(),
+        };
+        let edits = BTreeMap::from([(relative_path(path, &at)?, leaf)]);
+        let tree = apply_edits(&**repo.store(), &tree, &edits)?;
+        let graft = (tree != empty_tree_id()).then(|| Leaf::tree(tree));
+        let base = lookup(&**repo.store(), &self.base_tree, &at)?;
+        self.record(at, graft, base);
+        Ok(())
+    }
+
+    fn record(&mut self, path: RepoPath, leaf: Option<Leaf>, base: Option<Leaf>) {
+        remove_inside(&mut self.overlay, &path);
         if base == leaf {
             self.overlay.remove(&path);
         } else {
             self.overlay.insert(path, leaf);
         }
-        Ok(())
     }
 
     /// All files under `dir`, with the overlay applied.
     pub fn list(&self, repo: &Repo, dir: &RepoPath) -> Result<Vec<(RepoPath, Leaf)>> {
-        // An edit at `dir` or above it replaces the whole directory.
-        // (Overlay entries are never trees; see `set`.)
-        if self.overlay.contains_key(dir) || has_ancestor(&self.overlay, dir) {
-            return Ok(Vec::new());
+        if let Some((at, edit)) = self.covering_edit(dir) {
+            return match edit {
+                Some(graft) if graft.kind() == EntryKind::Tree => {
+                    graft_files(repo, at, graft.id(), &relative_path(dir, at)?)
+                }
+                _ => Ok(Vec::new()),
+            };
         }
         let mut files: BTreeMap<RepoPath, Leaf> =
             walk(&**repo.store(), &self.base_tree, dir)?.into_iter().collect();
@@ -135,7 +189,11 @@ impl Workspace {
             }
             files.remove(path);
             if let Some(leaf) = edit {
-                files.insert(path.clone(), *leaf);
+                if leaf.kind() == EntryKind::Tree {
+                    files.extend(graft_files(repo, path, leaf.id(), &RepoPath::root())?);
+                } else {
+                    files.insert(path.clone(), *leaf);
+                }
             }
         }
         Ok(files.into_iter().collect())
@@ -175,5 +233,28 @@ impl Workspace {
         self.base_tree = repo.revision(&self.working)?.tree;
         Ok(())
     }
+}
+
+fn relative_path(path: &RepoPath, ancestor: &RepoPath) -> Result<RepoPath> {
+    if path == ancestor {
+        return Ok(RepoPath::root());
+    }
+    if ancestor.is_root() {
+        return Ok(path.clone());
+    }
+    RepoPath::new(&path.as_str()[ancestor.as_str().len() + 1..])
+}
+
+fn graft_files(repo: &Repo, at: &RepoPath, tree: ObjectId, dir: &RepoPath) -> Result<Vec<(RepoPath, Leaf)>> {
+    walk(&**repo.store(), &tree, dir)?
+        .into_iter()
+        .map(|(path, leaf)| {
+            let path = RepoPath::new(&format!("{}/{}", at.as_str(), path.as_str()))?;
+            if path.components().count() > MAX_TREE_DEPTH {
+                return Err(Error::Invalid(format!("tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})")));
+            }
+            Ok((path, leaf))
+        })
+        .collect()
 }
 

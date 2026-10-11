@@ -4,13 +4,14 @@
 //! `MergeOutcome::Conflict` with the paths, and the caller refuses the operation
 //! instead of writing a half-merged tree.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::ObjectId;
+use crate::object::EntryKind;
 use crate::path::{has_ancestor, has_inside, RepoPath};
-use crate::store::{Store, StoreExt};
-use crate::treeops::{apply_edits, diff_trees, Leaf};
+use crate::store::{empty_tree_id, Store, StoreExt};
+use crate::treeops::{apply_edits, diff_trees, lookup, Leaf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -37,9 +38,27 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
             Some(ours_new) if *ours_new != d.new => conflicts.push(d.path),
             Some(_) => {} // both sides made the same change
             None => {
-                // A change under a path that `ours` turned into a file (or vice
-                // versa) shows up as different leaf paths; catch it here.
-                if has_ancestor(&our_changes, &d.path) || has_inside(&our_changes, &d.path) {
+                // Compare the final entries at the overlapping path. Two
+                // sides replacing the same file with directories are compatible;
+                // their individual leaf changes are checked separately.
+                let mut overlap = has_inside(&our_changes, &d.path).then(|| d.path.clone());
+                let mut parent = d.path.parent();
+                while let Some(at) = parent.filter(|at| !at.is_root()) {
+                    if our_changes.contains_key(&at) {
+                        overlap = Some(at);
+                        break;
+                    }
+                    parent = at.parent();
+                }
+                let incompatible = if let Some(at) = overlap {
+                    let ours = lookup(store, ours, &at)?;
+                    let theirs = lookup(store, theirs, &at)?;
+                    ours != theirs && !(ours.is_some_and(|leaf| leaf.kind() == EntryKind::Tree)
+                        && theirs.is_some_and(|leaf| leaf.kind() == EntryKind::Tree))
+                } else {
+                    false
+                };
+                if incompatible {
                     conflicts.push(d.path);
                 } else {
                     edits.insert(d.path, d.new);
@@ -64,23 +83,117 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
     Ok(MergeOutcome::Clean(apply_edits(store, ours, &edits)?))
 }
 
-/// Nearest common ancestor of two revisions (by BFS distance from `a`), or
-/// None if they share no history. Walks revision parents.
-pub fn merge_base(store: &dyn Store, a: &ObjectId, b: &ObjectId) -> Result<Option<ObjectId>> {
-    let ancestors_b = ancestors(store, b)?;
-    let mut queue = VecDeque::from([*a]);
-    let mut seen = HashSet::from([*a]);
-    while let Some(id) = queue.pop_front() {
-        if ancestors_b.contains(&id) {
-            return Ok(Some(id));
+/// Best common ancestors, sorted by id. No result is an ancestor of another
+/// result. Unrelated histories return an empty vector.
+pub fn merge_base(store: &dyn Store, a: &ObjectId, b: &ObjectId) -> Result<Vec<ObjectId>> {
+    let graph = MergeGraph::load(store, &[*a, *b])?;
+    graph.bases(&[*a], &[*b])
+}
+
+/// Merges revisions against the ancestry of all accumulated parents. Multiple
+/// best bases are themselves merged into a virtual base; a conflict there is
+/// a conflict in the outer merge too. No synthetic revisions are stored.
+pub(crate) fn merge_revisions(store: &dyn Store, heads: &[ObjectId]) -> Result<MergeOutcome> {
+    let graph = MergeGraph::load(store, heads)?;
+    graph.merge(store, heads)
+}
+
+/// Load each revision once per merge, including recursive virtual bases. Base
+/// selection makes two graph walks and prunes common parents, never a separate
+/// history walk for each common ancestor.
+struct MergeGraph {
+    revisions: HashMap<ObjectId, (ObjectId, Vec<ObjectId>)>,
+}
+
+impl MergeGraph {
+    fn load(store: &dyn Store, heads: &[ObjectId]) -> Result<Self> {
+        let mut revisions = HashMap::new();
+        let mut stack = heads.to_vec();
+        while let Some(id) = stack.pop() {
+            if revisions.contains_key(&id) {
+                continue;
+            }
+            let revision = store.get_revision(&id)?;
+            stack.extend(&revision.parents);
+            revisions.insert(id, (revision.tree, revision.parents));
         }
-        for p in store.get_revision(&id)?.parents {
-            if seen.insert(p) {
-                queue.push_back(p);
+        Ok(Self { revisions })
+    }
+
+    fn revision(&self, id: &ObjectId) -> Result<&(ObjectId, Vec<ObjectId>)> {
+        self.revisions.get(id).ok_or(Error::NotFound(*id))
+    }
+
+    fn ancestors(&self, heads: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        let mut seen = HashSet::new();
+        let mut stack = heads.to_vec();
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                stack.extend(&self.revision(&id)?.1);
             }
         }
+        Ok(seen)
     }
-    Ok(None)
+
+    fn bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let a = self.ancestors(a)?;
+        let b = self.ancestors(b)?;
+        let common: HashSet<ObjectId> = a.intersection(&b).copied().collect();
+        let mut best = common.clone();
+        // Any ancestor of a common ancestor is also common. Removing each
+        // common member's direct parents therefore removes all inferior bases.
+        for id in common {
+            for parent in &self.revision(&id)?.1 {
+                best.remove(parent);
+            }
+        }
+        let mut best: Vec<ObjectId> = best.into_iter().collect();
+        best.sort();
+        Ok(best)
+    }
+
+    fn merge(&self, store: &dyn Store, heads: &[ObjectId]) -> Result<MergeOutcome> {
+        struct Frame {
+            heads: Vec<ObjectId>,
+            tree: ObjectId,
+            next: usize,
+        }
+        let first = heads.first().ok_or_else(|| Error::Invalid("a merge needs at least one parent".into()))?;
+        let mut stack = vec![Frame { heads: heads.to_vec(), tree: self.revision(first)?.0, next: 1 }];
+        let mut virtual_trees = BTreeMap::new();
+        // Explicit frames keep nested criss-cross histories off the call stack.
+        while let Some(frame) = stack.last_mut() {
+            if frame.next == frame.heads.len() {
+                let tree = frame.tree;
+                virtual_trees.insert(frame.heads.clone(), tree);
+                stack.pop();
+                if stack.is_empty() {
+                    return Ok(MergeOutcome::Clean(tree));
+                }
+                continue;
+            }
+            let parent = frame.heads[frame.next];
+            let bases = self.bases(&frame.heads[..frame.next], &[parent])?;
+            let base = match bases.as_slice() {
+                [] => empty_tree_id(),
+                [base] => self.revision(base)?.0,
+                _ => match virtual_trees.get(&bases) {
+                    Some(tree) => *tree,
+                    None => {
+                        let tree = self.revision(&bases[0])?.0;
+                        stack.push(Frame { heads: bases, tree, next: 1 });
+                        continue;
+                    }
+                },
+            };
+            match merge_trees(store, &base, &frame.tree, &self.revision(&parent)?.0)? {
+                MergeOutcome::Clean(tree) => frame.tree = tree,
+                conflict => return Ok(conflict),
+            }
+            frame.next += 1;
+        }
+        Err(Error::Invalid("merge produced no tree".into()))
+    }
 }
 
 /// All ancestors of `id`, including itself.

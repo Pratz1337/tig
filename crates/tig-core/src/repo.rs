@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::id::{ChangeId, ObjectId};
-use crate::merge::{ancestors, merge_base, merge_trees, MergeOutcome};
+use crate::merge::{ancestors, merge_revisions, merge_trees, MergeOutcome};
 use crate::object::{Object, Operation, Revision, Signature, View};
 use crate::ophead::OpHeadStore;
 use crate::store::{empty_tree_id, Store, StoreExt};
@@ -448,25 +448,17 @@ impl Transaction {
     }
 
     fn merged_tree(&self, parents: &[ObjectId]) -> Result<ObjectId> {
-        let store = &*self.store;
         let Some((first, rest)) = parents.split_first() else {
             return Err(Error::Invalid("a change needs at least one parent".into()));
         };
-        let mut tree = store.get_revision(first)?.tree;
-        let mut merged_head = *first;
-        for p in rest {
-            let theirs = store.get_revision(p)?.tree;
-            let base = match merge_base(store, &merged_head, p)? {
-                Some(b) => store.get_revision(&b)?.tree,
-                None => empty_tree_id(),
-            };
-            match merge_trees(store, &base, &tree, &theirs)? {
-                MergeOutcome::Clean(t) => tree = t,
-                MergeOutcome::Conflict(paths) => return Err(conflict_error("merge", &paths)),
-            }
-            merged_head = *p;
+        if rest.is_empty() {
+            // A normal new change never walks its parent's history.
+            return Ok(self.store.get_revision(first)?.tree);
         }
-        Ok(tree)
+        match merge_revisions(&*self.store, parents)? {
+            MergeOutcome::Clean(tree) => Ok(tree),
+            MergeOutcome::Conflict(paths) => Err(conflict_error("merge", &paths)),
+        }
     }
 
     /// Writes a new revision of the same change and points everything that
