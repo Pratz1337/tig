@@ -10,6 +10,7 @@ lz4_flex.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

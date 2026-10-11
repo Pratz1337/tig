@@ -19,7 +19,9 @@ hex = "0.4"
 regex = "1"
 unicode-normalization = "0.1"
 chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 similar = "2"
