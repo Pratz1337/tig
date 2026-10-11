@@ -135,7 +135,7 @@ fn editing_a_parent_rebases_children() {
 }
 
 #[test]
-fn conflicting_rebase_is_refused_without_changes() {
+fn conflicting_snapshot_succeeds_and_leaves_the_child_in_place() {
     let mut repo = repo();
     let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
     ws.write(&repo, &p("a.txt"), b"base").unwrap();
@@ -154,10 +154,14 @@ fn conflicting_rebase_is_refused_without_changes() {
     repo.commit(tx).unwrap();
     let mut other = Workspace::open(&repo, "other").unwrap();
     other.write(&repo, &p("a.txt"), b"parent edit").unwrap();
-    let op = repo.op_id();
-    let err = other.snapshot(&mut repo).unwrap_err().to_string();
-    assert!(err.contains("a.txt"), "{err}");
-    assert_eq!(repo.op_id(), op);
+    // The edit is recorded (a snapshot must never strand the user); the
+    // child that would conflict stays on the previous parent and is reported.
+    assert!(other.snapshot(&mut repo).unwrap());
+    assert_eq!(repo.last_skipped_rebases().len(), 1);
+    assert_eq!(repo.last_skipped_rebases()[0].paths, vec![p("a.txt")]);
+    let child_now = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+    assert_eq!(repo.revision(&child_now).unwrap().parents, vec![parent]);
+    assert_eq!(other.read(&repo, &p("a.txt")).unwrap().unwrap(), b"parent edit");
 }
 
 #[test]

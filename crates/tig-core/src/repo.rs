@@ -82,6 +82,8 @@ pub struct Repo {
     op_id: ObjectId,
     op: Operation,
     view: View,
+    /// Rebases skipped by the latest commit, for the caller to report.
+    last_skipped: Vec<SkippedRebase>,
 }
 
 impl Repo {
@@ -99,6 +101,7 @@ impl Repo {
             description: "initialize repo".into(),
             undo_of: None,
             base_op: None,
+            skipped: Vec::new(),
         };
         tx.view.heads.insert(root_revision_id());
         let wc = tx.new_change(&[root_revision_id()], "")?;
@@ -107,14 +110,14 @@ impl Repo {
         if !op_head.compare_and_set(None, op_id)? {
             return Err(Error::Invalid("a repo was created here concurrently".into()));
         }
-        Ok(Repo { store, op_head, settings, op_id, op, view: tx.view })
+        Ok(Repo { store, op_head, settings, op_id, op, view: tx.view, last_skipped: Vec::new() })
     }
 
     pub fn load(store: Arc<dyn Store>, op_head: Arc<dyn OpHeadStore>, settings: Settings) -> Result<Repo> {
         let op_id = op_head.get()?.ok_or_else(|| Error::Invalid("no repo here (no operation head)".into()))?;
         let op = store.get_operation(&op_id)?;
         let view = store.get_view(&op.view)?;
-        Ok(Repo { store, op_head, settings, op_id, op, view })
+        Ok(Repo { store, op_head, settings, op_id, op, view, last_skipped: Vec::new() })
     }
 
     /// Re-reads the op head (after another process or workspace changed it).
@@ -130,6 +133,12 @@ impl Repo {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Descendants the latest commit left on an older parent because
+    /// rebasing them would conflict. Empty after a clean commit.
+    pub fn last_skipped_rebases(&self) -> &[SkippedRebase] {
+        &self.last_skipped
     }
 
     pub fn view(&self) -> &View {
@@ -164,6 +173,7 @@ impl Repo {
             description: description.into(),
             undo_of: None,
             base_op: Some(self.op_id),
+            skipped: Vec::new(),
         }
     }
 
@@ -191,6 +201,7 @@ impl Repo {
         self.op_id = op_id;
         self.op = op;
         self.view = tx.view;
+        self.last_skipped = tx.skipped;
         Ok(op_id)
     }
 
@@ -374,6 +385,16 @@ pub struct Transaction {
     undo_of: Option<ObjectId>,
     /// The operation this transaction's view was read from.
     base_op: Option<ObjectId>,
+    /// Descendants left on an older parent because rebasing would conflict.
+    skipped: Vec<SkippedRebase>,
+}
+
+/// A descendant that was not rebased onto a rewritten parent because the
+/// rebase would conflict. It stays on the previous version of that parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedRebase {
+    pub change: ChangeId,
+    pub paths: Vec<crate::path::RepoPath>,
 }
 
 fn same_store(a: &Arc<dyn Store>, b: &Arc<dyn Store>) -> bool {
@@ -548,6 +569,13 @@ impl Transaction {
     }
 
     fn set_working_inner(&mut self, workspace: &str, rev: ObjectId) -> Result<()> {
+        // The root can never be rewritten, so a workspace sitting on it could
+        // never record an edit.
+        if rev == root_revision_id() {
+            return Err(Error::Invalid(
+                "the root revision cannot be edited; use `tig new root` to start a change on top of it".into(),
+            ));
+        }
         self.store.get_revision(&rev)?;
         // Visible first, so `is_discardable` sees `rev` as using its parents.
         self.view.heads.insert(rev);
@@ -637,7 +665,13 @@ impl Transaction {
             let tree = match merge_trees(&*self.store, &old_base, &new_base, &rev.tree)? {
                 MergeOutcome::Clean(t) => t,
                 MergeOutcome::Conflict(paths) => {
-                    return Err(conflict_error(&format!("rebasing change {}", rev.change_id.short(8)), &paths))
+                    // Refusing here would make every command fail (each one
+                    // snapshots first), stranding the user. Until conflicts
+                    // are objects, the descendant stays on the previous
+                    // version of its parent, which stays visible: nothing is
+                    // lost, and the caller reports it.
+                    self.skipped.push(SkippedRebase { change: rev.change_id, paths });
+                    continue;
                 }
             };
             let mut next = rev.clone();

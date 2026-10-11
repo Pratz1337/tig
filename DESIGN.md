@@ -56,7 +56,10 @@ Encodings are hand-written, versioned, and varint-based (`tig-core::encode`). Th
 - A **change** has a stable random `ChangeId` (16 bytes). Each time its content changes, a new `Revision` is written with the same change_id, and the old revision is listed in `predecessors`.
 - The working copy is always a revision (the workspace's "working revision"). Every command first snapshots the working copy (jj-style). There is no staging area.
 - `tig new` starts a fresh empty change on top of the current one. `tig describe` sets the message. Branches are optional **bookmarks**.
-- Conflicts become objects later (phase 1.5). A rebase never stops halfway.
+- Conflicts become objects later (phase 1.5). A rebase never stops halfway. Until then:
+  - **Explicit actions** that would conflict (abandon, a merge in `new`) are refused, and nothing changes.
+  - **Automatic rebases of descendants** never fail the operation. Every command snapshots first, so a failure there would strand the user. A descendant whose rebase would conflict stays on the previous version of its parent, which stays visible (`log` marks it "(previous version)"), and the command prints a warning naming the paths. Nothing is lost, and nothing changes silently.
+- The root revision can never be a working change: it can't be rewritten, so edits on it could never be recorded. `tig new root` starts a change on top of it.
 
 ### Operation log
 

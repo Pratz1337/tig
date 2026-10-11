@@ -13,7 +13,7 @@ pub(super) fn run(repository: Option<&Path>, revision: Option<&str>) -> Result<(
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
     let mut tx = session.repo.start(format!("abandon {}", label.change_id));
     tx.abandon(id)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     println!("abandoned {}", label.change_id);
     super::announce_if_moved(&mut session, before)
 }

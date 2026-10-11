@@ -23,7 +23,7 @@ fn set(repository: Option<&Path>, name: String, revision: Option<String>) -> Res
     };
     let mut tx = session.repo.start(format!("set bookmark {name}"));
     tx.set_bookmark(&name, id)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     let rev = session.repo.revision(&id)?;
     let all = session.repo.visible_revisions()?;
     let label = RevLabel::from_revision(&session.repo, id, &rev, &all);
@@ -57,7 +57,7 @@ fn delete(repository: Option<&Path>, name: String) -> Result<()> {
     let (mut session, before) = super::open_ready(repository)?;
     let mut tx = session.repo.start(format!("delete bookmark {name}"));
     tx.delete_bookmark(&name)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     println!("deleted bookmark {name}");
     super::announce_if_moved(&mut session, before)
 }

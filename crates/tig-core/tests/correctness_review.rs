@@ -326,8 +326,11 @@ fn different_file_directory_replacements_still_conflict() {
     }
 }
 
+/// A conflicting descendant no longer fails the rewrite (that stranded every
+/// command, since each one snapshots first). It stays on the previous
+/// version of its parent, and the commit reports it.
 #[test]
-fn failed_rewrite_leaves_transaction_view_unchanged() {
+fn conflicting_descendant_stays_on_previous_parent() {
     let mut r = repo();
     let mut w = Workspace::open(&r, "default").unwrap();
     w.write(&r, &p("x"), b"base").unwrap();
@@ -341,10 +344,18 @@ fn failed_rewrite_leaves_transaction_view_unchanged() {
     w.write(&r, &p("x"), b"child").unwrap();
     w.snapshot(&mut r).unwrap();
     let changed = tree(&**r.store(), &[("x", b"parent edit")]);
+    let child = w.working_revision();
     let mut tx = r.start("rewrite");
-    let before = tx.view().clone();
-    assert!(tx.rewrite(a, |r| r.tree = changed).is_err());
-    assert_eq!(*tx.view(), before);
+    let a2 = tx.rewrite(a, |r| r.tree = changed).unwrap();
+    r.commit(tx).unwrap();
+    let skipped = r.last_skipped_rebases();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].paths, vec![p("x")]);
+    // The child kept its old parent, and both stay visible.
+    assert_eq!(r.working_revision("default").unwrap(), child);
+    assert_eq!(r.revision(&child).unwrap().parents, vec![a]);
+    let visible: Vec<_> = r.visible_revisions().unwrap().into_iter().map(|(id, _)| id).collect();
+    assert!(visible.contains(&a) && visible.contains(&a2) && visible.contains(&child));
 }
 
 #[test]
@@ -755,6 +766,11 @@ fn set_working_preserves_bookmarks_other_workspaces_ancestors_and_root() {
         } else {
             tx.new_change(&[parent], "new").unwrap()
         };
+        if guard == "root" {
+            // A workspace may never sit on the root: it could not record edits.
+            assert!(tx.set_working("default", new).is_err());
+            continue;
+        }
         tx.set_working("default", new).unwrap();
         r.commit(tx).unwrap();
         assert!(r.revision(&root_revision_id()).is_ok());

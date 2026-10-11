@@ -53,6 +53,11 @@ impl RevLabel {
         rev: &Revision,
         all: &[(ObjectId, Revision)],
     ) -> Self {
+        // The root is the same empty start in every repo; its zero change id
+        // and 1970 timestamp are noise.
+        if id == tig_core::repo::root_revision_id() {
+            return RevLabel { change_id: "root".into(), object_id: String::new(), summary: String::new() };
+        }
         RevLabel {
             change_id: change_label(repo, &rev.change_id, all),
             object_id: object_label(id),
@@ -60,8 +65,11 @@ impl RevLabel {
         }
     }
 
-    /// `change object summary`
+    /// `change object summary`, or just `root` for the root revision.
     pub fn line(&self) -> String {
+        if self.object_id.is_empty() {
+            return self.change_id.clone();
+        }
         format!("{} {} {}", self.change_id, self.object_id, self.summary)
     }
 }

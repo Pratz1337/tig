@@ -85,6 +85,13 @@ struct Session {
 }
 
 impl Session {
+    /// Commits `tx` and reports any descendant left un-rebased.
+    fn commit(&mut self, tx: tig_core::repo::Transaction) -> Result<()> {
+        self.repo.commit(tx)?;
+        report_skipped(&self.repo);
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         self.wc.name()
     }
@@ -105,8 +112,22 @@ fn open_ready(repository: Option<&Path>) -> Result<(Session, ObjectId)> {
     for warning in stats.warnings {
         eprintln!("warning: {warning}");
     }
+    report_skipped(&session.repo);
     let before = session.working()?;
     Ok((session, before))
+}
+
+/// A rebase that would conflict leaves the descendant on the previous
+/// version of its parent; say so, so nothing changes silently.
+fn report_skipped(repo: &tig_core::repo::Repo) {
+    for skipped in repo.last_skipped_rebases() {
+        let paths: Vec<String> = skipped.paths.iter().take(5).map(|p| p.to_string()).collect();
+        eprintln!(
+            "warning: change {} was not rebased onto this edit because it would conflict in {}; it stays on the previous version (conflict support is coming)",
+            skipped.change.short(8),
+            paths.join(", ")
+        );
+    }
 }
 
 fn open_session(repository: Option<&Path>) -> Result<Session> {

@@ -25,7 +25,7 @@ pub(super) fn run(
     let was_working = id == before;
     let mut tx = session.repo.start("describe");
     let new_id = tx.rewrite(id, |rev| rev.description = message)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     let moved = super::close_moved(&mut session, before)?;
     if was_working || moved {
         super::announce(&session)?;

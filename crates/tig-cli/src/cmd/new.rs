@@ -24,6 +24,6 @@ pub(super) fn run(
     let mut tx = session.repo.start("new change");
     let id = tx.new_change(&parents, &message)?;
     tx.set_working(&name, id)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     super::announce_if_moved(&mut session, before)
 }

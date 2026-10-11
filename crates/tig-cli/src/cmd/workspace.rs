@@ -79,7 +79,7 @@ fn forget(repository: Option<&Path>, name: &str) -> Result<()> {
     let current = session.name().to_string();
     let mut tx = session.repo.start(format!("forget workspace {name}"));
     tx.remove_workspace(name)?;
-    session.repo.commit(tx)?;
+    session.commit(tx)?;
     println!("forgot workspace {name}");
     if name == current {
         println!("this directory is no longer a workspace");

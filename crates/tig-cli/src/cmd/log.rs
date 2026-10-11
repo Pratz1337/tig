@@ -49,6 +49,11 @@ pub(super) fn print_entry(
     if is_empty(&session.repo, rev)? {
         extras.push("(empty)".to_string());
     }
+    // A change can show twice when a descendant stayed on its previous
+    // version (a rebase that would have conflicted). Say which one is old.
+    if all.iter().any(|(_, other)| other.predecessors.contains(&id)) {
+        extras.push("(previous version)".to_string());
+    }
     println!(
         "{}",
         ui::format_rev_line(

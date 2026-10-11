@@ -15,7 +15,7 @@ pub(super) fn run(repository: Option<&Path>, revision: &str) -> Result<()> {
         let name = session.name().to_string();
         let mut tx = session.repo.start(format!("edit {label}"));
         tx.set_working(&name, id)?;
-        session.repo.commit(tx)?;
+        session.commit(tx)?;
         super::close_moved(&mut session, before)?;
     }
     super::announce(&session)
