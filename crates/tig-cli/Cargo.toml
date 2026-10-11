@@ -12,6 +12,10 @@ path = "src/main.rs"
 tig-core.workspace = true
 tig-private.workspace = true
 clap.workspace = true
+ignore.workspace = true
+similar.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
