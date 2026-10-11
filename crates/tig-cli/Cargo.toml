@@ -1,0 +1,18 @@
+[package]
+name = "tig-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tig"
+path = "src/main.rs"
+
+[dependencies]
+tig-core.workspace = true
+tig-private.workspace = true
+clap.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

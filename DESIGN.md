@@ -1,0 +1,114 @@
+# tig — design and intent
+
+tig is version control built from scratch. It keeps what git got right and fixes four things git gets wrong:
+
+1. **Permissions are all-or-nothing per repo.** tig repos are public by default and private per path (`.private`).
+2. **Commits and branches are bookkeeping you do while working.** In tig the working copy *is* a change. It is snapshotted automatically, and every operation can be undone.
+3. **Worktrees are expensive bolt-ons.** A tig workspace is `(base revision, overlay)`. Creating one is O(1).
+4. **Git assumes a real OS and a POSIX filesystem.** tig is a library first. The filesystem is just one client of the API.
+
+This file is the contract every contributor (human or agent) follows. If code disagrees with it, the code is wrong or this file needs an explicit edit.
+
+## The one rule that beats every other rule
+
+**Nothing may add cost to edit, snapshot, status, diff, log, or checkout.**
+Permission checks, `.private` matching, sealing, encryption, and leak scans run only at trust boundaries (publish, fetch, import, rule changes). They are amortized per access group, never per file. Code that puts crypto or rule matching on the hot path gets rejected in review, even if it is correct.
+
+## Taste
+
+- **Small, boring, correct.** Plain data structures, explicit binary encodings, no clever generics. A reader should understand a module in one sitting.
+- **No panics on user data.** Corrupt objects, odd paths, and bad rules return `tig_core::Error`. `unwrap()` is only for invariants we hold ourselves, and it gets a comment saying why.
+- **Deterministic.** The same inputs give the same object IDs on every machine. No HashMap iteration order leaks into encodings. Timestamps are explicit fields, never read during encoding.
+- **The API comes first, then the CLI.** Every CLI command is a thin wrapper over a `tig-core`/`tig-private` function that works with the in-memory store.
+- **Honest UX.** If something cannot be undone (a secret already leaked, data already pulled by a revoked member), the tool says so plainly. It never pretends.
+- **Tests at the API level** against `MemoryStore`, plus a few CLI end-to-end tests. Property tests for encodings and the path index.
+
+## Architecture
+
+```
+crates/
+  tig-core     objects, hashing, stores, path index, trees, diff, revisions,
+               operation log, repo, workspaces (no filesystem required)
+  tig-private  .private rules, roles, keys, sealing, publish/fetch views
+  tig-cli      the `tig` binary: thin wrapper; filesystem working copy lives here
+```
+
+Dependencies only point downward: cli → private → core.
+
+### Objects (tig-core::object)
+
+All objects are content-addressed by **BLAKE3**: `id = blake3::derive_key("tig object v1", kind_byte || body)`. IDs are 32 bytes and display as lowercase hex.
+
+| Kind | Body |
+|---|---|
+| `Blob` | raw bytes |
+| `Tree` | sorted entries `(name, EntryKind, id)`. Names are non-empty and contain no `/` or NUL. Sort order is plain bytewise on the name (git's export re-sorts). |
+| `Revision` | tree, parents, change_id, predecessors, author, timestamp, description |
+| `Operation` | parents, view id, timestamp, user, description |
+| `View` | workspaces → working revision, bookmarks → revision, heads |
+
+`EntryKind` = `File`, `Executable`, `Symlink`, `Tree`, `Sealed`. A `Sealed` entry stands in for a private subtree in public views (see tig-private).
+
+Encodings are hand-written, versioned, and varint-based (`tig-core::encode`). They are stable: once an encoding ships, changing it requires a new version byte.
+
+### Changes, not commits
+
+- A **change** has a stable random `ChangeId` (16 bytes). Each time its content changes, a new `Revision` is written with the same change_id, and the old revision is listed in `predecessors`.
+- The working copy is always a revision (the workspace's "working revision"). Every command first snapshots the working copy (jj-style). There is no staging area.
+- `tig new` starts a fresh empty change on top of the current one. `tig describe` sets the message. Branches are optional **bookmarks**.
+- Conflicts become objects later (phase 1.5). A rebase never stops halfway.
+
+### Operation log
+
+Every mutation of repo state writes a new `View` plus an `Operation` pointing at it, then moves the single op-head pointer (an atomic file replace on disk, a swap in memory). `undo` writes a new operation whose view equals the parent's view. Nothing is ever destroyed, so `undo` is always available.
+
+### Stores
+
+`trait Store`: `get`, `put`, `has`. Backends:
+- `MemoryStore`: agents, tests, the fastest path.
+- `DiskStore`: loose objects, lz4-compressed, sharded `objects/ab/cdef…`, written atomically (tmp + rename). Packs come later.
+
+Object storage is plaintext for whoever holds it. Encryption happens only when objects leave the machine.
+
+### Path index (from HRT-LI, the parts that matter)
+
+The working-copy index is a **frozen sorted snapshot plus a small mutation ledger**:
+- Edits only touch the ledger. The frozen base is never rewritten on the hot path.
+- Inverse edits cancel (add then remove the same path leaves the ledger as it was).
+- Once the ledger passes a threshold, it is consolidated into a new frozen snapshot.
+- Directory listings and counts are range queries over the sorted order.
+- The learned rank model from HRT-LI is **deferred**. A sorted array plus binary search is the baseline, and it gets replaced only if a benchmark proves path lookup is a bottleneck.
+- Rank and range counts never cross a trust boundary. Public views get their own index, in which a sealed folder counts as one entry.
+
+### Workspaces
+
+A workspace is `(working revision, overlay)`. The overlay maps path → `Some(file)` or `None` (deleted). Reads check the overlay first and fall back to the base tree. A snapshot folds the overlay into new trees, reusing every unchanged subtree by ID, so the cost is proportional to the changed paths. Many workspaces share one store, so ten agents cost one repo plus their deltas.
+
+The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (path → size, mtime, id) to find changed files and feeds them into the overlay.
+
+### Privacy (tig-private)
+
+The `.private` file sits at the repo root and uses `.gitignore` syntax, with optional `@role` tags:
+
+```
+.env*
+*.pem
+*.key
+internal/billing/**   @billing
+```
+
+- A line without a role belongs to the built-in group `private` (simple mode). Last match wins. `!` negates. Matching is case-insensitive and Unicode-NFC-normalized for safety.
+- New repos ship this default `.private`: `.env*`, `*.pem`, `*.key`.
+- `tig why <path>` prints the effective rule and group.
+- **Publishing** builds a public view: every private path is replaced by a sealed entry per access group, and private content is encrypted into one sealed pack per group (X25519 key wrapping per member, ChaCha20-Poly1305 content keys per epoch, BLAKE3 keyed hashes so nobody can test whether a known file exists).
+- **The leak rule:** if a path was public in an earlier published snapshot and later becomes private, tig refuses to pretend it is hidden. It says the content already leaked and tells you to rotate it.
+- Roles, the Discord-style hierarchy, and two-step grants come after simple mode works end to end.
+
+## Phases
+
+- **Phase 1 (now):** core objects + stores, path index, trees/diff, revisions/changes, op log + undo, in-memory and filesystem workspaces, CLI (`init status diff log show new describe edit undo op-log workspace bookmark cat why`), `.private` rules plus local publish/fetch with sealing in simple mode, benchmarks against git.
+- **Phase 2:** git import/export (via gitoxide, MIT/Apache), remotes and a server, roles/hierarchy, conflicts as objects, filesystem watcher, packs.
+
+## Licensing
+
+tig is MIT/Apache-2.0. Never copy git's GPLv2 code. Borrow from gitoxide (MIT/Apache) where useful.
