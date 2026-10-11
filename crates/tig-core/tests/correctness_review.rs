@@ -776,7 +776,7 @@ fn workspace_nested_overlays_delete_replace_and_cancel() {
     w.remove(&r, &p("a")).unwrap();
     assert!(!w.is_dirty());
     w.write(&r, &p("a"), b"file").unwrap();
-    assert!(w.list(&r, &p("a")).unwrap().is_empty());
+    assert_eq!(w.list(&r, &p("a")).unwrap().len(), 1);
     assert_eq!(w.read(&r, &p("a/b")).unwrap(), None);
     w.snapshot(&mut r).unwrap();
     assert_eq!(w.read(&r, &p("a")).unwrap().unwrap(), b"file");

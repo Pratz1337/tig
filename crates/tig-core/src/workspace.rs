@@ -174,6 +174,7 @@ impl Workspace {
                 Some(graft) if graft.kind() == EntryKind::Tree => {
                     graft_files(repo, at, graft.id(), &relative_path(dir, at)?)
                 }
+                Some(leaf) if at == dir => Ok(vec![(dir.clone(), leaf)]),
                 _ => Ok(Vec::new()),
             };
         }

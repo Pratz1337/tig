@@ -36,16 +36,24 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
     for d in diff_trees(store, base, theirs)? {
         match our_changes.get(&d.path) {
             Some(ours_new) if *ours_new != d.new => conflicts.push(d.path),
-            Some(_) => {} // both sides made the same change
-            None => {
+            Some(_) if d.new.is_some() => {} // both sides wrote the same leaf
+            _ => {
                 // Compare the final entries at the overlapping path. Two
                 // sides replacing the same file with directories are compatible;
                 // their individual leaf changes are checked separately.
-                let mut overlap = has_inside(&our_changes, &d.path).then(|| d.path.clone());
+                // A shared deletion can still be a replacement on one side.
+                let mut overlap = (has_inside(&our_changes, &d.path)
+                    || (our_changes.contains_key(&d.path)
+                        && lookup(store, ours, &d.path)? != lookup(store, theirs, &d.path)?))
+                    .then(|| d.path.clone());
                 let mut parent = d.path.parent();
                 while let Some(at) = parent.filter(|at| !at.is_root()) {
                     if our_changes.contains_key(&at) {
-                        overlap = Some(at);
+                        // Keep the closest overlap. A shared replacement at
+                        // an ancestor must not hide a file/directory clash here.
+                        if overlap.is_none() {
+                            overlap = Some(at);
+                        }
                         break;
                     }
                     parent = at.parent();
@@ -60,7 +68,7 @@ pub fn merge_trees(store: &dyn Store, base: &ObjectId, ours: &ObjectId, theirs: 
                 };
                 if incompatible {
                     conflicts.push(d.path);
-                } else {
+                } else if !our_changes.contains_key(&d.path) {
                     edits.insert(d.path, d.new);
                 }
             }

@@ -113,7 +113,9 @@ pub struct DiffEntry {
 /// The empty path returns `Leaf::tree(root)` without reading the store. A
 /// missing component, or a non-tree in the middle of the path (file, symlink,
 /// executable, or sealed), yields `Ok(None)`.
+/// A path deeper than [`MAX_TREE_DEPTH`] is [`Error::Invalid`].
 pub fn lookup(store: &dyn Store, root: &ObjectId, path: &RepoPath) -> Result<Option<Leaf>> {
+    ensure_depth(path)?;
     if path.is_root() {
         return Ok(Some(Leaf::tree(*root)));
     }

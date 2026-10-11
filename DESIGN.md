@@ -98,6 +98,10 @@ internal/billing/**   @billing
 ```
 
 - A line without a role belongs to the built-in group `private` (simple mode). Last match wins. `!` negates. Matching is case-insensitive and Unicode-NFC-normalized for safety.
+- Two deliberate differences from gitignore, both pinned by tests in `tig-private/tests/review_round2.rs`:
+  - **A negation can re-include a file inside a private folder.** With `secrets/` then `!secrets/README.md`, the README is public. Git never re-includes files under an excluded directory. Publishing one file out of a private folder is a feature here, and publish asks for confirmation the first time a negation makes something public.
+  - **Wildcards count characters, not bytes.** `?` matches `é`, and `[À-Ö]` is a range of characters. Git's wildmatch counts bytes, so `!?.key` would not reach `é.key` there. Characters are what people mean when they write these patterns.
+- Leading whitespace in a pattern must be escaped (`\ name`). An unescaped leading space is an error rather than a silent part of the name. Unescaped trailing spaces are dropped, as in git.
 - New repos ship this default `.private` (`tig_private::rules::DEFAULT_PRIVATE`): `.env*` except `.env.example`, `.env.sample` and `.env.template`, plus `*.pem`, `*.key`, `*.p12`, `*.pfx`, and the SSH key names `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`. The example files stay public on purpose: projects commit them for every contributor, and making them private by default would teach people to fight the tool on day one.
 - `tig why <path>` prints the effective rule and group.
 - **Publishing** builds a public view: every private path is replaced by a sealed entry, and private content is encrypted into one sealed pack per access group and push window (X25519 key wrapping per member, content keys per epoch). The exact rules are in "Crypto and wire rules" below.

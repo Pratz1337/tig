@@ -270,6 +270,9 @@ impl Repo {
                 .first()
                 .ok_or_else(|| Error::Invalid(format!("{spec:?}: the root revision has no parent")))?;
         }
+        // Stored views and parent references may be malformed. Validate the
+        // final target too, including @, bookmarks, and the last parent step.
+        self.revision(&id)?;
         Ok(id)
     }
 
@@ -286,7 +289,6 @@ impl Repo {
         if spec.len() == 64 {
             if let Ok(id) = spec.parse::<ObjectId>() {
                 if self.store.has(&id)? {
-                    self.store.get_revision(&id)?; // must be a revision, not a blob
                     return Ok(id);
                 }
             }
@@ -301,7 +303,9 @@ impl Repo {
         }
         let mut matches: Vec<ObjectId> = Vec::new();
         for (id, rev) in self.visible_revisions()? {
-            if (is_change && rev.change_id.to_text().starts_with(spec)) || (is_hex && id.to_hex().starts_with(spec)) {
+            if (is_change && rev.change_id.to_text().starts_with(spec))
+                || (is_hex && id.to_hex().get(..spec.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(spec)))
+            {
                 matches.push(id);
             }
         }
@@ -675,6 +679,9 @@ impl Transaction {
     /// Drops heads that are ancestors of other heads, and the root when
     /// anything else exists.
     fn normalize_heads(&mut self) -> Result<()> {
+        // Reparenting can leave a workspace or bookmark at a childless
+        // revision that was previously reachable only through another head.
+        self.view.heads.extend(self.view.workspaces.values().chain(self.view.bookmarks.values()).copied());
         let heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
         let mut covered: HashSet<ObjectId> = HashSet::new();
         for h in &heads {

@@ -56,7 +56,7 @@ pub struct RuleError {
 pub struct RuleRef {
     /// 1-based line number.
     pub line: usize,
-    /// The rule line as written, with trailing whitespace removed.
+    /// The rule line as written, with unescaped trailing ASCII spaces removed.
     pub text: String,
 }
 
@@ -110,16 +110,26 @@ impl Rules {
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
-            let line = raw.trim_end();
+            let mut line = raw;
+            while let Some(before) = line.strip_suffix(' ') {
+                // Git ignores trailing ASCII spaces only when unescaped.
+                if before.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 {
+                    break;
+                }
+                line = before;
+            }
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let tokens = split_tokens(line);
             let mut tokens = tokens.iter().map(String::as_str);
-            // `trim_end` left a non-empty line, so there is at least one token.
+            // A line containing only separators has no pattern.
             let Some(first) = tokens.next() else {
                 continue;
             };
+            if line.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
+                return Err(rule_error(line_no, "leading whitespace in a pattern must be escaped with a backslash"));
+            }
             let (negated, pattern) =
                 split_negation(first).map_err(|message| rule_error(line_no, message))?;
             let rest: Vec<&str> = tokens.collect();
@@ -221,7 +231,7 @@ impl Rules {
     }
 }
 
-/// Splits a rule line on unescaped whitespace. `\ ` stays in the token as an
+/// Splits a rule line on unescaped ASCII whitespace. `\ ` stays in the token as an
 /// escaped space, which the glob compiler reads as a literal space.
 fn split_tokens(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -233,7 +243,7 @@ fn split_tokens(line: &str) -> Vec<String> {
             if let Some(next) = chars.next() {
                 cur.push(next);
             }
-        } else if c.is_whitespace() {
+        } else if c.is_ascii_whitespace() {
             if !cur.is_empty() {
                 tokens.push(std::mem::take(&mut cur));
             }
@@ -297,7 +307,7 @@ fn parse_role(token: &str) -> Result<String, String> {
 /// - A trailing `/` matches only directories, so only paths inside one.
 /// - A match on a directory covers everything inside it, because we classify
 ///   file paths instead of pruning a directory walk.
-/// - `**` as a whole component spans zero or more directories (leading,
+/// - Two or more stars as a whole component span zero or more directories (leading,
 ///   middle) or everything inside (trailing). Elsewhere it is plain `*`.
 /// - `*`, `?` and `[...]` never match `/`. `{`, `}` and every other
 ///   character are literal. `\x` escapes `x`.
@@ -316,7 +326,7 @@ fn rule_regex(pattern: &str) -> Result<String, String> {
     }
     let last = components.len() - 1;
     for (i, comp) in components.iter().enumerate() {
-        if comp == "**" {
+        if comp.len() >= 2 && comp.bytes().all(|c| c == b'*') {
             if components.len() == 1 {
                 re.push_str("[^/]+");
             } else if i == last {
@@ -328,6 +338,15 @@ fn rule_regex(pattern: &str) -> Result<String, String> {
                 re.push_str("(?:[^/]+/)*");
             }
             continue;
+        }
+        if i != last {
+            if let Some((prefix, stars)) = comp.rsplit_once("\\/") {
+                if stars.len() >= 2 && stars.bytes().all(|c| c == b'*') {
+                    re.push_str(&component_regex(prefix)?);
+                    re.push_str("/(?:[^/]+/)*");
+                    continue;
+                }
+            }
         }
         re.push_str(&component_regex(comp)?);
         if i != last {
@@ -372,10 +391,17 @@ fn component_regex(comp: &str) -> Result<String, String> {
                 i += 2;
             }
             '*' => {
+                let start = i;
                 while i < chars.len() && chars[i] == '*' {
                     i += 1;
                 }
-                re.push_str("[^/]*");
+                // Git also lets a double star cross directories beside an
+                // escaped slash. That slash stays literal: unlike `**/`,
+                // `**\/` requires a separator even with no matched text.
+                let boundary_before = start == 0 || chars[start - 1] == '/';
+                let boundary_after = i == chars.len()
+                    || (chars.get(i) == Some(&'\\') && chars.get(i + 1) == Some(&'/'));
+                re.push_str(if i - start >= 2 && boundary_before && boundary_after { ".*" } else { "[^/]*" });
             }
             '?' => {
                 re.push_str("[^/]");
