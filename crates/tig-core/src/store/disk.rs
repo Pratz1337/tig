@@ -128,7 +128,9 @@ impl Store for DiskStore {
         let tmp = RemoveOnDrop(path);
         let mut file = file;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        // No per-object fsync: it costs milliseconds per object on Windows
+        // and breaks the hot-path rule. Durability comes from the synced op
+        // head plus crash recovery (DESIGN.md "Known gaps"), as in git.
         // Windows cannot rename a file that still has an open handle.
         drop(file);
         publish(&tmp.0, &dest)

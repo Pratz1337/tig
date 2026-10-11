@@ -439,6 +439,7 @@ impl WorkingCopy {
         };
         let mut cache = PathIndex::new();
         let mut seen: BTreeSet<RepoPath> = BTreeSet::new();
+        let mut to_hash: Vec<ToHash> = Vec::new();
 
         for ent in walk_worktree(&self.root) {
             let ent =
@@ -535,29 +536,41 @@ impl WorkingCopy {
                 }
             }
 
-            let bytes = read_shape(ent.path(), shape)?;
-            let id = repo.store().put_blob(&bytes)?;
-            stats.hashed += 1;
             let (kind, stand_in) = desired_kind(&meta, shape, prev.as_ref());
-            let unchanged = self.trusted
-                && prev
-                    .as_ref()
-                    .is_some_and(|row| row.id == id && row.kind == kind);
-            if !unchanged {
-                ws.set(repo, repo_path.clone(), Some(leaf_of(kind, id)?))?;
-            }
-            cache.insert(
-                repo_path.clone(),
-                FileState {
+            seen.insert(repo_path.clone());
+            to_hash.push(ToHash {
+                repo_path,
+                disk: ent.path().to_path_buf(),
+                shape,
+                row: FileState {
                     size,
                     mtime,
                     kind,
-                    id,
+                    id: ObjectId([0; 32]), // filled in after hashing
                     racy: !mtime_known,
                     symlink_stand_in: stand_in,
                 },
-            );
-            seen.insert(repo_path);
+                prev,
+            });
+        }
+
+        // Reading is the slow part (on Windows, every first open of a new
+        // file waits for the antivirus scan), so read, hash and store in
+        // parallel. Overlay edits are then applied in walk order, so the
+        // result does not depend on thread timing.
+        let ids = hash_in_parallel(repo.store().as_ref(), &to_hash)?;
+        for (item, id) in to_hash.into_iter().zip(ids) {
+            stats.hashed += 1;
+            let ToHash { repo_path, mut row, prev, .. } = item;
+            row.id = id;
+            let unchanged = self.trusted
+                && prev
+                    .as_ref()
+                    .is_some_and(|old| old.id == id && old.kind == row.kind);
+            if !unchanged {
+                ws.set(repo, repo_path.clone(), Some(leaf_of(row.kind, id)?))?;
+            }
+            cache.insert(repo_path, row);
         }
 
         // The walker skips ignored paths. A path still on disk is not a
@@ -1220,6 +1233,61 @@ fn is_link_or_reparse(meta: &fs::Metadata) -> bool {
 fn unix_executable(meta: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o111 != 0
+}
+
+/// A file the stat cache could not vouch for; it must be read and hashed.
+struct ToHash {
+    repo_path: RepoPath,
+    disk: PathBuf,
+    shape: Shape,
+    /// Everything but `id` is known from the walk.
+    row: FileState,
+    prev: Option<FileState>,
+}
+
+/// Reads, hashes and stores every file in `items` on a small thread pool.
+/// Returns the blob ids in the same order as `items`. The first error wins.
+fn hash_in_parallel(store: &dyn tig_core::Store, items: &[ToHash]) -> Result<Vec<ObjectId>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tig_core::store::StoreExt;
+
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16).min(items.len());
+    let next = AtomicUsize::new(0);
+    let ids: Mutex<Vec<Option<ObjectId>>> = Mutex::new(vec![None; items.len()]);
+    let failure: Mutex<Option<Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() || failure.lock().expect("lock poisoned").is_some() {
+                    return;
+                }
+                let item = &items[i];
+                let result = read_shape(&item.disk, item.shape)
+                    .map_err(Error::from)
+                    .and_then(|bytes| Ok(store.put_blob(&bytes)?));
+                match result {
+                    Ok(id) => ids.lock().expect("lock poisoned")[i] = Some(id),
+                    Err(e) => {
+                        failure.lock().expect("lock poisoned").get_or_insert(e);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failure.into_inner().expect("lock poisoned") {
+        return Err(e);
+    }
+    ids.into_inner()
+        .expect("lock poisoned")
+        .into_iter()
+        .map(|id| id.ok_or_else(|| Error::Msg("hashing stopped early".into())))
+        .collect()
 }
 
 fn read_shape(path: &Path, shape: Shape) -> io::Result<Vec<u8>> {
