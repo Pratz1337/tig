@@ -128,7 +128,10 @@ impl Rules {
                 continue;
             };
             if line.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
-                return Err(rule_error(line_no, "leading whitespace in a pattern must be escaped with a backslash"));
+                return Err(rule_error(
+                    line_no,
+                    "leading whitespace in a pattern must be escaped with a backslash",
+                ));
             }
             let (negated, pattern) =
                 split_negation(first).map_err(|message| rule_error(line_no, message))?;
@@ -176,11 +179,7 @@ impl Rules {
                 let line = rules.last().map(|rule| rule.reference.line).unwrap_or(1);
                 rule_error(line, format!("rules too large to compile: {e}"))
             })?;
-        Ok(Rules {
-            set,
-            rules,
-            roles,
-        })
+        Ok(Rules { set, rules, roles })
     }
 
     /// Classify `path`. The repo root is always public.
@@ -313,7 +312,11 @@ fn parse_role(token: &str) -> Result<String, String> {
 ///   character are literal. `\x` escapes `x`.
 fn rule_regex(pattern: &str) -> Result<String, String> {
     let directory = pattern.ends_with('/') && !pattern.ends_with("\\/");
-    let body = if directory { &pattern[..pattern.len() - 1] } else { pattern };
+    let body = if directory {
+        &pattern[..pattern.len() - 1]
+    } else {
+        pattern
+    };
     let anchored = body.contains('/');
     let body = body.strip_prefix('/').unwrap_or(body);
     if body.is_empty() {
@@ -401,7 +404,11 @@ fn component_regex(comp: &str) -> Result<String, String> {
                 let boundary_before = start == 0 || chars[start - 1] == '/';
                 let boundary_after = i == chars.len()
                     || (chars.get(i) == Some(&'\\') && chars.get(i + 1) == Some(&'/'));
-                re.push_str(if i - start >= 2 && boundary_before && boundary_after { ".*" } else { "[^/]*" });
+                re.push_str(if i - start >= 2 && boundary_before && boundary_after {
+                    ".*"
+                } else {
+                    "[^/]*"
+                });
             }
             '?' => {
                 re.push_str("[^/]");
@@ -843,12 +850,20 @@ mixed @private @audit
 
         let spaces = Rules::parse("foo bar\n").unwrap_err();
         assert_eq!(spaces.line, 1);
-        assert!(spaces.message.contains("unexpected token"), "{}", spaces.message);
+        assert!(
+            spaces.message.contains("unexpected token"),
+            "{}",
+            spaces.message
+        );
 
         // The extra token is reported, not the later bad role.
         let first = Rules::parse("# ok\nfoo bar\n!nope @billing\n").unwrap_err();
         assert_eq!(first.line, 2);
-        assert!(first.message.contains("unexpected token"), "{}", first.message);
+        assert!(
+            first.message.contains("unexpected token"),
+            "{}",
+            first.message
+        );
 
         let later = Rules::parse("# ok\n\n*.txt @Bad\n!x @billing\n").unwrap_err();
         assert_eq!(later.line, 3);
@@ -889,7 +904,9 @@ mixed @private @audit
         assert_private(&rules, "docs/notes 2024.txt");
         assert_public(&rules, "My/plan.txt");
         match rules.classify(&rp("My Secrets/plan.txt")) {
-            Verdict::Private { readers, .. } => assert_eq!(readers, BTreeSet::from(["team".to_string()])),
+            Verdict::Private { readers, .. } => {
+                assert_eq!(readers, BTreeSet::from(["team".to_string()]))
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -902,14 +919,18 @@ mixed @private @audit
         assert_private(&parse_ok(".ÉNV\n"), ".énv");
         assert_private(&parse_ok("SECRETS/**\n"), "secrets/ÉTÉ.txt");
         assert_private(&parse_ok("k.key\n"), "\u{212A}.key"); // Kelvin sign
-        // Character classes never cross '/', negated or not.
+                                                              // Character classes never cross '/', negated or not.
         let rules = parse_ok("secrets/**\n!/secrets/public[!x]data\n");
         assert_private(&rules, "secrets/public/data");
         assert_public(&rules, "secrets/publicYdata");
         let slash = Rules::parse("a[/]b\n").unwrap_err();
-        assert!(slash.message.contains("'/' cannot appear"), "{}", slash.message);
+        assert!(
+            slash.message.contains("'/' cannot appear"),
+            "{}",
+            slash.message
+        );
         assert_public(&parse_ok("a[.-0]b\n"), "a/b"); // range spanning '/'
-        // Braces are literal in gitignore.
+                                                      // Braces are literal in gitignore.
         let braces = parse_ok("secret{1,2}.txt\n");
         assert_private(&braces, "secret{1,2}.txt");
         assert_public(&braces, "secret1.txt");
@@ -928,8 +949,14 @@ mixed @private @audit
         let stars = parse_ok("a**b\n"); // not a whole component: plain '*'
         assert_private(&stars, "axyb");
         assert_public(&stars, "ax/yb");
-        assert!(Rules::parse("[[:alpha:]]\n").unwrap_err().message.contains("POSIX"));
-        assert!(Rules::parse("[z-a]\n").unwrap_err().message.contains("range"));
+        assert!(Rules::parse("[[:alpha:]]\n")
+            .unwrap_err()
+            .message
+            .contains("POSIX"));
+        assert!(Rules::parse("[z-a]\n")
+            .unwrap_err()
+            .message
+            .contains("range"));
         assert_private(&parse_ok("\\[x]\n"), "[x]");
     }
 

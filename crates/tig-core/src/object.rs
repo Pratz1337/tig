@@ -122,7 +122,7 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    fn from_u8(b: u8) -> Result<Self> {
+    pub fn from_u8(b: u8) -> Result<Self> {
         Ok(match b {
             1 => EntryKind::File,
             2 => EntryKind::Executable,

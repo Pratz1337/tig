@@ -70,8 +70,11 @@ impl SealedId {
         hex::encode(self.0)
     }
 
-    /// Only for decoding trees; see `TreeEntry::sealed_id`.
-    pub(crate) fn from_stored(bytes: [u8; 32]) -> Self {
+    /// Wraps sealed-ID bytes read from stored or received data (a tree, a
+    /// pack index). Decoding is safe: a received sealed ID is only ever
+    /// compared with `verify`. Never use this to *make* a sealed entry from
+    /// an object ID; that is what `compute` is for.
+    pub fn from_stored(bytes: [u8; 32]) -> Self {
         SealedId(bytes)
     }
 }

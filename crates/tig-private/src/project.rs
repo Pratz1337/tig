@@ -64,17 +64,25 @@ pub fn rules_of(store: &dyn Store, root: &ObjectId) -> Result<Rules, ProjectErro
     match lookup(store, root, &path)? {
         Some(leaf) if matches!(leaf.kind(), EntryKind::File | EntryKind::Executable) => {
             let bytes = store.get_blob(&leaf.id())?;
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| tig_core::Error::Invalid(".private is invalid: expected UTF-8".into()))?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                tig_core::Error::Invalid(".private is invalid: expected UTF-8".into())
+            })?;
             Ok(Rules::parse(text)?)
         }
         None => Ok(Rules::empty()),
-        Some(_) => Err(tig_core::Error::Invalid(".private is invalid: expected a regular file".into()).into()),
+        Some(_) => Err(tig_core::Error::Invalid(
+            ".private is invalid: expected a regular file".into(),
+        )
+        .into()),
     }
 }
 
 /// Projects `root` for publishing under the `private` group's `key`.
-pub fn project_tree(store: &dyn Store, root: &ObjectId, key: &EpochKey) -> Result<Projection, ProjectError> {
+pub fn project_tree(
+    store: &dyn Store,
+    root: &ObjectId,
+    key: &EpochKey,
+) -> Result<Projection, ProjectError> {
     let rules = rules_of(store, root)?;
     if !rules.is_simple_mode() {
         let roles: Vec<String> = rules.roles().into_iter().map(|r| format!("@{r}")).collect();
@@ -159,18 +167,32 @@ pub fn project_tree(store: &dyn Store, root: &ObjectId, key: &EpochKey) -> Resul
             .ok_or_else(|| tig_core::Error::Invalid(format!("sealed root {path} vanished")))?;
         let sid = key.seal(&path, leaf.kind(), &leaf.id());
         edits.insert(path.clone(), Some(Leaf::sealed(sid)));
-        sealed.push(SealedRoot { path, leaf, readers });
+        sealed.push(SealedRoot {
+            path,
+            leaf,
+            readers,
+        });
     }
     let public_tree = apply_edits(store, root, &edits)?;
     // Foreign seals absorbed into a private folder are no longer public leaves.
     public_files.retain(|(path, _)| !tig_core::path::has_ancestor(&edits, path));
-    Ok(Projection { public_tree, sealed, public_files, private_files, negated })
+    Ok(Projection {
+        public_tree,
+        sealed,
+        public_files,
+        private_files,
+        negated,
+    })
 }
 
 /// The public twin of an internal revision: same identity and metadata,
 /// public tree and parents, no predecessors (they would expose rewrites
 /// and internal IDs).
-pub fn public_revision(rev: &Revision, public_tree: ObjectId, public_parents: Vec<ObjectId>) -> Revision {
+pub fn public_revision(
+    rev: &Revision,
+    public_tree: ObjectId,
+    public_parents: Vec<ObjectId>,
+) -> Revision {
     Revision {
         tree: public_tree,
         parents: public_parents,
@@ -189,7 +211,11 @@ mod tests {
     use tig_core::MemoryStore;
 
     fn group() -> crate::keys::GroupEpoch {
-        crate::keys::GroupEpoch { group: PRIVATE_GROUP.into(), epoch: 1 }
+        crate::keys::GroupEpoch {
+            remote: [0; 16],
+            group: PRIVATE_GROUP.into(),
+            epoch: 1,
+        }
     }
 
     fn p(s: &str) -> RepoPath {
@@ -225,13 +251,22 @@ mod tests {
         let proj = project_tree(&s, &root, &key).unwrap();
         assert_eq!(sealed_paths(&proj), vec![".env", "secrets"]);
         // Outsiders see the names of the sealed roots and nothing below them.
-        let public: Vec<String> =
-            walk(&s, &proj.public_tree, &RepoPath::root()).unwrap().into_iter().map(|(p, _)| p.to_string()).collect();
+        let public: Vec<String> = walk(&s, &proj.public_tree, &RepoPath::root())
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p.to_string())
+            .collect();
         assert_eq!(public, vec![".env", ".private", "secrets", "src/main.rs"]);
-        assert!(lookup(&s, &proj.public_tree, &p("secrets/a.key")).unwrap().is_none());
+        assert!(lookup(&s, &proj.public_tree, &p("secrets/a.key"))
+            .unwrap()
+            .is_none());
         let env = lookup(&s, &proj.public_tree, &p(".env")).unwrap().unwrap();
         assert_eq!(env.kind(), EntryKind::Sealed);
-        assert_ne!(env.id(), lookup(&s, &root, &p(".env")).unwrap().unwrap().id(), "never the plain id");
+        assert_ne!(
+            env.id(),
+            lookup(&s, &root, &p(".env")).unwrap().unwrap().id(),
+            "never the plain id"
+        );
         // Untouched public subtrees are reused by id.
         assert_eq!(
             lookup(&s, &proj.public_tree, &p("src")).unwrap(),
@@ -244,7 +279,11 @@ mod tests {
         let s = MemoryStore::new();
         let root = tree(
             &s,
-            &[(".private", b"secrets/**\n!secrets/README.md\n"), ("secrets/README.md", b"hi"), ("secrets/a.key", b"A")],
+            &[
+                (".private", b"secrets/**\n!secrets/README.md\n"),
+                ("secrets/README.md", b"hi"),
+                ("secrets/a.key", b"A"),
+            ],
         );
         let proj = project_tree(&s, &root, &EpochKey::generate(group()).unwrap()).unwrap();
         assert_eq!(sealed_paths(&proj), vec!["secrets/a.key"]);
@@ -264,19 +303,36 @@ mod tests {
     fn refusals() {
         let s = MemoryStore::new();
         let key = EpochKey::generate(group()).unwrap();
-        let roles = tree(&s, &[(".private", b"billing/ @billing\n"), ("billing/x", b"x")]);
-        assert!(matches!(project_tree(&s, &roles, &key), Err(ProjectError::RolesNotSupported(r)) if r == "@billing"));
+        let roles = tree(
+            &s,
+            &[(".private", b"billing/ @billing\n"), ("billing/x", b"x")],
+        );
+        assert!(
+            matches!(project_tree(&s, &roles, &key), Err(ProjectError::RolesNotSupported(r)) if r == "@billing")
+        );
         let self_private = tree(&s, &[(".private", b".priv*\n")]);
-        assert!(matches!(project_tree(&s, &self_private, &key), Err(ProjectError::RulesFileIsPrivate)));
+        assert!(matches!(
+            project_tree(&s, &self_private, &key),
+            Err(ProjectError::RulesFileIsPrivate)
+        ));
     }
 
     #[test]
     fn sealed_ids_are_stable_across_publishes_of_unchanged_content() {
         let s = MemoryStore::new();
         let key = EpochKey::generate(group()).unwrap();
-        let a = tree(&s, &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"1")]);
-        let b = tree(&s, &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"2")]);
-        let (pa, pb) = (project_tree(&s, &a, &key).unwrap(), project_tree(&s, &b, &key).unwrap());
+        let a = tree(
+            &s,
+            &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"1")],
+        );
+        let b = tree(
+            &s,
+            &[(".private", b".env\n"), (".env", b"T=1"), ("x", b"2")],
+        );
+        let (pa, pb) = (
+            project_tree(&s, &a, &key).unwrap(),
+            project_tree(&s, &b, &key).unwrap(),
+        );
         let sealed = |t| lookup(&s, t, &p(".env")).unwrap().unwrap();
         assert_eq!(sealed(&pa.public_tree), sealed(&pb.public_tree));
     }

@@ -8,7 +8,8 @@ use tig_core::{
     ChangeId, EntryKind, MemoryStore, ObjectId, ObjectKind, RepoPath, Revision, Signature, Store,
 };
 use tig_private::keys::{
-    grant, open_grant, unwrap_unverified, wrap, EpochKey, GroupEpoch, Identity, KeyError, PublicIdentity, WrappedKey,
+    grant, open_grant, unwrap_unverified, wrap, EpochKey, GroupEpoch, Identity, KeyError,
+    PublicIdentity, WrappedKey,
 };
 use tig_private::project::{project_tree, public_revision, ProjectError};
 
@@ -26,6 +27,7 @@ fn tree(store: &MemoryStore, files: &[(&str, &[u8])]) -> ObjectId {
 
 fn group(name: &str, epoch: u64) -> GroupEpoch {
     GroupEpoch {
+        remote: [0; 16],
         group: name.into(),
         epoch,
     }
@@ -38,7 +40,12 @@ fn invalid_utf8_rules_refuse_projection() {
         &store,
         &[(".private", b"secr\xffet\n"), ("secret", b"TOKEN=1")],
     );
-    assert!(project_tree(&store, &root, &EpochKey::generate(group("private", 1)).unwrap()).is_err());
+    assert!(project_tree(
+        &store,
+        &root,
+        &EpochKey::generate(group("private", 1)).unwrap()
+    )
+    .is_err());
 }
 
 #[test]
@@ -73,9 +80,23 @@ fn wrap_labels_are_frozen_in_the_domain_module() {
     assert_eq!(tig_core::domain::CONTENT_KEY, "tig content key v1");
     assert_eq!(tig_core::domain::NONCE_KEY, "tig nonce key v1");
     assert_eq!(tig_core::domain::WIRE_ID_KEY, "tig wire id key v1");
-    assert_eq!(tig_core::domain::IDENTITY_FINGERPRINT, "tig identity fingerprint v1");
-    assert_eq!(tig_core::domain::EPOCH_KEY_COMMITMENT, "tig epoch key commitment v1");
-    assert_eq!(tig_core::domain::GRANT_SIGNATURE, "tig epoch grant signature v1");
+    assert_eq!(
+        tig_core::domain::IDENTITY_FINGERPRINT,
+        "tig identity fingerprint v1"
+    );
+    assert_eq!(
+        tig_core::domain::EPOCH_KEY_COMMITMENT,
+        "tig epoch key commitment v1"
+    );
+    assert_eq!(
+        tig_core::domain::GRANT_SIGNATURE,
+        "tig epoch grant signature v1"
+    );
+    assert_eq!(tig_core::domain::PACK_INDEX_AAD, b"tig pack index v1");
+    assert_eq!(
+        tig_core::domain::KEYRING_HEAD_SIGNATURE,
+        "tig keyring head signature v1"
+    );
 }
 
 #[test]
@@ -85,8 +106,14 @@ fn synthetic_nonce_must_not_accept_two_plaintexts_for_one_id() {
     let second = b"SECRET=2";
     let id = hash_object(ObjectKind::Blob, first);
     assert!(key.encrypt_object(ObjectKind::Blob, &id, first).is_ok());
-    assert!(matches!(key.encrypt_object(ObjectKind::Blob, &id, second), Err(KeyError::ObjectMismatch)));
-    assert!(matches!(key.encrypt_object(ObjectKind::Tree, &id, first), Err(KeyError::ObjectMismatch)));
+    assert!(matches!(
+        key.encrypt_object(ObjectKind::Blob, &id, second),
+        Err(KeyError::ObjectMismatch)
+    ));
+    assert!(matches!(
+        key.encrypt_object(ObjectKind::Tree, &id, first),
+        Err(KeyError::ObjectMismatch)
+    ));
 }
 
 #[test]
@@ -95,7 +122,15 @@ fn reused_epoch_key_must_separate_group_and_epoch_nonce_domains() {
     let body = b"SECRET=1";
     let id = hash_object(ObjectKind::Blob, body);
     let a = key.encrypt_object(ObjectKind::Blob, &id, body).unwrap();
-    for context in [group("billing", 1), group("private", 2), group("private\0", 1), group("", 1)] {
+    let mut other_remote = group("private", 1);
+    other_remote.remote = [1; 16];
+    for context in [
+        group("billing", 1),
+        group("private", 2),
+        group("private\0", 1),
+        group("", 1),
+        other_remote,
+    ] {
         let other = EpochKey::from_bytes(context.clone(), [7; 32]);
         let b = other.encrypt_object(ObjectKind::Blob, &id, body).unwrap();
         assert_ne!(
@@ -105,7 +140,10 @@ fn reused_epoch_key_must_separate_group_and_epoch_nonce_domains() {
         );
         assert!(other.decrypt_object(ObjectKind::Blob, &id, &a).is_err());
         assert_ne!(key.wire_id(&id), other.wire_id(&id));
-        assert_ne!(key.seal(&p("a.key"), EntryKind::File, &id), other.seal(&p("a.key"), EntryKind::File, &id));
+        assert_ne!(
+            key.seal(&p("a.key"), EntryKind::File, &id),
+            other.seal(&p("a.key"), EntryKind::File, &id)
+        );
     }
 }
 
@@ -166,11 +204,22 @@ fn private_folder_with_existing_seal_hides_child_names() {
             .unwrap()
             .is_none()
     );
-    assert!(lookup(&store, &projection.public_tree, &p("secrets/old")).unwrap().is_none());
-    assert!(projection.public_files.iter().all(|(path, _)| !path.starts_with(&p("secrets"))));
-    assert_eq!(projection.sealed[0].readers, std::collections::BTreeSet::from(["private".into()]));
+    assert!(lookup(&store, &projection.public_tree, &p("secrets/old"))
+        .unwrap()
+        .is_none());
+    assert!(projection
+        .public_files
+        .iter()
+        .all(|(path, _)| !path.starts_with(&p("secrets"))));
+    assert_eq!(
+        projection.sealed[0].readers,
+        std::collections::BTreeSet::from(["private".into()])
+    );
     // The original private subtree keeps the opaque foreign entry intact.
-    assert_eq!(lookup(&store, &projection.sealed[0].leaf.id(), &p("old")).unwrap(), Some(Leaf::sealed(sid)));
+    assert_eq!(
+        lookup(&store, &projection.sealed[0].leaf.id(), &p("old")).unwrap(),
+        Some(Leaf::sealed(sid))
+    );
 }
 
 #[test]
@@ -182,12 +231,19 @@ fn foreign_seals_with_public_files_or_alone_stay_public() {
     let sid = foreign_key.seal(&p("folder/old"), EntryKind::File, &target);
     for files in [vec![("folder/README", &b"public"[..])], vec![]] {
         let base = tree(&store, &files);
-        let root = apply_edits(&store, &base, &BTreeMap::from([(p("folder/old"), Some(Leaf::sealed(sid)))])).unwrap();
+        let root = apply_edits(
+            &store,
+            &base,
+            &BTreeMap::from([(p("folder/old"), Some(Leaf::sealed(sid)))]),
+        )
+        .unwrap();
         let projection = project_tree(&store, &root, &key).unwrap();
         assert_eq!(projection.public_tree, root);
         assert!(projection.sealed.is_empty());
         assert!(projection.private_files.is_empty());
-        assert!(projection.public_files.contains(&(p("folder/old"), Leaf::sealed(sid))));
+        assert!(projection
+            .public_files
+            .contains(&(p("folder/old"), Leaf::sealed(sid))));
     }
 }
 
@@ -208,7 +264,12 @@ fn mixed_directories_seal_only_the_highest_uniform_roots() {
             ("root.key", b"key"),
         ],
     );
-    let projection = project_tree(&store, &root, &EpochKey::generate(group("private", 1)).unwrap()).unwrap();
+    let projection = project_tree(
+        &store,
+        &root,
+        &EpochKey::generate(group("private", 1)).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         projection
             .sealed
@@ -423,9 +484,13 @@ fn deep_private_paths_collapse_without_recursion_in_projection() {
     let deep = format!("secrets/{}key", "d/".repeat(128));
     let root = tree(&store, &[(".private", b"secrets/\n"), (&deep, b"key")]);
     assert_eq!(
-        project_tree(&store, &root, &EpochKey::generate(group("private", 1)).unwrap())
-            .unwrap()
-            .sealed[0]
+        project_tree(
+            &store,
+            &root,
+            &EpochKey::generate(group("private", 1)).unwrap()
+        )
+        .unwrap()
+        .sealed[0]
             .path,
         p("secrets")
     );
@@ -473,7 +538,12 @@ fn failing_or_vanished_sealed_root_aborts_without_public_tree_writes() {
             writes: AtomicUsize::new(0),
             missing,
         };
-        let error = project_tree(&faulty, &root, &EpochKey::generate(group("private", 1)).unwrap()).unwrap_err();
+        let error = project_tree(
+            &faulty,
+            &root,
+            &EpochKey::generate(group("private", 1)).unwrap(),
+        )
+        .unwrap_err();
         if missing {
             assert!(error.to_string().contains("vanished"));
         } else {
@@ -531,7 +601,13 @@ fn wrap_checks_low_order_points_and_binds_the_ephemeral_key() {
     ] {
         let point: [u8; 32] = hex::decode(point).unwrap().try_into().unwrap();
         assert!(matches!(
-            wrap(&key, &PublicIdentity { encryption: point, signing: identity.public().signing }),
+            wrap(
+                &key,
+                &PublicIdentity {
+                    encryption: point,
+                    signing: identity.public().signing
+                }
+            ),
             Err(KeyError::WeakKey)
         ));
         let bad = WrappedKey {
@@ -585,9 +661,7 @@ fn objects_are_deterministic_and_bind_all_aad_fields() {
     }
     let mut bad = ciphertext.clone();
     bad[0] ^= 1;
-    assert!(key
-        .decrypt_object(ObjectKind::Blob, &id, &bad)
-        .is_err());
+    assert!(key.decrypt_object(ObjectKind::Blob, &id, &bad).is_err());
 }
 
 #[test]

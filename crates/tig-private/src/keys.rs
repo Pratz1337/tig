@@ -10,8 +10,8 @@
 //!   epoch key. Members use [`open_grant`] with the pinned owner signing key.
 //!   Owners use their local epoch keys, never keys supplied by the remote.
 //! - The epoch key is never used directly. Every purpose derives its own
-//!   subkey from the secret AND its group/epoch context, with a frozen label
-//!   from `tig_core::domain`. Secret buffers are zeroized on drop.
+//!   subkey from the secret AND its remote, group and epoch, with a frozen
+//!   label from `tig_core::domain`. Secret buffers are zeroized on drop.
 
 use std::fmt;
 
@@ -81,7 +81,10 @@ pub struct Identity {
 
 impl Identity {
     pub fn generate() -> Result<Self, KeyError> {
-        Ok(Identity { secret: StaticSecret::from(*random32()?), signing: SigningKey::from_bytes(&*random32()?) })
+        Ok(Identity {
+            secret: StaticSecret::from(*random32()?),
+            signing: SigningKey::from_bytes(&*random32()?),
+        })
     }
 
     /// Stored format: X25519 secret followed by an independent Ed25519 seed.
@@ -107,6 +110,11 @@ impl Identity {
             signing: self.signing.verifying_key().to_bytes(),
         }
     }
+
+    /// Signs `message` with this identity's Ed25519 key.
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing.sign(message).to_bytes()
+    }
 }
 
 impl fmt::Debug for Identity {
@@ -118,21 +126,39 @@ impl fmt::Debug for Identity {
 // ---------------------------------------------------------------------------
 // Groups
 
-/// Which group and epoch a key or ciphertext belongs to. Bound into every
-/// epoch subkey and the associated data of everything encrypted under it.
+/// Which remote, group and epoch a key or ciphertext belongs to.
+///
+/// `remote` is the remote's random 16-byte id. It is mixed, length-prefixed,
+/// into every subkey, every AEAD associated-data string, the grant signature
+/// and the epoch-key commitment. The same secret bytes in two remotes are
+/// two unrelated keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupEpoch {
+    pub remote: [u8; 16],
     pub group: String,
     pub epoch: u64,
 }
 
 impl GroupEpoch {
+    /// `remote_len_u64_le || remote || group_len_u64_le || group || epoch_u64_le`.
+    ///
+    /// Fixed-width lengths sit in front of every variable field, so two
+    /// different contexts cannot encode to the same bytes.
+    fn encoding(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.remote.len() + 8 + self.group.len() + 8);
+        out.extend_from_slice(&(self.remote.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.remote);
+        out.extend_from_slice(&(self.group.len() as u64).to_le_bytes());
+        out.extend_from_slice(self.group.as_bytes());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out
+    }
+
     fn aad(&self, prefix: &[u8], extra: &[u8]) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(prefix.len() + self.group.len() + 16 + extra.len());
+        let ctx = self.encoding();
+        let mut aad = Vec::with_capacity(prefix.len() + ctx.len() + extra.len());
         aad.extend_from_slice(prefix);
-        aad.extend_from_slice(&(self.group.len() as u64).to_le_bytes());
-        aad.extend_from_slice(self.group.as_bytes());
-        aad.extend_from_slice(&self.epoch.to_le_bytes());
+        aad.extend_from_slice(&ctx);
         aad.extend_from_slice(extra);
         aad
     }
@@ -165,7 +191,10 @@ impl EpochKey {
     /// Restores an owner's locally stored epoch key with its context.
     pub fn from_bytes(context: GroupEpoch, bytes: [u8; 32]) -> Self {
         let bytes = Zeroizing::new(bytes);
-        EpochKey { bytes: *bytes, context }
+        EpochKey {
+            bytes: *bytes,
+            context,
+        }
     }
 
     /// Secret bytes for the local keystore; save the context alongside them.
@@ -178,9 +207,10 @@ impl EpochKey {
     }
 
     fn subkey(&self, label: &str) -> Zeroizing<[u8; 32]> {
-        let mut material = Zeroizing::new(Vec::with_capacity(48 + self.context.group.len()));
+        let ctx = self.context.encoding();
+        let mut material = Zeroizing::new(Vec::with_capacity(self.bytes.len() + ctx.len()));
         material.extend_from_slice(&self.bytes);
-        material.extend_from_slice(&self.context.aad(b"", b""));
+        material.extend_from_slice(&ctx);
         Zeroizing::new(blake3::derive_key(label, &material))
     }
 
@@ -211,15 +241,27 @@ impl EpochKey {
     ///
     /// Refuses a mismatched kind/body/ID before using the synthetic nonce.
     /// This is not misuse-resistant SIV; it relies on collision-resistant IDs.
-    pub fn encrypt_object(&self, kind: ObjectKind, id: &ObjectId, body: &[u8]) -> Result<Vec<u8>, KeyError> {
+    pub fn encrypt_object(
+        &self,
+        kind: ObjectKind,
+        id: &ObjectId,
+        body: &[u8],
+    ) -> Result<Vec<u8>, KeyError> {
         if hash_object(kind, body) != *id {
             return Err(KeyError::ObjectMismatch);
         }
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
         let nonce = self.object_nonce(kind, id);
         let aad = self.context.aad(domain::OBJECT_AAD, &object_aad(kind, id));
         cipher
-            .encrypt(XNonce::from_slice(&nonce), Payload { msg: body, aad: &aad })
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: body,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| KeyError::Encrypt)
     }
 
@@ -230,12 +272,21 @@ impl EpochKey {
         id: &ObjectId,
         ciphertext: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
         let nonce = self.object_nonce(kind, id);
         let aad = self.context.aad(domain::OBJECT_AAD, &object_aad(kind, id));
-        let plain = Zeroizing::new(cipher
-            .decrypt(XNonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &aad })
-            .map_err(|_| KeyError::Decrypt)?);
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| KeyError::Decrypt)?,
+        );
         if hash_object(kind, &plain) != *id {
             return Err(KeyError::ObjectMismatch);
         }
@@ -247,6 +298,88 @@ impl EpochKey {
         let mut nonce = [0u8; 24];
         nonce.copy_from_slice(&full.as_bytes()[..24]);
         nonce
+    }
+
+    /// Encrypts a pack index under the content subkey.
+    ///
+    /// Generates a fresh 24-byte nonce. Associated data is
+    /// `PACK_INDEX_AAD || context || header || nonce`. `context` is the
+    /// length-unambiguous remote, group and epoch. `header || nonce` is the
+    /// pack header stored in front of the index ciphertext; `header` is that
+    /// prefix without the nonce, because the nonce is chosen here.
+    pub fn encrypt_index(
+        &self,
+        index: &[u8],
+        header: &[u8],
+    ) -> Result<([u8; 24], Vec<u8>), KeyError> {
+        let mut nonce = [0u8; 24];
+        getrandom::getrandom(&mut nonce).map_err(|e| KeyError::Random(e.to_string()))?;
+        let ciphertext = self.seal_index(&nonce, index, header)?;
+        Ok((nonce, ciphertext))
+    }
+
+    /// Decrypts a pack index. `header` is the prefix passed to
+    /// [`EpochKey::encrypt_index`]. The plaintext is zeroized on drop.
+    pub fn decrypt_index(
+        &self,
+        nonce: &[u8; 24],
+        ciphertext: &[u8],
+        header: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        Ok(Zeroizing::new(self.open_index(nonce, ciphertext, header)?))
+    }
+
+    fn seal_index(
+        &self,
+        nonce: &[u8; 24],
+        index: &[u8],
+        header: &[u8],
+    ) -> Result<Vec<u8>, KeyError> {
+        // The derived subkey is 32 bytes, the only length this cipher accepts.
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
+        let aad = self.index_aad(header, nonce);
+        cipher
+            .encrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: index,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| KeyError::Encrypt)
+    }
+
+    fn open_index(
+        &self,
+        nonce: &[u8; 24],
+        ciphertext: &[u8],
+        header: &[u8],
+    ) -> Result<Vec<u8>, KeyError> {
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&self.subkey(domain::CONTENT_KEY)[..]).unwrap();
+        let aad = self.index_aad(header, nonce);
+        cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| KeyError::Decrypt)
+    }
+
+    fn index_aad(&self, header: &[u8], nonce: &[u8; 24]) -> Vec<u8> {
+        let ctx = self.context.encoding();
+        let mut aad = Vec::with_capacity(
+            domain::PACK_INDEX_AAD.len() + ctx.len() + header.len() + nonce.len(),
+        );
+        aad.extend_from_slice(domain::PACK_INDEX_AAD);
+        aad.extend_from_slice(&ctx);
+        aad.extend_from_slice(header);
+        aad.extend_from_slice(nonce);
+        aad
     }
 }
 
@@ -268,7 +401,11 @@ pub struct WrappedKey {
     pub ciphertext: Vec<u8>,
 }
 
-fn wrap_cipher(shared: &[u8; 32], ephemeral: &[u8; 32], recipient: &PublicIdentity) -> XChaCha20Poly1305 {
+fn wrap_cipher(
+    shared: &[u8; 32],
+    ephemeral: &[u8; 32],
+    recipient: &PublicIdentity,
+) -> XChaCha20Poly1305 {
     let mut material = Zeroizing::new(Vec::with_capacity(96));
     material.extend_from_slice(shared);
     material.extend_from_slice(ephemeral);
@@ -293,9 +430,19 @@ pub fn wrap(key: &EpochKey, recipient: &PublicIdentity) -> Result<WrappedKey, Ke
     getrandom::getrandom(&mut nonce).map_err(|e| KeyError::Random(e.to_string()))?;
     let aad = key.context.aad(domain::WRAP_AAD, &recipient.encryption);
     let ciphertext = wrap_cipher(shared.as_bytes(), &ephemeral, recipient)
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: &key.bytes, aad: &aad })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &key.bytes,
+                aad: &aad,
+            },
+        )
         .map_err(|_| KeyError::Decrypt)?;
-    Ok(WrappedKey { ephemeral, nonce, ciphertext })
+    Ok(WrappedKey {
+        ephemeral,
+        nonce,
+        ciphertext,
+    })
 }
 
 /// Opens an anonymous wrap. This does NOT authenticate the sender; remote
@@ -303,22 +450,37 @@ pub fn wrap(key: &EpochKey, recipient: &PublicIdentity) -> Result<WrappedKey, Ke
 /// Opens a wrapped key WITHOUT checking who granted it. A server can wrap a
 /// key it knows to your public key, so never use this to accept keys from a
 /// remote: use [`open_grant`], which verifies the owner's signature.
-pub fn unwrap_unverified(wrapped: &WrappedKey, group: &GroupEpoch, identity: &Identity) -> Result<EpochKey, KeyError> {
+pub fn unwrap_unverified(
+    wrapped: &WrappedKey,
+    group: &GroupEpoch,
+    identity: &Identity,
+) -> Result<EpochKey, KeyError> {
     let recipient = identity.public();
-    let shared = identity.secret.diffie_hellman(&XPublic::from(wrapped.ephemeral));
+    let shared = identity
+        .secret
+        .diffie_hellman(&XPublic::from(wrapped.ephemeral));
     if !shared.was_contributory() {
         return Err(KeyError::WeakKey);
     }
     let aad = group.aad(domain::WRAP_AAD, &recipient.encryption);
-    let plain = Zeroizing::new(wrap_cipher(shared.as_bytes(), &wrapped.ephemeral, &recipient)
-        .decrypt(XNonce::from_slice(&wrapped.nonce), Payload { msg: &wrapped.ciphertext, aad: &aad })
-        .map_err(|_| KeyError::Decrypt)?);
+    let plain = Zeroizing::new(
+        wrap_cipher(shared.as_bytes(), &wrapped.ephemeral, &recipient)
+            .decrypt(
+                XNonce::from_slice(&wrapped.nonce),
+                Payload {
+                    msg: &wrapped.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| KeyError::Decrypt)?,
+    );
     let bytes: &[u8; 32] = plain.as_slice().try_into().map_err(|_| KeyError::Decrypt)?;
     Ok(EpochKey::from_bytes(group.clone(), *bytes))
 }
 
 /// An owner-authenticated epoch key for one recipient. All fields except
-/// `signature` are covered by the signature; variable fields are length-prefixed.
+/// `signature` are covered by the signature. The remote id, the group and
+/// the ciphertext are length-prefixed, so the encoding has one parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub context: GroupEpoch,
@@ -342,10 +504,29 @@ impl Grant {
         bytes.extend_from_slice(&self.granter);
         bytes
     }
+
+    /// Checks the granter field and the Ed25519 signature. Does not unwrap.
+    pub fn verify_signature(&self, owner_signing_key: &[u8; 32]) -> Result<(), KeyError> {
+        if self.granter != *owner_signing_key {
+            return Err(KeyError::InvalidGrant);
+        }
+        let owner =
+            VerifyingKey::from_bytes(owner_signing_key).map_err(|_| KeyError::InvalidGrant)?;
+        owner
+            .verify_strict(
+                &self.signing_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&self.signature),
+            )
+            .map_err(|_| KeyError::InvalidGrant)
+    }
 }
 
 /// Wraps and signs a grant. In phase 1 `owner` must be the pinned repo owner.
-pub fn grant(key: &EpochKey, recipient: &PublicIdentity, owner: &Identity) -> Result<Grant, KeyError> {
+pub fn grant(
+    key: &EpochKey,
+    recipient: &PublicIdentity,
+    owner: &Identity,
+) -> Result<Grant, KeyError> {
     let mut grant = Grant {
         context: key.context.clone(),
         recipient: *recipient,
@@ -366,14 +547,14 @@ pub fn open_grant(
     identity: &Identity,
     trusted_owner_signing_key: &[u8; 32],
 ) -> Result<EpochKey, KeyError> {
-    if grant.granter != *trusted_owner_signing_key || grant.recipient != identity.public() {
+    if grant.recipient != identity.public() {
         return Err(KeyError::InvalidGrant);
     }
-    let owner = VerifyingKey::from_bytes(trusted_owner_signing_key).map_err(|_| KeyError::InvalidGrant)?;
-    owner.verify_strict(&grant.signing_bytes(), &ed25519_dalek::Signature::from_bytes(&grant.signature))
-        .map_err(|_| KeyError::InvalidGrant)?;
+    grant.verify_signature(trusted_owner_signing_key)?;
     let key = unwrap_unverified(&grant.wrapped, &grant.context, identity)?;
-    if blake3::Hash::from(*key.subkey(domain::EPOCH_KEY_COMMITMENT)) != blake3::Hash::from(grant.commitment) {
+    if blake3::Hash::from(*key.subkey(domain::EPOCH_KEY_COMMITMENT))
+        != blake3::Hash::from(grant.commitment)
+    {
         return Err(KeyError::InvalidGrant);
     }
     Ok(key)
@@ -384,7 +565,12 @@ mod tests {
     use super::*;
 
     fn group() -> GroupEpoch {
-        GroupEpoch { group: "private".into(), epoch: 1 }
+        // Fixed remote so the golden vectors below stay reproducible.
+        GroupEpoch {
+            remote: [9; 16],
+            group: "private".into(),
+            epoch: 1,
+        }
     }
 
     fn path(s: &str) -> RepoPath {
@@ -400,10 +586,38 @@ mod tests {
         let opened = unwrap_unverified(&w, &group(), &alice).unwrap();
         assert_eq!(opened.bytes, key.bytes);
         assert_eq!(opened.context(), key.context());
-        // Wrong person, wrong group, wrong epoch, tampering: all refused.
+        // Wrong person, wrong remote, wrong group, wrong epoch, tampering: all refused.
         assert!(unwrap_unverified(&w, &group(), &bob).is_err());
-        assert!(unwrap_unverified(&w, &GroupEpoch { group: "billing".into(), epoch: 1 }, &alice).is_err());
-        assert!(unwrap_unverified(&w, &GroupEpoch { group: "private".into(), epoch: 2 }, &alice).is_err());
+        assert!(unwrap_unverified(
+            &w,
+            &GroupEpoch {
+                remote: [9; 16],
+                group: "billing".into(),
+                epoch: 1
+            },
+            &alice
+        )
+        .is_err());
+        assert!(unwrap_unverified(
+            &w,
+            &GroupEpoch {
+                remote: [9; 16],
+                group: "private".into(),
+                epoch: 2
+            },
+            &alice
+        )
+        .is_err());
+        assert!(unwrap_unverified(
+            &w,
+            &GroupEpoch {
+                remote: [8; 16],
+                group: "private".into(),
+                epoch: 1
+            },
+            &alice
+        )
+        .is_err());
         let mut bad = w.clone();
         bad.ciphertext[0] ^= 1;
         assert!(unwrap_unverified(&bad, &group(), &alice).is_err());
@@ -414,7 +628,10 @@ mod tests {
     #[test]
     fn low_order_public_key_is_refused() {
         let key = EpochKey::generate(group()).unwrap();
-        let recipient = PublicIdentity { encryption: [0; 32], signing: [0; 32] };
+        let recipient = PublicIdentity {
+            encryption: [0; 32],
+            signing: [0; 32],
+        };
         assert!(matches!(wrap(&key, &recipient), Err(KeyError::WeakKey)));
     }
 
@@ -422,17 +639,46 @@ mod tests {
     fn object_encryption_is_deterministic_and_bound() {
         let key = EpochKey::generate(group()).unwrap();
         let id = hash_object(ObjectKind::Blob, b"SECRET=1");
-        let a = key.encrypt_object(ObjectKind::Blob, &id, b"SECRET=1").unwrap();
-        assert_eq!(a, key.encrypt_object(ObjectKind::Blob, &id, b"SECRET=1").unwrap());
-        assert_eq!(key.decrypt_object(ObjectKind::Blob, &id, &a).unwrap().as_slice(), b"SECRET=1");
-        let other_group = GroupEpoch { group: "billing".into(), epoch: 1 };
+        let a = key
+            .encrypt_object(ObjectKind::Blob, &id, b"SECRET=1")
+            .unwrap();
+        assert_eq!(
+            a,
+            key.encrypt_object(ObjectKind::Blob, &id, b"SECRET=1")
+                .unwrap()
+        );
+        assert_eq!(
+            key.decrypt_object(ObjectKind::Blob, &id, &a)
+                .unwrap()
+                .as_slice(),
+            b"SECRET=1"
+        );
+        let other_group = GroupEpoch {
+            remote: [9; 16],
+            group: "billing".into(),
+            epoch: 1,
+        };
         let other = EpochKey::from_bytes(other_group, *key.to_bytes());
         assert!(other.decrypt_object(ObjectKind::Blob, &id, &a).is_err());
+        let other_remote = GroupEpoch {
+            remote: [8; 16],
+            group: "private".into(),
+            epoch: 1,
+        };
+        let shifted = EpochKey::from_bytes(other_remote, *key.to_bytes());
+        assert!(shifted.decrypt_object(ObjectKind::Blob, &id, &a).is_err());
+        assert_ne!(key.wire_id(&id), shifted.wire_id(&id));
         assert!(key.decrypt_object(ObjectKind::Tree, &id, &a).is_err());
-        assert!(key.decrypt_object(ObjectKind::Blob, &ObjectId([5; 32]), &a).is_err());
+        assert!(key
+            .decrypt_object(ObjectKind::Blob, &ObjectId([5; 32]), &a)
+            .is_err());
         // A different epoch key never produces the same ciphertext.
         let key2 = EpochKey::generate(group()).unwrap();
-        assert_ne!(a, key2.encrypt_object(ObjectKind::Blob, &id, b"SECRET=1").unwrap());
+        assert_ne!(
+            a,
+            key2.encrypt_object(ObjectKind::Blob, &id, b"SECRET=1")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -440,9 +686,20 @@ mod tests {
         let key = EpochKey::generate(group()).unwrap();
         let id = ObjectId([7; 32]);
         let s = key.seal(&path(".env"), EntryKind::File, &id);
-        assert_eq!(s, key.seal(&path(".env"), EntryKind::File, &id), "stable for unchanged content");
-        assert_ne!(s, key.seal(&path("other/.env"), EntryKind::File, &id), "same content elsewhere differs");
-        assert_ne!(s, key.seal(&path(".env"), EntryKind::File, &ObjectId([8; 32])));
+        assert_eq!(
+            s,
+            key.seal(&path(".env"), EntryKind::File, &id),
+            "stable for unchanged content"
+        );
+        assert_ne!(
+            s,
+            key.seal(&path("other/.env"), EntryKind::File, &id),
+            "same content elsewhere differs"
+        );
+        assert_ne!(
+            s,
+            key.seal(&path(".env"), EntryKind::File, &ObjectId([8; 32]))
+        );
         assert_ne!(s.as_bytes(), id.as_bytes());
         // Disclosing one salt lets anyone verify that one entry.
         let salt = key.seal_salt(&path(".env"), EntryKind::File, &id);
@@ -495,29 +752,55 @@ mod tests {
                 9 => bad.granter[0] ^= 1,
                 _ => bad.signature[0] ^= 1,
             }
-            assert!(open_grant(&bad, &member, &trusted).is_err(), "field {field}");
+            assert!(
+                open_grant(&bad, &member, &trusted).is_err(),
+                "field {field}"
+            );
         }
+        let mut bad = g.clone();
+        bad.context.remote[0] ^= 1;
+        assert!(open_grant(&bad, &member, &trusted).is_err(), "remote");
         // A correct owner signature cannot make a bad commitment or wrap valid.
         let mut bad = g.clone();
         bad.commitment[0] ^= 1;
         bad.signature = owner.signing.sign(&bad.signing_bytes()).to_bytes();
-        assert!(matches!(open_grant(&bad, &member, &trusted), Err(KeyError::InvalidGrant)));
+        assert!(matches!(
+            open_grant(&bad, &member, &trusted),
+            Err(KeyError::InvalidGrant)
+        ));
         let mut bad = g;
         bad.wrapped.ciphertext[0] ^= 1;
         bad.signature = owner.signing.sign(&bad.signing_bytes()).to_bytes();
-        assert!(matches!(open_grant(&bad, &member, &trusted), Err(KeyError::Decrypt)));
+        assert!(matches!(
+            open_grant(&bad, &member, &trusted),
+            Err(KeyError::Decrypt)
+        ));
     }
 
     #[test]
     fn authenticated_object_with_wrong_hash_is_refused() {
         let key = EpochKey::generate(group()).unwrap();
         let id = hash_object(ObjectKind::Blob, b"SECRET=1");
-        let cipher = XChaCha20Poly1305::new_from_slice(&key.subkey(domain::CONTENT_KEY)[..]).unwrap();
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&key.subkey(domain::CONTENT_KEY)[..]).unwrap();
         let nonce = key.object_nonce(ObjectKind::Blob, &id);
-        let aad = key.context.aad(domain::OBJECT_AAD, &object_aad(ObjectKind::Blob, &id));
+        let aad = key
+            .context
+            .aad(domain::OBJECT_AAD, &object_aad(ObjectKind::Blob, &id));
         // Deliberately bypass encrypt_object to simulate an authenticated bad pack.
-        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: b"SECRET=2", aad: &aad }).unwrap();
-        assert!(matches!(key.decrypt_object(ObjectKind::Blob, &id, &ciphertext), Err(KeyError::ObjectMismatch)));
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: b"SECRET=2",
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            key.decrypt_object(ObjectKind::Blob, &id, &ciphertext),
+            Err(KeyError::ObjectMismatch)
+        ));
     }
 
     #[test]
@@ -525,11 +808,26 @@ mod tests {
         let member = Identity::generate().unwrap();
         let key = EpochKey::generate(group()).unwrap();
         let mut wrapped = wrap(&key, &member.public()).unwrap();
-        let shared = member.secret.diffie_hellman(&XPublic::from(wrapped.ephemeral));
+        let shared = member
+            .secret
+            .diffie_hellman(&XPublic::from(wrapped.ephemeral));
         let cipher = wrap_cipher(shared.as_bytes(), &wrapped.ephemeral, &member.public());
-        let aad = key.context.aad(domain::WRAP_AAD, &member.public().encryption);
-        wrapped.ciphertext = cipher.encrypt(XNonce::from_slice(&wrapped.nonce), Payload { msg: &[0; 31], aad: &aad }).unwrap();
-        assert!(matches!(unwrap_unverified(&wrapped, &group(), &member), Err(KeyError::Decrypt)));
+        let aad = key
+            .context
+            .aad(domain::WRAP_AAD, &member.public().encryption);
+        wrapped.ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&wrapped.nonce),
+                Payload {
+                    msg: &[0; 31],
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            unwrap_unverified(&wrapped, &group(), &member),
+            Err(KeyError::Decrypt)
+        ));
     }
 
     #[test]
@@ -564,41 +862,124 @@ mod tests {
         let ephemeral = XPublic::from(&ephemeral_secret).to_bytes();
         let shared = ephemeral_secret.diffie_hellman(&XPublic::from(member.public().encryption));
         let nonce = [5; 24];
-        let aad = key.context.aad(domain::WRAP_AAD, &member.public().encryption);
+        let aad = key
+            .context
+            .aad(domain::WRAP_AAD, &member.public().encryption);
         let ciphertext = wrap_cipher(shared.as_bytes(), &ephemeral, &member.public())
-            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &key.bytes, aad: &aad }).unwrap();
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &key.bytes,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
         let mut g = Grant {
-            context: group(), recipient: member.public(),
-            wrapped: WrappedKey { ephemeral, nonce, ciphertext },
+            context: group(),
+            recipient: member.public(),
+            wrapped: WrappedKey {
+                ephemeral,
+                nonce,
+                ciphertext,
+            },
             commitment: *key.subkey(domain::EPOCH_KEY_COMMITMENT),
-            granter: owner.public().signing, signature: [0; 64],
+            granter: owner.public().signing,
+            signature: [0; 64],
         };
         g.signature = owner.signing.sign(&g.signing_bytes()).to_bytes();
-        assert_eq!(open_grant(&g, &member, &owner.public().signing).unwrap().to_bytes(), key.to_bytes());
+        assert_eq!(
+            open_grant(&g, &member, &owner.public().signing)
+                .unwrap()
+                .to_bytes(),
+            key.to_bytes()
+        );
         for (label, expected) in [
-            (domain::SEAL_SALT_KEY, "785b3ad2ce620ae12c15caf9bcf745f8fde050557ff7e45fbacb8e433ccc4cd0"),
-            (domain::CONTENT_KEY, "5e765cebf74b439e4a27906f24768e90e76780f7f6f691154787ba38ffbfbd9e"),
-            (domain::NONCE_KEY, "e0b86cb9246fea622ceb593c5cad2b1d78fdd635375d9567f54d34ec32aade60"),
-            (domain::WIRE_ID_KEY, "65f2a8112aeaa18540dbbbebde100ab9a4631b9e552dcbd0bd613b3e761e9f7d"),
+            (
+                domain::SEAL_SALT_KEY,
+                "5e25548d21d46249807c55cc36388a0528ea740277faf8758033d25ac6fa7bb1",
+            ),
+            (
+                domain::CONTENT_KEY,
+                "b5b33688a8bebb1b1d9e03ae10a9a5f9268a97165cd167e03d47a7a3a608688f",
+            ),
+            (
+                domain::NONCE_KEY,
+                "2be7248c4e30837e97dc2edf305143cb9d48115140bbf07e07666de311bf0317",
+            ),
+            (
+                domain::WIRE_ID_KEY,
+                "6e1f7546f22f81739e83a637edf7f9625dfadd793bd34e23c50e9b2352d4e744",
+            ),
         ] {
             assert_eq!(hex::encode(*key.subkey(label)), expected, "{label}");
         }
         assert_eq!(owner.public().fingerprint(), "11937e1ac7824421");
-        assert_eq!(hex::encode(key.seal_salt(&path(".env"), EntryKind::File, &id).as_bytes()),
-            "5bb604875ce20880f7ed202d1d5997086023359965e81ee3a7e432c4013dac1d");
-        assert_eq!(key.seal(&path(".env"), EntryKind::File, &id).to_hex(),
-            "fbe78775d5e78d35c96bfbacbd8e07072027dab84bb2f65f8705b18ccc677fde");
-        assert_eq!(hex::encode(key.wire_id(&id).0),
-            "b3775127d7993e1522832b6d4367ca5b55594de8a07006be648b0471b5fc2310");
-        assert_eq!(hex::encode(key.encrypt_object(ObjectKind::Blob, &id, body).unwrap()),
-            "f38e8311ca8ad59f68589522f874e366cd30aca60c80e686");
-        assert_eq!(hex::encode(&g.wrapped.ciphertext),
-            "484c91ead078bc8e4df19bb7b2b696ed7717ea43feb498b2c4df9809805390cfb10109bfe700c710bdd9c59b9e6ec980");
-        assert_eq!(hex::encode(g.commitment),
-            "78f408032edb048465568669de71151c3b94c4a9a05cc91a1e4c9acdcb150202");
-        assert_eq!(blake3::hash(&g.signing_bytes()).to_hex().as_str(),
-            "7f1b4a0f597639a5b2f61b4f5a05769b3109824dffec84e91ff7dbcf5f413451");
-        assert_eq!(hex::encode(g.signature),
-            "e779b99354eff8f9e5d0cc2cfc53aaa9f702e03450fa06195e7cc38cc5a5fb6e1653e588d6031a89a8281ba374769aba4c78af545b980836029e756bda5e220e");
+        assert_eq!(
+            hex::encode(
+                key.seal_salt(&path(".env"), EntryKind::File, &id)
+                    .as_bytes()
+            ),
+            "89991c15d66841c44452071247c7a9bbdf9d70f81ae324c7dbd35bf25e48d14b"
+        );
+        assert_eq!(
+            key.seal(&path(".env"), EntryKind::File, &id).to_hex(),
+            "0f807823e921a12afba88f9bd9fa1bbb1e3ccc6cc97cfa0cb0413e7d124a414b"
+        );
+        assert_eq!(
+            hex::encode(key.wire_id(&id).0),
+            "ab1739d9d7a6d3211ba31486665a8c7c54a1b0ce06a588c871a9f63df99fe416"
+        );
+        assert_eq!(
+            hex::encode(key.encrypt_object(ObjectKind::Blob, &id, body).unwrap()),
+            "8b740a129acbf5ed0875171feb4b7f5aee80eb122b74fffc"
+        );
+        assert_eq!(
+            hex::encode(&g.wrapped.ciphertext),
+            "484c91ead078bc8e4df19bb7b2b696ed7717ea43feb498b2c4df9809805390cf2732d09fb5342a9519a3a14ddf53d55c"
+        );
+        assert_eq!(
+            hex::encode(g.commitment),
+            "e0b245ec5f679ceb03d08bf915f421b51e2d1a73061b2e60b6ee5137c09da483"
+        );
+        assert_eq!(
+            blake3::hash(&g.signing_bytes()).to_hex().as_str(),
+            "31e1faaf24dce6a9724b04a63c42db476ccdf724570e362d638ab75bed99a24a"
+        );
+        assert_eq!(
+            hex::encode(g.signature),
+            "72e9e644dfef41f17f3bda054b0955164fbe0dbdd1c622a47525ce4a2d632b8e912ae0cedd54e6d9b08fef8472eeee5a0fbebe1b7d4f97456c48e5801e60610d"
+        );
+    }
+
+    #[test]
+    fn index_encryption_is_bound_to_header_and_context() {
+        let key = EpochKey::generate(group()).unwrap();
+        let header = *b"TIGPheader";
+        let (nonce, ct) = key.encrypt_index(b"index-bytes", &header).unwrap();
+        assert_eq!(
+            key.decrypt_index(&nonce, &ct, &header).unwrap().as_slice(),
+            b"index-bytes"
+        );
+        let mut bad_header = header;
+        bad_header[0] ^= 1;
+        assert!(key.decrypt_index(&nonce, &ct, &bad_header).is_err());
+        let mut bad_nonce = nonce;
+        bad_nonce[0] ^= 1;
+        assert!(key.decrypt_index(&bad_nonce, &ct, &header).is_err());
+        let mut bad_ct = ct.clone();
+        bad_ct[0] ^= 1;
+        assert!(key.decrypt_index(&nonce, &bad_ct, &header).is_err());
+        let other = EpochKey::from_bytes(
+            GroupEpoch {
+                remote: [8; 16],
+                group: "private".into(),
+                epoch: 1,
+            },
+            *key.to_bytes(),
+        );
+        assert!(other.decrypt_index(&nonce, &ct, &header).is_err());
+        let (nonce2, ct2) = key.encrypt_index(b"index-bytes", &header).unwrap();
+        assert_ne!(nonce, nonce2);
+        assert_ne!(ct, ct2);
     }
 }

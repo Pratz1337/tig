@@ -15,7 +15,7 @@ pub const OBJECT_ID: &str = "tig object v1";
 pub const SEALED_ENTRY: &str = "tig sealed entry v1";
 
 // Subkeys that tig-private derives from a group's epoch key with
-// `blake3::derive_key(label, epoch_key || group_len_u64_le || group || epoch_u64_le)`.
+// `blake3::derive_key(label, epoch_key || remote_len_u64_le || remote || group_len_u64_le || group || epoch_u64_le)`.
 // Listed here so every label lives in one place. See DESIGN.md "Crypto and wire rules".
 
 /// Derives per-entry seal salts.
@@ -40,3 +40,7 @@ pub const IDENTITY_FINGERPRINT: &str = "tig identity fingerprint v1";
 pub const EPOCH_KEY_COMMITMENT: &str = "tig epoch key commitment v1";
 /// Prefix of the canonical encoding signed by an epoch grant's owner.
 pub const GRANT_SIGNATURE: &str = "tig epoch grant signature v1";
+/// Associated data for a sealed pack's encrypted index.
+pub const PACK_INDEX_AAD: &[u8] = b"tig pack index v1";
+/// Prefix of the canonical encoding signed by a keyring head.
+pub const KEYRING_HEAD_SIGNATURE: &str = "tig keyring head signature v1";
