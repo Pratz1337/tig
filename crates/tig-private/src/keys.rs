@@ -19,13 +19,6 @@ use tig_core::seal::{SealSalt, SealedId};
 use tig_core::{EntryKind, ObjectId, ObjectKind, RepoPath};
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
-/// Label for the key that wraps epoch keys to members.
-const WRAP_KEY: &str = "tig wrap key v1";
-/// Associated-data prefixes, so a ciphertext of one kind can never be
-/// accepted as another.
-const WRAP_AAD: &[u8] = b"tig wrapped epoch key v1";
-const OBJECT_AAD: &[u8] = b"tig sealed object v1";
-
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
     #[error("could not decrypt: wrong key, or the data was tampered with")]
@@ -161,10 +154,16 @@ impl EpochKey {
     /// (derived from the object ID under a separate subkey), so the same
     /// object encrypts identically within a group and epoch (dedup) and
     /// differently everywhere else.
+    ///
+    /// Caller invariant: `id` must equal `hash_object(kind, body)`, and this
+    /// epoch key must belong to exactly one group and epoch. Neither is
+    /// checked here. Reusing an ID for different bodies reuses a keystream;
+    /// reusing this key across contexts also reuses the Poly1305 key even
+    /// though the associated data differs. This is not misuse-resistant SIV.
     pub fn encrypt_object(&self, group: &GroupEpoch, kind: ObjectKind, id: &ObjectId, body: &[u8]) -> Vec<u8> {
         let cipher = XChaCha20Poly1305::new(&self.subkey(domain::CONTENT_KEY).into());
         let nonce = self.object_nonce(kind, id);
-        let aad = group.aad(OBJECT_AAD, &object_aad(kind, id));
+        let aad = group.aad(domain::OBJECT_AAD, &object_aad(kind, id));
         cipher
             .encrypt(XNonce::from_slice(&nonce), Payload { msg: body, aad: &aad })
             // XChaCha20-Poly1305 encryption only fails for messages > 256 GiB.
@@ -180,7 +179,7 @@ impl EpochKey {
     ) -> Result<Vec<u8>, KeyError> {
         let cipher = XChaCha20Poly1305::new(&self.subkey(domain::CONTENT_KEY).into());
         let nonce = self.object_nonce(kind, id);
-        let aad = group.aad(OBJECT_AAD, &object_aad(kind, id));
+        let aad = group.aad(domain::OBJECT_AAD, &object_aad(kind, id));
         cipher
             .decrypt(XNonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &aad })
             .map_err(|_| KeyError::Decrypt)
@@ -217,11 +216,13 @@ fn wrap_cipher(shared: &[u8; 32], ephemeral: &[u8; 32], recipient: &PublicKey) -
     material.extend_from_slice(shared);
     material.extend_from_slice(ephemeral);
     material.extend_from_slice(&recipient.0);
-    XChaCha20Poly1305::new(&blake3::derive_key(WRAP_KEY, &material).into())
+    XChaCha20Poly1305::new(&blake3::derive_key(domain::WRAP_KEY, &material).into())
 }
 
 /// Encrypts `key` so only `recipient` can open it, for `group`. A fresh
 /// ephemeral key and random nonce are used every time.
+/// This authenticates the ciphertext's context, not its sender: anyone with
+/// the recipient's public key can wrap a key of their own choosing.
 pub fn wrap(key: &EpochKey, group: &GroupEpoch, recipient: &PublicKey) -> Result<WrappedKey, KeyError> {
     let ephemeral_secret = StaticSecret::from(random32()?);
     let ephemeral = XPublic::from(&ephemeral_secret).to_bytes();
@@ -231,7 +232,7 @@ pub fn wrap(key: &EpochKey, group: &GroupEpoch, recipient: &PublicKey) -> Result
     }
     let mut nonce = [0u8; 24];
     getrandom::getrandom(&mut nonce).map_err(|e| KeyError::Random(e.to_string()))?;
-    let aad = group.aad(WRAP_AAD, &recipient.0);
+    let aad = group.aad(domain::WRAP_AAD, &recipient.0);
     let ciphertext = wrap_cipher(shared.as_bytes(), &ephemeral, recipient)
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: &key.0, aad: &aad })
         .map_err(|_| KeyError::Decrypt)?;
@@ -245,7 +246,7 @@ pub fn unwrap(wrapped: &WrappedKey, group: &GroupEpoch, identity: &Identity) -> 
     if !shared.was_contributory() {
         return Err(KeyError::WeakKey);
     }
-    let aad = group.aad(WRAP_AAD, &recipient.0);
+    let aad = group.aad(domain::WRAP_AAD, &recipient.0);
     let plain = wrap_cipher(shared.as_bytes(), &wrapped.ephemeral, &recipient)
         .decrypt(XNonce::from_slice(&wrapped.nonce), Payload { msg: &wrapped.ciphertext, aad: &aad })
         .map_err(|_| KeyError::Decrypt)?;

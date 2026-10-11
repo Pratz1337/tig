@@ -26,3 +26,10 @@ pub const CONTENT_KEY: &str = "tig content key v1";
 pub const NONCE_KEY: &str = "tig nonce key v1";
 /// Keys the IDs of private objects in fetch/push negotiation.
 pub const WIRE_ID_KEY: &str = "tig wire id key v1";
+
+/// Derives the key that wraps epoch keys to members.
+pub const WRAP_KEY: &str = "tig wrap key v1";
+/// Associated data for wrapped epoch keys.
+pub const WRAP_AAD: &[u8] = b"tig wrapped epoch key v1";
+/// Associated data for objects in sealed packs.
+pub const OBJECT_AAD: &[u8] = b"tig sealed object v1";

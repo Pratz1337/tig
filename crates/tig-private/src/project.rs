@@ -60,11 +60,14 @@ pub struct Projection {
 pub fn rules_of(store: &dyn Store, root: &ObjectId) -> Result<Rules, ProjectError> {
     let path = RepoPath::new(RULES_FILE)?;
     match lookup(store, root, &path)? {
-        Some(leaf) if leaf.is_file_like() => {
+        Some(leaf) if matches!(leaf.kind(), EntryKind::File | EntryKind::Executable) => {
             let bytes = store.get_blob(&leaf.id())?;
-            Ok(Rules::parse(&String::from_utf8_lossy(&bytes))?)
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| tig_core::Error::Invalid(".private is invalid: expected UTF-8".into()))?;
+            Ok(Rules::parse(text)?)
         }
-        _ => Ok(Rules::empty()),
+        None => Ok(Rules::empty()),
+        Some(_) => Err(tig_core::Error::Invalid(".private is invalid: expected a regular file".into()).into()),
     }
 }
 
