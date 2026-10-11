@@ -181,6 +181,7 @@ impl WorkingCopy {
     pub fn open(start: &Path, settings: Settings) -> Result<(Repo, WorkingCopy)> {
         let start_dir = starting_dir(start)?;
         let (root, tig_dir) = find_tig(&start_dir)?;
+        ensure_metadata_dirs(&tig_dir)?;
         let name = workspace_name_for(&tig_dir, &root)?;
         let store = Arc::new(DiskStore::open(tig_dir.join("store"))?);
         let op_head = Arc::new(FileOpHead::new(&tig_dir));
@@ -227,6 +228,8 @@ impl WorkingCopy {
     /// against the old revision would drop that move, so this returns an
     /// error telling you to run `tig workspace update-stale`.
     pub fn snapshot(&mut self, repo: &mut Repo) -> Result<SnapshotStats> {
+        ensure_canonical_directory(&self.root)?;
+        ensure_metadata_dirs(&self.tig_dir)?;
         repo.reload()?;
         let current = repo.working_revision(&self.name)?;
         let rev_tree = repo.revision(&current)?.tree;
@@ -271,10 +274,12 @@ impl WorkingCopy {
 
     /// Makes the disk match the repo's current working revision.
     ///
-    /// Refuses the whole checkout, with no files written, when a target path
-    /// is unsafe on this volume or a file about to be replaced has changed
-    /// since the stat cache was written.
+    /// Refuses before writing when preflight finds an unsafe path or a file
+    /// that differs from its snapshot. Re-checks each affected path before
+    /// mutation; a concurrent edit or I/O failure can stop a partial checkout.
     pub fn checkout(&mut self, repo: &Repo) -> Result<CheckoutStats> {
+        ensure_canonical_directory(&self.root)?;
+        ensure_metadata_dirs(&self.tig_dir)?;
         if !self.trusted {
             return Err(Error::Msg(
                 "workspace state is unusable (missing or corrupt); snapshot the working copy so tig can re-scan before checkout"
@@ -286,8 +291,13 @@ impl WorkingCopy {
         let diff = diff_trees(repo.store().as_ref(), &self.state.tree, &new_tree)?;
         let final_paths = final_tree_paths(&self.state.cache, &diff);
         preflight(self.root(), &final_paths, &diff)?;
+        let deleted: BTreeSet<&RepoPath> = diff
+            .iter()
+            .filter(|change| change.new.is_none())
+            .map(|change| &change.path)
+            .collect();
         for change in &diff {
-            ensure_clean(&self.root, &self.state.cache, change)?;
+            ensure_clean(&self.root, &self.state.cache, change, &deleted)?;
         }
 
         let mut stats = CheckoutStats {
@@ -299,16 +309,27 @@ impl WorkingCopy {
 
         let (deletes, writes) = split_diff(&diff);
         for change in &deletes {
+            ensure_ancestors_safe(&self.root, &change.path, &BTreeSet::new())?;
+            ensure_clean(&self.root, &self.state.cache, change, &BTreeSet::new())?;
             let disk = disk_path(&self.root, &change.path);
             remove_leaf(&disk)?;
             cache.remove(&change.path);
             removed_dirs.extend(ancestor_dirs(&change.path));
             stats.removed += 1;
         }
+        remove_empty_dirs(&self.root, &removed_dirs);
         for change in &writes {
             let leaf = change.new.expect("writes have a new leaf");
             // Sealed and directory leaves are rejected in preflight.
             let bytes = repo.store().get_blob(&leaf.id())?;
+            ensure_ancestors_safe(&self.root, &change.path, &BTreeSet::new())?;
+            ensure_clean(&self.root, &self.state.cache, change, &BTreeSet::new())?;
+            let dest = disk_path(&self.root, &change.path);
+            if symlink_metadata_kind(&dest)? == Some(Shape::Dir) {
+                // Preflight allowed only an empty directory. remove_dir
+                // refuses if an untracked file appeared since that check.
+                fs::remove_dir(&dest)?;
+            }
             let stand_in = write_leaf(&self.root, &change.path, leaf, &bytes)?;
             let disk = disk_path(&self.root, &change.path);
             let meta = fs::symlink_metadata(&disk)?;
@@ -350,6 +371,13 @@ impl WorkingCopy {
         parent: ObjectId,
     ) -> Result<WorkingCopy> {
         validate_workspace_name(name)?;
+        ensure_metadata_dirs(&main.tig_dir)?;
+        let workspace_dir = main.tig_dir.join("workspaces").join(name);
+        if symlink_metadata_kind(&workspace_dir)?.is_some() {
+            return Err(Error::Msg(format!(
+                "workspace metadata for {name:?} already exists"
+            )));
+        }
         let path = canonicalize_creating(path)?;
         let pointer = path.join(".tig");
         if symlink_metadata_kind(&pointer)?.is_some() {
@@ -392,7 +420,8 @@ impl WorkingCopy {
 
     fn save_state(&self) -> Result<()> {
         let dir = self.tig_dir.join("workspaces").join(&self.name);
-        fs::create_dir_all(&dir)?;
+        ensure_metadata_dirs(&self.tig_dir)?;
+        ensure_real_directory(&dir)?;
         atomic_write(&dir.join("state"), &encode_state(&self.state), true)?;
         Ok(())
     }
@@ -664,6 +693,9 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
     for _ in 0..n {
         let path = RepoPath::from_os_relative(r.str().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        if path.is_root() {
+            return Err("cache row names the workspace root".into());
+        }
         let size = r.varint().map_err(|e| e.to_string())?;
         let secs = r.ivarint().map_err(|e| e.to_string())?;
         let nanos = r.varint().map_err(|e| e.to_string())?;
@@ -675,6 +707,9 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         let flags = r.u8().map_err(|e| e.to_string())?;
         if flags & !(FLAG_RACY | FLAG_STAND_IN) != 0 {
             return Err(format!("unknown state flags {flags}"));
+        }
+        if flags & FLAG_STAND_IN != 0 && kind != EntryKind::Symlink {
+            return Err("stand-in flag on a non-symlink row".into());
         }
         rows.push((
             path,
@@ -786,7 +821,7 @@ fn preflight(root: &Path, paths: &BTreeSet<RepoPath>, diff: &[DiffEntry]) -> Res
     }
     #[cfg(windows)]
     {
-        for path in paths {
+        for path in paths.iter().chain(diff.iter().map(|change| &change.path)) {
             if let Some(why) = path_name_block(path) {
                 return Err(Error::Msg(format!(
                     "refusing to check out {path}: {why}"
@@ -813,6 +848,8 @@ fn preflight(root: &Path, paths: &BTreeSet<RepoPath>, diff: &[DiffEntry]) -> Res
     for change in diff {
         if change.new.is_some() {
             ensure_ancestors_safe(root, &change.path, &deleted)?;
+        } else {
+            ensure_ancestors_safe(root, &change.path, &BTreeSet::new())?;
         }
     }
     Ok(())
@@ -839,7 +876,11 @@ fn path_name_block(path: &RepoPath) -> Option<&'static str> {
 
 /// `Some(reason)` when `name` must not be created on Windows.
 fn windows_name_block(name: &str) -> Option<&'static str> {
-    if is_windows_device(name) {
+    if name.contains(['<', '>', '"', '|', '?', '*']) {
+        Some("invalid Windows filename character")
+    } else if name.encode_utf16().count() > 255 {
+        Some("Windows filename exceeds 255 UTF-16 units")
+    } else if is_windows_device(name) {
         Some("Windows device name")
     } else if is_tig_short_name(name) {
         Some("NTFS 8.3 alias of .tig")
@@ -964,6 +1005,7 @@ fn ensure_ancestors_safe(
     rel: &RepoPath,
     deleted: &BTreeSet<&RepoPath>,
 ) -> Result<()> {
+    ensure_canonical_directory(root)?;
     let mut cur = root.to_path_buf();
     let mut at = RepoPath::root();
     let parts: Vec<&str> = rel.components().collect();
@@ -982,7 +1024,7 @@ fn ensure_ancestors_safe(
                     )));
                 }
             }
-            Ok(meta) if meta.is_dir() => {}
+            Ok(meta) if meta.is_dir() => ensure_not_metadata_alias(&cur)?,
             Ok(_) => {
                 if !deleted.contains(&at) {
                     return Err(Error::Msg(format!(
@@ -999,13 +1041,15 @@ fn ensure_ancestors_safe(
     Ok(())
 }
 
-/// Compares the file checkout is about to overwrite or delete with the stat
-/// cache. A racy row is hashed. Content that already equals the blob we
+/// Compares the file checkout is about to overwrite or delete with the tree
+/// snapshot. Every affected file is hashed: restored mtimes cannot prove its
+/// contents are safe to destroy. Content that already equals the blob we
 /// would write is allowed, so a checkout that stopped halfway can be retried.
 fn ensure_clean(
     root: &Path,
     cache: &PathIndex<FileState>,
     change: &DiffEntry,
+    deleted: &BTreeSet<&RepoPath>,
 ) -> Result<()> {
     let disk = disk_path(root, &change.path);
     let meta = match fs::symlink_metadata(&disk) {
@@ -1023,12 +1067,15 @@ fn ensure_clean(
         }
         Err(e) => return Err(e.into()),
     };
-    if let Some(row) = cache.get(&change.path) {
-        if fast_match(row, &meta) {
+    let shape = shape_of(&meta);
+    if shape != Shape::Symlink {
+        ensure_not_metadata_alias(&disk)?;
+    }
+    if shape == Shape::Dir && change.old.is_none() && change.new.is_some() {
+        if directory_is_removed(root, &change.path, deleted)? {
             return Ok(());
         }
     }
-    let shape = shape_of(&meta);
     if matches!(shape, Shape::Dir | Shape::Other) {
         return Err(dirty(
             &change.path,
@@ -1037,8 +1084,9 @@ fn ensure_clean(
     }
     let bytes = read_shape(&disk, shape)?;
     let id = hash_object(ObjectKind::Blob, &bytes);
-    if let Some(row) = cache.get(&change.path) {
-        if row.id == id && kind_compatible(row, shape) {
+    if let Some(leaf) = change.old {
+        let (kind, _) = desired_kind(&meta, shape, cache.get(&change.path));
+        if leaf.id() == id && leaf.kind() == kind && leaf_matches_shape(leaf, shape) {
             return Ok(());
         }
     }
@@ -1047,65 +1095,45 @@ fn ensure_clean(
             return Ok(());
         }
     }
-    if change.new.is_none() {
-        if let Some(leaf) = change.old {
-            if leaf.id() == id && leaf_matches_shape(leaf, shape) {
-                return Ok(());
-            }
-        }
-    }
     Err(dirty(
         &change.path,
         "changed on disk since the last snapshot",
     ))
 }
 
-fn dirty(path: &RepoPath, why: &str) -> Error {
-    Error::Msg(format!("refusing to check out {path}: it {why}"))
-}
-
-fn fast_match(row: &FileState, meta: &fs::Metadata) -> bool {
-    if row.racy || row.size != meta.len() {
-        return false;
-    }
-    let Some(mtime) = mtime_parts(meta) else {
-        return false;
-    };
-    if row.mtime != mtime {
-        return false;
-    }
-    let shape = shape_of(meta);
-    shape_agrees(row, shape) && kind_compatible(row, shape) && exec_bit_agrees(row, meta)
-}
-
-fn kind_compatible(row: &FileState, shape: Shape) -> bool {
-    match shape {
-        Shape::Symlink => row.kind == EntryKind::Symlink && !row.symlink_stand_in,
-        Shape::File => {
-            if row.symlink_stand_in {
-                row.kind == EntryKind::Symlink
-            } else {
-                matches!(row.kind, EntryKind::File | EntryKind::Executable)
+/// Every leaf in a directory replacement must be a scheduled deletion.
+/// Extra empty subdirectories are also preserved rather than removed.
+fn directory_is_removed(
+    root: &Path,
+    rel: &RepoPath,
+    deleted: &BTreeSet<&RepoPath>,
+) -> Result<bool> {
+    let mut pending = vec![rel.clone()];
+    while let Some(dir) = pending.pop() {
+        let mut empty = true;
+        for ent in fs::read_dir(disk_path(root, &dir))? {
+            empty = false;
+            let ent = ent?;
+            let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
+                return Ok(false);
+            };
+            let child = dir.join(&name)?;
+            let meta = fs::symlink_metadata(ent.path())?;
+            if meta.is_dir() && !is_link_or_reparse(&meta) {
+                pending.push(child);
+            } else if !deleted.contains(&child) {
+                return Ok(false);
             }
         }
-        Shape::Dir | Shape::Other => false,
+        if empty && dir != *rel {
+            return Ok(false);
+        }
     }
+    Ok(true)
 }
 
-fn exec_bit_agrees(row: &FileState, meta: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        if row.symlink_stand_in || row.kind == EntryKind::Symlink {
-            return true;
-        }
-        let exec = unix_executable(meta);
-        return (row.kind == EntryKind::Executable) == exec;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (row, meta);
-        true
-    }
+fn dirty(path: &RepoPath, why: &str) -> Error {
+    Error::Msg(format!("refusing to check out {path}: it {why}"))
 }
 
 fn leaf_matches_shape(leaf: Leaf, shape: Shape) -> bool {
@@ -1250,15 +1278,12 @@ fn read_symlink_bytes(path: &Path) -> io::Result<Vec<u8>> {
 fn write_leaf(root: &Path, rel: &RepoPath, leaf: Leaf, bytes: &[u8]) -> Result<bool> {
     prepare_parent(root, rel)?;
     let dest = disk_path(root, rel);
-    // Re-check immediately before the write. Preflight already looked, and
-    // a symlink planted in between must not receive the file.
+    // Reduce the race window by re-checking just before writing. Path-based
+    // std APIs cannot make this check and the following mutation atomic.
     ensure_ancestors_real(root, rel)?;
     match leaf.kind() {
         EntryKind::Symlink => write_symlink(&dest, bytes),
         EntryKind::File | EntryKind::Executable => {
-            if symlink_metadata_kind(&dest)?.is_some() {
-                remove_leaf(&dest)?;
-            }
             atomic_write(&dest, bytes, false)?;
             #[cfg(unix)]
             set_unix_mode(&dest, leaf.kind() == EntryKind::Executable)?;
@@ -1342,7 +1367,7 @@ fn prepare_parent(root: &Path, rel: &RepoPath) -> Result<()> {
                     cur.display()
                 )));
             }
-            Ok(meta) if meta.is_dir() => {}
+            Ok(meta) if meta.is_dir() => ensure_not_metadata_alias(&cur)?,
             Ok(_) => {
                 return Err(Error::Msg(format!(
                     "refusing to check out {rel}: {} is not a directory",
@@ -1373,7 +1398,7 @@ fn ensure_ancestors_real(root: &Path, rel: &RepoPath) -> Result<()> {
                     cur.display()
                 )));
             }
-            Ok(meta) if meta.is_dir() => {}
+            Ok(meta) if meta.is_dir() => ensure_not_metadata_alias(&cur)?,
             Ok(_) => {
                 return Err(Error::Msg(format!(
                     "refusing to check out {rel}: {} is not a directory",
@@ -1404,6 +1429,13 @@ fn remove_leaf(path: &Path) -> io::Result<()> {
             path.display()
         )));
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if meta.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
     fs::remove_file(path)
 }
 
@@ -1414,6 +1446,9 @@ fn remove_empty_dirs(root: &Path, dirs: &[RepoPath]) {
     dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
     for dir in dirs {
         if dir.is_root() {
+            continue;
+        }
+        if ensure_ancestors_safe(root, &dir, &BTreeSet::new()).is_err() {
             continue;
         }
         let path = disk_path(root, &dir);
@@ -1490,7 +1525,10 @@ fn walk_worktree(root: &Path) -> ignore::Walk {
 
 fn is_scratch_name(name: &OsStr) -> bool {
     name.to_str()
-        .is_some_and(|text| text.starts_with(".tig-tmp-"))
+        .and_then(|text| text.strip_prefix(".tig-tmp-"))
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 struct RemoveOnDrop(PathBuf);
@@ -1538,16 +1576,10 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
 
 fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
     if let Err(e) = fs::rename(from, to) {
-        // A just-closed temp can fail the first rename on Windows, and some
-        // paths refuse to replace an existing file. Retry a few times, and
-        // if the destination is a regular file, remove it and rename again.
+        // A just-closed temp can fail the first rename on Windows. Retry,
+        // but never unlink the destination: failure must preserve its bytes.
         let mut last = e;
         for attempt in 0..4 {
-            if let Ok(meta) = fs::symlink_metadata(to) {
-                if !meta.is_dir() || is_link_or_reparse(&meta) {
-                    let _ = fs::remove_file(to);
-                }
-            }
             match fs::rename(from, to) {
                 Ok(()) => return Ok(()),
                 Err(e) => last = e,
@@ -1592,11 +1624,22 @@ fn find_tig(start_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     loop {
         let candidate = dir.join(".tig");
         match fs::symlink_metadata(&candidate) {
-            Ok(meta) if is_link_or_reparse(&meta) => {}
+            Ok(meta) if is_link_or_reparse(&meta) => {
+                return Err(Error::Msg(format!(
+                    "refusing linked metadata {}",
+                    candidate.display()
+                )));
+            }
             Ok(meta) if meta.is_dir() => return Ok((dir, candidate)),
             Ok(meta) if meta.is_file() => {
                 let text = fs::read_to_string(&candidate)?;
                 let target = PathBuf::from(text.trim());
+                if !target.is_absolute() {
+                    return Err(Error::Msg(format!(
+                        "{} must point at an absolute tig directory",
+                        candidate.display()
+                    )));
+                }
                 let tig = fs::canonicalize(&target).map_err(|e| {
                     Error::Msg(format!(
                         "{} points at {}, which cannot be opened: {e}",
@@ -1641,6 +1684,7 @@ fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
+        ensure_real_directory(&ent.path())?;
         let root_file = ent.path().join("root");
         let Ok(text) = fs::read_to_string(&root_file) else {
             continue;
@@ -1656,6 +1700,7 @@ fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
                     ent.path().display()
                 ))
             })?;
+            validate_workspace_name(&name)?;
             if found.replace(name).is_some() {
                 return Err(Error::Msg(format!(
                     "several workspaces claim {}",
@@ -1675,27 +1720,73 @@ fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
 
 fn write_root_file(tig_dir: &Path, name: &str, workspace_root: &Path) -> Result<()> {
     let dir = tig_dir.join("workspaces").join(name);
-    fs::create_dir_all(&dir)?;
+    ensure_real_directory(tig_dir)?;
+    ensure_real_directory(&tig_dir.join("workspaces"))?;
+    if symlink_metadata_kind(&dir)?.is_none() {
+        fs::create_dir(&dir)?;
+    }
+    ensure_real_directory(&dir)?;
     let body = format!("{}\n", workspace_root.display());
     atomic_write(&dir.join("root"), body.as_bytes(), true)?;
     Ok(())
 }
 
 fn validate_workspace_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\\', ':', '\0'])
-        || name.chars().any(|c| c.is_control())
-    {
-        return Err(Error::Msg(format!("invalid workspace name {name:?}")));
-    }
+    tig_core::object::validate_name(name)?;
     if let Some(why) = windows_name_block(name) {
         return Err(Error::Msg(format!(
             "invalid workspace name {name:?}: {why}"
         )));
     }
     Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || is_link_or_reparse(&meta) {
+        return Err(Error::Msg(format!(
+            "{} is not a real directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_canonical_directory(path: &Path) -> Result<()> {
+    ensure_real_directory(path)?;
+    if fs::canonicalize(path)? != path {
+        return Err(Error::Msg(format!(
+            "refusing redirected directory {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Numeric and hashed 8.3 names can both resolve to repository metadata.
+fn ensure_not_metadata_alias(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let resolved = fs::canonicalize(path)?;
+        if resolved.file_name().and_then(OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case(".tig"))
+        {
+            return Err(Error::Msg(format!(
+                "refusing metadata alias {}",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
+fn ensure_metadata_dirs(tig_dir: &Path) -> Result<()> {
+    ensure_canonical_directory(tig_dir)?;
+    ensure_real_directory(&tig_dir.join("workspaces"))?;
+    ensure_real_directory(&tig_dir.join("store"))?;
+    ensure_real_directory(&tig_dir.join("store").join("tmp"))
 }
 
 fn mtime_parts(meta: &fs::Metadata) -> Option<(i64, u32)> {
@@ -1737,7 +1828,7 @@ fn system_time_from_parts(mtime: (i64, u32)) -> Option<SystemTime> {
     if mtime.0 >= 0 {
         UNIX_EPOCH.checked_add(Duration::new(mtime.0 as u64, mtime.1))
     } else if mtime.1 == 0 {
-        UNIX_EPOCH.checked_sub(Duration::new((-mtime.0) as u64, 0))
+        UNIX_EPOCH.checked_sub(Duration::new(mtime.0.checked_neg()? as u64, 0))
     } else {
         let secs = mtime.0.checked_neg()?.checked_sub(1)?;
         UNIX_EPOCH.checked_sub(Duration::new(secs as u64, 1_000_000_000 - mtime.1))
@@ -1859,5 +1950,82 @@ mod tests {
     fn corrupt_state_is_rejected() {
         assert!(decode_state(b"nope").is_err());
         assert!(decode_state(b"TIGW\x02").is_err());
+    }
+
+    #[test]
+    fn failed_rename_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state");
+        fs::write(&dest, b"previous state").unwrap();
+        assert!(rename_replacing(&dir.path().join("missing"), &dest).is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"previous state");
+    }
+
+    #[test]
+    fn extreme_state_timestamp_does_not_panic() {
+        assert!(system_time_from_parts((i64::MIN, 0)).is_none());
+    }
+
+    #[test]
+    #[ignore = "Decision required: the state format has no integrity checksum"]
+    fn syntactically_valid_state_corruption_is_rejected() {
+        let mut cache = PathIndex::new();
+        cache.insert(
+            rp("work.txt"),
+            FileState {
+                size: 5,
+                mtime: (1_700_000_000, 0),
+                kind: EntryKind::File,
+                id: ObjectId([7; 32]),
+                racy: true,
+                symlink_stand_in: false,
+            },
+        );
+        let state = WcState {
+            working: ObjectId([1; 32]),
+            tree: ObjectId([2; 32]),
+            cache,
+        };
+        let mut bytes = encode_state(&state);
+        // A single flipped racy bit is still a valid encoding.
+        *bytes.last_mut().unwrap() ^= FLAG_RACY;
+        assert!(decode_state(&bytes).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preflight_blocks_unsafe_deleted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".tig")).unwrap();
+        let diff = vec![DiffEntry {
+            path: rp("TIG~1/file"),
+            old: Some(Leaf::file(ObjectId([7; 32]))),
+            new: None,
+        }];
+        assert!(preflight(&fs::canonicalize(dir.path()).unwrap(), &BTreeSet::new(), &diff).is_err());
+    }
+
+    #[test]
+    fn state_rejects_root_rows_and_invalid_stand_ins() {
+        for (path, stand_in) in [(RepoPath::root(), false), (rp("work.txt"), true)] {
+            let mut cache = PathIndex::new();
+            cache.insert(
+                path,
+                FileState {
+                    size: 5,
+                    mtime: (0, 0),
+                    kind: EntryKind::File,
+                    id: ObjectId([7; 32]),
+                    racy: true,
+                    symlink_stand_in: stand_in,
+                },
+            );
+            let state = WcState {
+                working: ObjectId([1; 32]),
+                tree: ObjectId([2; 32]),
+                cache,
+            };
+            assert!(decode_state(&encode_state(&state)).is_err());
+        }
     }
 }
