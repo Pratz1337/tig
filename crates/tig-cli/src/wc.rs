@@ -381,10 +381,7 @@ impl WorkingCopy {
         let path = canonicalize_creating(path)?;
         let pointer = path.join(".tig");
         if symlink_metadata_kind(&pointer)?.is_some() {
-            return Err(Error::Msg(format!(
-                "{} already exists",
-                pointer.display()
-            )));
+            return Err(Error::Msg(format!("{} already exists", pointer.display())));
         }
         // Creates the workspace and an empty change on `parent` in one operation.
         let created = Workspace::create(repo, name, parent)?;
@@ -444,17 +441,13 @@ impl WorkingCopy {
         let mut seen: BTreeSet<RepoPath> = BTreeSet::new();
 
         for ent in walk_worktree(&self.root) {
-            let ent = ent.map_err(|e| {
-                Error::Msg(format!("walking {}: {e}", self.root.display()))
-            })?;
+            let ent =
+                ent.map_err(|e| Error::Msg(format!("walking {}: {e}", self.root.display())))?;
             if ent.depth() == 0 {
                 continue;
             }
             if let Some(err) = ent.error() {
-                warnings.push(format!(
-                    "ignore rules near {}: {err}",
-                    ent.path().display()
-                ));
+                warnings.push(format!("ignore rules near {}: {err}", ent.path().display()));
             }
             let rel = match ent.path().strip_prefix(&self.root) {
                 Ok(rel) => rel,
@@ -472,10 +465,7 @@ impl WorkingCopy {
             } else if ent.file_type().is_some_and(|t| t.is_dir()) {
                 continue;
             } else if !ent.file_type().is_some_and(|t| t.is_file()) {
-                warnings.push(format!(
-                    "skipping special file {}",
-                    ent.path().display()
-                ));
+                warnings.push(format!("skipping special file {}", ent.path().display()));
                 continue;
             }
 
@@ -507,15 +497,12 @@ impl WorkingCopy {
                 continue;
             }
 
-            let meta = ent.metadata().map_err(|e| {
-                Error::Msg(format!("stat {}: {e}", ent.path().display()))
-            })?;
+            let meta = ent
+                .metadata()
+                .map_err(|e| Error::Msg(format!("stat {}: {e}", ent.path().display())))?;
             let shape = shape_of(&meta);
             if matches!(shape, Shape::Dir | Shape::Other) {
-                warnings.push(format!(
-                    "skipping special file {}",
-                    ent.path().display()
-                ));
+                warnings.push(format!("skipping special file {}", ent.path().display()));
                 continue;
             }
             let size = meta.len();
@@ -538,11 +525,7 @@ impl WorkingCopy {
                     let (kind, stand_in) = desired_kind(&meta, shape, Some(prev));
                     let mut row = prev.clone();
                     if kind != row.kind || stand_in != row.symlink_stand_in {
-                        ws.set(
-                            repo,
-                            repo_path.clone(),
-                            Some(leaf_of(kind, row.id)?),
-                        )?;
+                        ws.set(repo, repo_path.clone(), Some(leaf_of(kind, row.id)?))?;
                         row.kind = kind;
                         row.symlink_stand_in = stand_in;
                     }
@@ -823,9 +806,7 @@ fn preflight(root: &Path, paths: &BTreeSet<RepoPath>, diff: &[DiffEntry]) -> Res
     {
         for path in paths.iter().chain(diff.iter().map(|change| &change.path)) {
             if let Some(why) = path_name_block(path) {
-                return Err(Error::Msg(format!(
-                    "refusing to check out {path}: {why}"
-                )));
+                return Err(Error::Msg(format!("refusing to check out {path}: {why}")));
             }
         }
     }
@@ -901,8 +882,10 @@ fn is_windows_device(name: &str) -> bool {
         return false;
     }
     let folded = fold_device(stem);
-    matches!(folded.as_str(), "con" | "prn" | "aux" | "nul" | "conin$" | "conout$")
-        || is_com_or_lpt(&folded)
+    matches!(
+        folded.as_str(),
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$"
+    ) || is_com_or_lpt(&folded)
 }
 
 fn is_com_or_lpt(folded: &str) -> bool {
@@ -1000,11 +983,7 @@ fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
 /// An ancestor that is a symlink or reparse point would make a later create
 /// write outside the workspace. An ancestor we are about to delete is fine:
 /// the delete runs first, and the write creates a real directory.
-fn ensure_ancestors_safe(
-    root: &Path,
-    rel: &RepoPath,
-    deleted: &BTreeSet<&RepoPath>,
-) -> Result<()> {
+fn ensure_ancestors_safe(root: &Path, rel: &RepoPath, deleted: &BTreeSet<&RepoPath>) -> Result<()> {
     ensure_canonical_directory(root)?;
     let mut cur = root.to_path_buf();
     let mut at = RepoPath::root();
@@ -1325,12 +1304,8 @@ fn os_symlink(bytes: &[u8], dest: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn os_symlink(bytes: &[u8], dest: &Path) -> io::Result<()> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "symlink target is not utf-8",
-        )
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "symlink target is not utf-8"))?;
     std::os::windows::fs::symlink_file(text, dest)
 }
 
@@ -1528,9 +1503,7 @@ fn walk_worktree(root: &Path) -> ignore::Walk {
 fn is_scratch_name(name: &OsStr) -> bool {
     name.to_str()
         .and_then(|text| text.strip_prefix(".tig-tmp-"))
-        .is_some_and(|suffix| {
-            suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-        })
+        .is_some_and(|suffix| suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 struct RemoveOnDrop(PathBuf);
@@ -1545,9 +1518,9 @@ impl Drop for RemoveOnDrop {
 /// and renaming it over `dest`. `sync` fsyncs first; working-tree files skip
 /// that (one fsync per file would dominate checkout).
 fn atomic_write(dest: &Path, bytes: &[u8], sync: bool) -> io::Result<()> {
-    let parent = dest.parent().ok_or_else(|| {
-        io::Error::other(format!("{} has no parent directory", dest.display()))
-    })?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::other(format!("{} has no parent directory", dest.display())))?;
     let (tmp, mut file) = create_temp(parent)?;
     let guard = RemoveOnDrop(tmp.clone());
     file.write_all(bytes)?;
@@ -1607,15 +1580,15 @@ fn canonicalize_creating(path: &Path) -> Result<PathBuf> {
 }
 
 fn starting_dir(start: &Path) -> Result<PathBuf> {
-    let meta = fs::symlink_metadata(start).map_err(|e| {
-        Error::Msg(format!("cannot open {}: {e}", start.display()))
-    })?;
+    let meta = fs::symlink_metadata(start)
+        .map_err(|e| Error::Msg(format!("cannot open {}: {e}", start.display())))?;
     let dir = if meta.is_dir() && !is_link_or_reparse(&meta) {
         start.to_path_buf()
     } else {
-        start.parent().map(Path::to_path_buf).ok_or_else(|| {
-            Error::Msg(format!("{} has no parent directory", start.display()))
-        })?
+        start
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| Error::Msg(format!("{} has no parent directory", start.display())))?
     };
     Ok(fs::canonicalize(&dir)?)
 }
@@ -1677,9 +1650,8 @@ fn workspace_name_for(tig_dir: &Path, root: &Path) -> Result<String> {
     let ws_dir = tig_dir.join("workspaces");
     let root = fs::canonicalize(root)?;
     let mut found: Option<String> = None;
-    let entries = fs::read_dir(&ws_dir).map_err(|e| {
-        Error::Msg(format!("cannot read {}: {e}", ws_dir.display()))
-    })?;
+    let entries = fs::read_dir(&ws_dir)
+        .map_err(|e| Error::Msg(format!("cannot read {}: {e}", ws_dir.display())))?;
     for ent in entries {
         let ent = ent?;
         let file_type = ent.file_type()?;
@@ -1770,7 +1742,9 @@ fn ensure_not_metadata_alias(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let resolved = fs::canonicalize(path)?;
-        if resolved.file_name().and_then(OsStr::to_str)
+        if resolved
+            .file_name()
+            .and_then(OsStr::to_str)
             .is_some_and(|name| name.eq_ignore_ascii_case(".tig"))
         {
             return Err(Error::Msg(format!(
@@ -1814,10 +1788,7 @@ fn system_time_parts(t: SystemTime) -> Option<(i64, u32)> {
             if nanos == 0 {
                 Some((-secs, 0))
             } else {
-                Some((
-                    secs.checked_neg()?.checked_sub(1)?,
-                    1_000_000_000 - nanos,
-                ))
+                Some((secs.checked_neg()?.checked_sub(1)?, 1_000_000_000 - nanos))
             }
         }
     }
@@ -1868,7 +1839,15 @@ mod tests {
         ] {
             assert!(is_windows_device(name), "{name} should be reserved");
         }
-        for name in [".env", "commit", "combo", "COM0", "COM10", "auxillary", "readme"] {
+        for name in [
+            ".env",
+            "commit",
+            "combo",
+            "COM0",
+            "COM10",
+            "auxillary",
+            "readme",
+        ] {
             assert!(!is_windows_device(name), "{name} should be allowed");
         }
     }
@@ -2004,7 +1983,12 @@ mod tests {
             old: Some(Leaf::file(ObjectId([7; 32]))),
             new: None,
         }];
-        assert!(preflight(&fs::canonicalize(dir.path()).unwrap(), &BTreeSet::new(), &diff).is_err());
+        assert!(preflight(
+            &fs::canonicalize(dir.path()).unwrap(),
+            &BTreeSet::new(),
+            &diff
+        )
+        .is_err());
     }
 
     #[test]
