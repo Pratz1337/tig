@@ -385,7 +385,6 @@ fn rewrite_rejects_parentless_revisions() {
 }
 
 #[test]
-#[ignore = "decision: validating rewrite roots reloads trees on the snapshot hot path"]
 fn rewrite_rejects_non_tree_roots() {
     let r = repo();
     let old = r.working_revision("default").unwrap();
@@ -393,11 +392,65 @@ fn rewrite_rejects_non_tree_roots() {
     for invalid_tree in [blob, ObjectId([9; 32])] {
         let mut tx = r.start("invalid tree");
         let saved = tx.view().clone();
-        assert!(tx
+        let err = tx
             .rewrite(old, |revision| revision.tree = invalid_tree)
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(err, tig_core::Error::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("existing tree object"));
         assert_eq!(*tx.view(), saved);
     }
+}
+
+#[test]
+fn rewrite_checks_kind_only_when_tree_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tig_core::{ObjectKind, Store};
+
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        kind_calls: AtomicUsize,
+    }
+
+    impl Store for CountingStore {
+        fn get_raw(&self, id: &ObjectId) -> tig_core::Result<Option<(ObjectKind, Vec<u8>)>> {
+            self.inner.get_raw(id)
+        }
+
+        fn kind(&self, id: &ObjectId) -> tig_core::Result<Option<ObjectKind>> {
+            self.kind_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.kind(id)
+        }
+
+        fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> tig_core::Result<()> {
+            self.inner.put_raw(id, kind, body)
+        }
+
+        fn has(&self, id: &ObjectId) -> tig_core::Result<bool> {
+            self.inner.has(id)
+        }
+    }
+
+    let store = Arc::new(CountingStore::default());
+    let r = Repo::init(
+        store.clone(),
+        Arc::new(MemoryOpHead::new()),
+        Settings::default(),
+    )
+    .unwrap();
+    let old = r.working_revision("default").unwrap();
+    let mut tx = r.start("kind checks");
+    assert_eq!(tx.rewrite(old, |_| {}).unwrap(), old);
+    let described = tx.rewrite(old, |rev| rev.description = "description".into()).unwrap();
+    assert_eq!(store.kind_calls.load(Ordering::Relaxed), 0);
+
+    let edits = [(p("file"), Some(Leaf::file(store.put_blob(b"file").unwrap())))]
+        .into_iter()
+        .collect();
+    let tree = apply_edits(&*store, &empty_tree_id(), &edits).unwrap();
+    let rewritten = tx.rewrite(described, |rev| rev.tree = tree).unwrap();
+    assert_eq!(store.get_revision(&rewritten).unwrap().tree, tree);
+    assert_eq!(store.kind_calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]

@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 use crate::id::{ChangeId, ObjectId};
 use crate::merge::{ancestors, merge_revisions, merge_trees, MergeOutcome};
-use crate::object::{Object, Operation, Revision, Signature, View};
+use crate::object::{Object, ObjectKind, Operation, Revision, Signature, View};
 use crate::ophead::OpHeadStore;
 use crate::store::{empty_tree_id, Store, StoreExt};
 
@@ -483,6 +483,9 @@ impl Transaction {
         rev.change_id = before.change_id;
         if rev.tree == before.tree && rev.parents == before.parents && rev.description == before.description {
             return Ok(old);
+        }
+        if rev.tree != before.tree && self.store.kind(&rev.tree)? != Some(ObjectKind::Tree) {
+            return Err(Error::Invalid(format!("revision tree {} must refer to an existing tree object", rev.tree)));
         }
         if rev.parents.is_empty() {
             return Err(Error::Invalid("only the root revision may have no parents".into()));

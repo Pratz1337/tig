@@ -18,6 +18,13 @@ use crate::object::{hash_object, Object, ObjectKind, Operation, Revision, Tree, 
 /// what was put.
 pub trait Store: Send + Sync {
     fn get_raw(&self, id: &ObjectId) -> Result<Option<(ObjectKind, Vec<u8>)>>;
+    /// A fast type check, not an integrity check: this need not verify the
+    /// body hash. Use `get_raw` to read and verify the body. The default reads
+    /// the whole object; backends can look up just its kind.
+    fn kind(&self, id: &ObjectId) -> Result<Option<ObjectKind>> {
+        Ok(self.get_raw(id)?.map(|(kind, _)| kind))
+    }
+
     fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> Result<()>;
     fn has(&self, id: &ObjectId) -> Result<bool>;
 }

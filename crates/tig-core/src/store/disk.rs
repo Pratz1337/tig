@@ -11,7 +11,7 @@
 //! place, so readers never see a half-written object.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -80,6 +80,27 @@ impl DiskStore {
 }
 
 impl Store for DiskStore {
+    fn kind(&self, id: &ObjectId) -> Result<Option<ObjectKind>> {
+        let mut file = match File::open(self.object_path(id)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut header = [0u8; 5];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(corrupt(*id, "truncated object header"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if header[..4] != MAGIC {
+            return Err(corrupt(*id, "bad magic"));
+        }
+        let kind = ObjectKind::from_u8(header[4]).map_err(|e| corrupt(*id, e.to_string()))?;
+        Ok(Some(kind))
+    }
+
     fn get_raw(&self, id: &ObjectId) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         let data = match fs::read(self.object_path(id)) {
             Ok(data) => data,
@@ -254,6 +275,64 @@ mod tests {
         assert!(bytes.len() >= HEADER_LEN);
         assert_eq!(&bytes[..4], &MAGIC);
         bytes[5]
+    }
+
+    #[test]
+    fn kind_present_and_missing() {
+        let (_dir, store) = open_tmp();
+        for kind in [
+            ObjectKind::Blob,
+            ObjectKind::Tree,
+            ObjectKind::Revision,
+            ObjectKind::Operation,
+            ObjectKind::View,
+        ] {
+            let id = hash_object(kind, b"body");
+            store.put_raw(&id, kind, b"body").unwrap();
+            assert_eq!(store.kind(&id).unwrap(), Some(kind));
+        }
+        assert_eq!(store.kind(&ObjectId([9; 32])).unwrap(), None);
+    }
+
+    #[test]
+    fn kind_rejects_corrupt_headers() {
+        let (_dir, store) = open_tmp();
+        let id = store.put_blob(b"hello").unwrap();
+        let path = store.object_path(&id);
+        let header = [b'T', b'I', b'G', b'1', ObjectKind::Blob as u8];
+        for len in 0..header.len() {
+            fs::write(&path, &header[..len]).unwrap();
+            assert!(matches!(store.kind(&id), Err(Error::Corrupt { id: bad, .. }) if bad == id));
+        }
+        let mut bad_magic = header;
+        bad_magic[0] = b'X';
+        fs::write(&path, bad_magic).unwrap();
+        assert!(matches!(store.kind(&id), Err(Error::Corrupt { id: bad, .. }) if bad == id));
+        for invalid_kind in [0, 6, 255] {
+            let mut bad_kind = header;
+            bad_kind[4] = invalid_kind;
+            fs::write(&path, bad_kind).unwrap();
+            assert!(matches!(store.kind(&id), Err(Error::Corrupt { id: bad, .. }) if bad == id));
+        }
+    }
+
+    #[test]
+    fn kind_does_not_read_or_verify_body() {
+        let (_dir, store) = open_tmp();
+        for body in [b"hello".to_vec(), vec![b'a'; 1024]] {
+            let id = store.put_blob(&body).unwrap();
+            let path = store.object_path(&id);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.truncate(HEADER_LEN);
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(store.kind(&id).unwrap(), Some(ObjectKind::Blob));
+            assert!(matches!(store.get_raw(&id), Err(Error::Corrupt { .. })));
+            // Even the encoding flag is outside the magic-and-kind prefix.
+            bytes.truncate(5);
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(store.kind(&id).unwrap(), Some(ObjectKind::Blob));
+            assert!(matches!(store.get_raw(&id), Err(Error::Corrupt { .. })));
+        }
     }
 
     #[test]

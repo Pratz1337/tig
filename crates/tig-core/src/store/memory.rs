@@ -31,6 +31,10 @@ impl Store for MemoryStore {
         Ok(self.objects.read().expect("lock poisoned").get(id).cloned())
     }
 
+    fn kind(&self, id: &ObjectId) -> Result<Option<ObjectKind>> {
+        Ok(self.objects.read().expect("lock poisoned").get(id).map(|(kind, _)| *kind))
+    }
+
     fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> Result<()> {
         self.objects
             .write()
@@ -49,6 +53,23 @@ impl Store for MemoryStore {
 mod tests {
     use super::*;
     use crate::store::StoreExt;
+
+    #[test]
+    fn kind_present_and_missing() {
+        let s = MemoryStore::new();
+        for kind in [
+            ObjectKind::Blob,
+            ObjectKind::Tree,
+            ObjectKind::Revision,
+            ObjectKind::Operation,
+            ObjectKind::View,
+        ] {
+            let id = crate::object::hash_object(kind, b"body");
+            s.put_raw(&id, kind, b"body").unwrap();
+            assert_eq!(s.kind(&id).unwrap(), Some(kind));
+        }
+        assert_eq!(s.kind(&ObjectId([9; 32])).unwrap(), None);
+    }
 
     #[test]
     fn put_get_blob() {
