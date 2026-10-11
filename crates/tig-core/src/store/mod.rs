@@ -1,6 +1,7 @@
 //! Object stores. A store maps `ObjectId` to `(kind, body)`. It never interprets
 //! bodies; typed helpers live on `StoreExt`.
 
+mod disk;
 mod memory;
 
 pub use memory::MemoryStore;
