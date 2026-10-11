@@ -454,3 +454,25 @@ fn assert_kind(repo: &tig_core::repo::Repo, rel: &str, kind: EntryKind) {
         .1;
     assert_eq!(leaf.kind(), kind);
 }
+
+/// A workspace or repo nested inside another must never be swept into it.
+#[test]
+fn nested_workspaces_and_repos_are_not_scanned() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("main.txt"), b"m").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    let parent = repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+    let inner = dir.path().join("inner");
+    let _side = WorkingCopy::add_workspace(&mut repo, &wc, "inner", &inner, parent).unwrap();
+    fs::write(inner.join("only-inner.txt"), b"i").unwrap();
+    let other = dir.path().join("other");
+    fs::create_dir(&other).unwrap();
+    WorkingCopy::init(&other, settings()).unwrap();
+    fs::write(other.join("only-other.txt"), b"o").unwrap();
+
+    wc.snapshot(&mut repo).unwrap();
+    assert!(tracked(&repo, "main.txt").is_some());
+    for nested in ["inner/only-inner.txt", "inner/main.txt", "other/only-other.txt", "other/.private"] {
+        assert!(tracked(&repo, nested).is_none(), "{nested} leaked into the outer repo");
+    }
+}

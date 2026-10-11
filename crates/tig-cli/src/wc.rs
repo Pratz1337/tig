@@ -1563,7 +1563,16 @@ fn walk_worktree(root: &Path) -> ignore::Walk {
         .add_custom_ignore_filename(".tigignore")
         .filter_entry(|ent| {
             let name = ent.file_name();
-            name != OsStr::new(".tig") && !is_scratch_name(name)
+            if name == OsStr::new(".tig") || is_scratch_name(name) {
+                return false;
+            }
+            // A subdirectory with its own `.tig` is another workspace or a
+            // nested repo: never sweep it into this one (git skips nested
+            // repos the same way). One stat per directory, not per file.
+            let nested = ent.depth() > 0
+                && ent.file_type().is_some_and(|t| t.is_dir())
+                && fs::symlink_metadata(ent.path().join(".tig")).is_ok();
+            !nested
         })
         .build()
 }
