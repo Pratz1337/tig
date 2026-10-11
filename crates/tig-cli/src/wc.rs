@@ -1071,10 +1071,12 @@ fn ensure_clean(
     if shape != Shape::Symlink {
         ensure_not_metadata_alias(&disk)?;
     }
-    if shape == Shape::Dir && change.old.is_none() && change.new.is_some() {
-        if directory_is_removed(root, &change.path, deleted)? {
-            return Ok(());
-        }
+    if shape == Shape::Dir
+        && change.old.is_none()
+        && change.new.is_some()
+        && directory_is_removed(root, &change.path, deleted)?
+    {
+        return Ok(());
     }
     if matches!(shape, Shape::Dir | Shape::Other) {
         return Err(dirty(
