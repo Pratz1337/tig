@@ -240,3 +240,93 @@ fn unicode_wildcards_document_the_git_compatibility_decision() {
         assert!(!private(text, "é.key"));
     }
 }
+
+#[test]
+fn escaped_separators_and_class_boundaries_follow_git() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    let paths = [
+        "a/b",
+        "a/x/b",
+        "a/x/y/b",
+        "b",
+        "x/b",
+        "a/b/x",
+        "a.key",
+        "b.key",
+        "c.key",
+        "-.key",
+        "].key",
+        "[.key",
+        "&.key",
+        "~.key",
+        "a/secret",
+        "a/x/secret",
+    ];
+    for pattern in [
+        r"a\/**/b",
+        r"a\/**\/**/b",
+        r"**\/**/b",
+        r"a/**\/**/b",
+        r"a/**/b\/",
+        r"a\/**/",
+        r"a\/**",
+        r"[a-b-c].key",
+        r"[a\-c-e].key",
+        r"[!\]a].key",
+        r"[[]\.key",
+        r"[&&~].key",
+        r"[\^-a].key",
+        r"**\/**/secret",
+    ] {
+        let rules = Rules::parse(pattern).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), format!("{pattern}\n")).unwrap();
+        let mut child = Command::new("git")
+            .args([
+                "-c",
+                "core.ignoreCase=false",
+                "-c",
+                "core.excludesFile=",
+                "check-ignore",
+                "--no-index",
+                "-v",
+                "-z",
+                "--stdin",
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(paths.join("\0").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 1)));
+        let records: Vec<_> = output.stdout.split(|&byte| byte == 0).collect();
+        let matched: Vec<_> = records
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|record| std::str::from_utf8(record[3]).unwrap())
+            .collect();
+        for path in paths {
+            assert_eq!(
+                rules.is_private(&RepoPath::new(path).unwrap()),
+                matched.contains(&path),
+                "{pattern:?} at {path:?}"
+            );
+        }
+    }
+}

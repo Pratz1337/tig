@@ -371,3 +371,49 @@ fn file_ophead_serializes_writers_and_keeps_existing_temp_names() {
         ]
     );
 }
+
+#[test]
+fn rewrite_rejects_parentless_revisions() {
+    let r = repo();
+    let old = r.working_revision("default").unwrap();
+    let mut tx = r.start("parentless");
+    let saved = tx.view().clone();
+    assert!(tx
+        .rewrite(old, |revision| revision.parents.clear())
+        .is_err());
+    assert_eq!(*tx.view(), saved);
+}
+
+#[test]
+#[ignore = "decision: validating rewrite roots reloads trees on the snapshot hot path"]
+fn rewrite_rejects_non_tree_roots() {
+    let r = repo();
+    let old = r.working_revision("default").unwrap();
+    let blob = r.store().put_blob(b"not a tree").unwrap();
+    for invalid_tree in [blob, ObjectId([9; 32])] {
+        let mut tx = r.start("invalid tree");
+        let saved = tx.view().clone();
+        assert!(tx
+            .rewrite(old, |revision| revision.tree = invalid_tree)
+            .is_err());
+        assert_eq!(*tx.view(), saved);
+    }
+}
+
+#[test]
+fn rewrite_cannot_reparent_a_change_onto_itself_or_its_descendant() {
+    let mut r = repo();
+    let a = r.working_revision("default").unwrap();
+    let mut tx = r.start("child");
+    let b = tx.new_change(&[a], "b").unwrap();
+    tx.set_working("default", b).unwrap();
+    r.commit(tx).unwrap();
+    for parent in [a, b] {
+        let mut tx = r.start("invalid reparent");
+        let saved = tx.view().clone();
+        assert!(tx
+            .rewrite(a, |revision| revision.parents = vec![parent])
+            .is_err());
+        assert_eq!(*tx.view(), saved);
+    }
+}

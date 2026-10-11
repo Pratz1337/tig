@@ -484,6 +484,16 @@ impl Transaction {
         if rev.tree == before.tree && rev.parents == before.parents && rev.description == before.description {
             return Ok(old);
         }
+        if rev.parents.is_empty() {
+            return Err(Error::Invalid("only the root revision may have no parents".into()));
+        }
+        if rev.parents != before.parents {
+            for parent in &rev.parents {
+                if ancestors(&*self.store, parent)?.contains(&old) {
+                    return Err(Error::Invalid("cannot reparent a change onto itself or its descendant".into()));
+                }
+            }
+        }
         rev.predecessors = vec![old];
         rev.committer = self.settings.signature();
         let new = self.write_revision(rev)?;
