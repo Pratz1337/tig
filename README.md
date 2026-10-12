@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 # tig
 
@@ -24,7 +24,7 @@ tig flips it: **public by default, private per path.**
 flowchart LR
     subgraph Repo["one tig repo"]
         A[src/] --- B[docs/]
-        C[".env 🔒"] --- D["packages/billing 🔒"]
+        C[".env (private)"] --- D["packages/billing (private)"]
     end
     Repo -->|tig publish| R[(remote)]
     R -->|clone, no access| O["outsider: src/ + docs/<br/>private paths left out"]
@@ -35,8 +35,8 @@ flowchart LR
 
 | | git | tig |
 |---|---|---|
-| Private files in a public repo | separate repo / git-crypt | a `.private` file, like `.gitignore` |
-| Staging + commits | manual, all the time | working copy **is** a change, snapshotted automatically |
+| Private files in a public repo | separate repo or git-crypt | a `.private` file, like `.gitignore` |
+| Staging and commits | manual, all the time | the working copy **is** a change, snapshotted automatically |
 | Undo | reflog archaeology | every operation is undoable (`tig undo`, `tig op`) |
 | Parallel checkouts | worktrees | workspaces: O(1) to create, same change in two places |
 | Needs a real filesystem | yes | no, library first; the filesystem is just one client |
@@ -47,17 +47,17 @@ flowchart LR
 cargo build --release -p tig-cli
 
 tig init
-echo ".env" >> .private      # this path is now private
+echo ".env" >> .private       # this path is now private
 tig status                    # snapshots your edits, no `add` needed
 tig describe -m "first change"
 tig new                       # start the next change
-tig undo                      # changed your mind? undo anything
+tig undo                      # changed your mind? undo it
 ```
 
 Coming from git:
 
 ```sh
-tig import-git path/to/git-repo   # full history, flags anything that looks private
+tig import-git <path-to-git-repo>   # full history, flags anything that looks private
 ```
 
 ## How privacy works
@@ -83,7 +83,7 @@ sequenceDiagram
 - Per-reader key wrapping with **X25519** (like `age`), owner signatures with **Ed25519**
 - Signed publish manifest, so a server can't hide or swap packs
 
-**What outsiders can still see:** the `.private` file itself, change descriptions, author fields and bookmark names. Don't write secrets there. `tig publish` warns you if you do.
+**What outsiders can still see:** the `.private` file itself, change descriptions, author fields and bookmark names. Don't put secrets there; `tig publish` warns you if a private path shows up in them.
 
 ## Architecture
 
@@ -94,7 +94,7 @@ flowchart TB
     PRIV --> CORE["tig-core<br/>objects, store, changes, merge, op log, workspaces"]
 ```
 
-About 27k lines of Rust, MIT OR Apache-2.0. See [`DESIGN.md`](DESIGN.md) for the full contract.
+About 27k lines of Rust. See [`DESIGN.md`](DESIGN.md) for the full design contract.
 
 ## Speed
 
@@ -107,7 +107,7 @@ Synthetic trees on Linux, median wall time, git on default settings:
 | status, 1 file edited | 1,687 ms | 1,234 ms | 0.73x |
 | record change | 1,630 ms | 1,081 ms | 0.66x |
 
-Methodology, Windows numbers and caveats are in [`bench/RESULTS.md`](bench/RESULTS.md). Tuned-git and jj comparisons are next.
+Methodology, Windows numbers and caveats are in [`bench/RESULTS.md`](bench/RESULTS.md). Comparisons against tuned git and jj are next.
 
 ## Status
 
@@ -115,10 +115,10 @@ Methodology, Windows numbers and caveats are in [`bench/RESULTS.md`](bench/RESUL
 |---|---|
 | core engine, changes, undo, workspaces | export back to git |
 | `.private` simple mode | Discord-style roles end to end |
-| publish / fetch with crash recovery | GitHub integration |
+| publish and fetch with crash recovery | GitHub integration |
 | git import with full history | security audit |
 
-⚠️ **Alpha and unaudited.** Please try to break it. See [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md) and open an issue.
+**Alpha and unaudited.** Please try to break it. See [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md) and open an issue.
 
 ## License
 
