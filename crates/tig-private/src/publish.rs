@@ -25,12 +25,13 @@ use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{Leaf, MAX_TREE_DEPTH};
 use tig_core::{EntryKind, ObjectId, RepoPath};
 
+use crate::fetch::FetchState;
 use crate::keyring::{Keyring, KeyringError, OwnerKeys};
 use crate::keys::{EpochKey, Identity, KeyError, WireId};
 use crate::manifest::{pack_id, Manifest, ManifestError, PackEntry};
 use crate::pack::{PackBuilder, PackError};
 use crate::project::{project_tree, public_revision, Projection, SealedRoot, PRIVATE_GROUP};
-use crate::remote::{DirRemote, RemoteError};
+use crate::remote::{CommitOutcome, Remote, RemoteError};
 
 const VERSION: u8 = 4;
 const MAX_REVISIONS: usize = 1_000_000;
@@ -41,6 +42,9 @@ const MAX_GROUP: usize = 1024;
 const MAX_PATH: usize = 64 * 1024;
 const MAX_HISTORY: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
+const PUBLISH_ATTEMPTS: u32 = 8;
+const BATCH_OBJECTS: usize = 1000;
+const BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
@@ -77,6 +81,14 @@ pub enum PublishError {
         join_paths(paths)
     )]
     NegationNeedsConfirmation { paths: Vec<RepoPath> },
+    /// The remote bookmark is not an ancestor of this revision.
+    #[error(
+        "remote `{bookmark}` has changes you have not fetched; run `tig fetch`, merge, and publish again"
+    )]
+    NotFastForward { bookmark: String },
+    /// Eight head commits in a row lost the race.
+    #[error("the remote is busy; another publish landed on every attempt")]
+    Busy,
     #[error("{0}")]
     Invalid(String),
 }
@@ -102,6 +114,8 @@ pub struct PublishOptions {
     /// Publish these paths in the clear even though their bytes were sealed
     /// before (an explicit, per-path declassification).
     pub declassify: BTreeSet<RepoPath>,
+    /// Move the bookmark even when it is not a fast-forward.
+    pub force: bool,
 }
 
 /// Per-remote publish memory. The caller persists [`PublishState::encode`].
@@ -345,17 +359,22 @@ struct Session {
 /// owner's local key or, for a member, with
 /// [`crate::keyring::VerifiedKeyring::current_key`].
 ///
-/// On `Err`, `state` is unchanged and nothing new has been written. A failure
-/// after the remote accepted some objects (a crash, or a disk error) can
-/// leave content-addressed objects without moving the bookmark; publishing
-/// the same revision again finishes the job.
+/// On `Err`, `state` is unchanged and nothing has been uploaded: refusal
+/// checks and the fast-forward check run before the first `put_batch` or
+/// `put_pack`. A lost `commit_head` race can still leave content-addressed
+/// objects and a pack that no manifest names. The bookmark does not move
+/// until `commit_head` returns [`CommitOutcome::Committed`].
+///
+/// `fetched` is the other half of this remote's correspondence: an internal
+/// revision rebuilt by fetch is already published under that public id.
 #[allow(clippy::too_many_arguments)]
 pub fn publish(
     store: &dyn Store,
-    remote: &DirRemote,
+    remote: &dyn Remote,
     identity: &Identity,
     owner_keys: Option<&OwnerKeys>,
     state: &mut PublishState,
+    fetched: &FetchState,
     bookmark: &str,
     rev: ObjectId,
     options: &PublishOptions,
@@ -363,9 +382,168 @@ pub fn publish(
     if bookmark.is_empty() || bookmark.len() > MAX_BOOKMARK {
         return Err(PublishError::Invalid("invalid bookmark".into()));
     }
-    let session = open_session(remote, identity, owner_keys, state)?;
+    let mut prep: Option<Prep> = None;
+    for _ in 0..PUBLISH_ATTEMPTS {
+        let head = remote.read_head()?;
+        let session = open_session(
+            remote.remote_id(),
+            head.keyring.as_deref(),
+            identity,
+            owner_keys,
+            state,
+        )?;
+        let epoch = session.epoch_key.context().epoch;
+        let reuse = prep
+            .as_ref()
+            .is_some_and(|prep| prep.epoch == epoch && prep.counter == session.counter);
+        if !reuse {
+            prep = Some(project(store, remote.public_store(), &session, state, fetched, rev)?);
+        }
+        let previous = read_manifest(
+            remote.remote_id(),
+            head.manifest.as_deref(),
+            &session.keyring,
+            state.manifest_seq,
+        )?;
+        let mut refs = match &previous {
+            Some(manifest) => manifest.refs.clone(),
+            None => remote.read_legacy_refs()?.unwrap_or_default(),
+        };
+        let mut ever_public = state.ever_public.clone();
+        ever_public.extend(remote_public_paths(remote.public_store(), &refs)?);
+        let checked = check_refusals(
+            state,
+            &ever_public,
+            &prep.as_ref().expect("projection was just built").plans,
+            options,
+        )?;
+        let tip = public_parent(
+            &prep.as_ref().expect("projection was just built").public_ids,
+            rev,
+        )?;
+        ensure_fast_forward(
+            store,
+            rev,
+            bookmark,
+            refs.get(bookmark).copied(),
+            tip,
+            &local_of_public(state, fetched),
+            options.force,
+        )?;
+        {
+            let prep = prep.as_mut().expect("projection was just built");
+            if !prep.uploaded {
+                upload(remote, prep)?;
+                prep.uploaded = true;
+            }
+        }
+        let prep = prep.as_ref().expect("projection was just built");
+        refs.insert(bookmark.to_string(), tip);
+        let mut packs = previous.as_ref().map(|m| m.packs.clone()).unwrap_or_default();
+        if let Some((id, sealed)) = &prep.pack {
+            packs
+                .entry(*id)
+                .or_insert_with(|| PackEntry {
+                    group: prep.group.clone(),
+                    epoch,
+                    sealed: BTreeSet::new(),
+                })
+                .sealed
+                .extend(sealed);
+        }
+        let sequence = previous
+            .as_ref()
+            .map_or(0, |m| m.sequence)
+            .max(state.manifest_seq)
+            .checked_add(1)
+            .ok_or_else(|| PublishError::Invalid("manifest sequence overflow".into()))?;
+        let manifest =
+            Manifest::signed(remote.remote_id(), sequence, refs, packs, identity)?.encode()?;
+        let fresh = match &session.fresh {
+            Some(keyring) => Some(keyring.encode()?),
+            None => None,
+        };
+        match remote.commit_head(&head.version(), fresh.as_deref(), Some(&manifest))? {
+            CommitOutcome::Stale(current) => {
+                // The next attempt verifies this head (pin and counter floor).
+                // A changed counter restarts projection under the new epoch.
+                let _ = current;
+                continue;
+            }
+            CommitOutcome::Committed(_) => {
+                state.remote_id = remote.remote_id();
+                state.owner_signing = Some(session.pin);
+                state.counter = session.counter;
+                for plan in &prep.plans {
+                    let public_id = prep.public_ids[&plan.internal];
+                    state.revisions.insert(plan.internal, public_id);
+                }
+                ever_public.extend(checked.new_public);
+                state.ever_public = ever_public;
+                state.confirmed_negations.extend(checked.confirmed);
+                state.ever_private.extend(checked.new_private);
+                state.declassified.extend(checked.new_declassified);
+                state.manifest_seq = sequence;
+                if !prep.new_wires.is_empty() {
+                    state
+                        .sent
+                        .entry((prep.group.clone(), epoch))
+                        .or_default()
+                        .extend(prep.new_wires.iter().copied());
+                }
+                return Ok(PublishReport {
+                    revisions_published: prep.plans.len(),
+                    public_objects_written: prep.written,
+                    private_objects_sealed: prep.sealed_objects,
+                    sealed_roots: prep.sealed_roots,
+                    new_owner_keys: None,
+                    warnings: {
+                        let mut warnings = checked.warnings;
+                        warnings.extend(metadata_mentions(store, &prep.plans)?);
+                        let compatibility: BTreeSet<_> = prep
+                            .plans
+                            .iter()
+                            .flat_map(|plan| plan.projection.warnings.iter().cloned())
+                            .collect();
+                        warnings.extend(compatibility);
+                        warnings
+                    },
+                });
+            }
+        }
+    }
+    Err(PublishError::Busy)
+}
+
+struct Prep {
+    plans: Vec<Plan>,
+    public_ids: BTreeMap<ObjectId, ObjectId>,
+    pack: Option<([u8; 32], BTreeSet<SealedId>)>,
+    new_wires: BTreeSet<WireId>,
+    objects: Vec<(ObjectId, ObjectKind, Vec<u8>)>,
+    pack_bytes: Option<Vec<u8>>,
+    uploaded: bool,
+    written: usize,
+    sealed_objects: usize,
+    sealed_roots: usize,
+    epoch: u64,
+    counter: u64,
+    group: String,
+}
+
+/// Projects locally. The only remote use is `has` on the public store, so a
+/// later refusal has nothing to undo.
+fn project(
+    store: &dyn Store,
+    public: &dyn Store,
+    session: &Session,
+    state: &PublishState,
+    fetched: &FetchState,
+    rev: ObjectId,
+) -> Result<Prep, PublishError> {
+    let known = published_ids(state, fetched);
     let ancestors = parent_first(store, &[rev], |id| {
-        id == root_revision_id() || state.revisions.contains_key(&id)
+        id == root_revision_id() || known.contains_key(&id)
     })?;
     let mut plans = Vec::with_capacity(ancestors.len());
     for internal in ancestors {
@@ -377,32 +555,10 @@ pub fn publish(
             description: revision.description,
         });
     }
-    let previous = read_manifest(remote, &session.keyring, state.manifest_seq)?;
-    let mut refs = match &previous {
-        Some(manifest) => manifest.refs.clone(),
-        // Remotes from before manifests: the unsigned refs file.
-        None => remote.read_refs()?,
-    };
-    let mut ever_public = state.ever_public.clone();
-    ever_public.extend(remote_public_paths(remote, &refs)?);
-    let checked = check_refusals(state, &ever_public, &plans, options)?;
-
-    let mut written = 0usize;
-    if let Some(fresh) = &session.fresh {
-        remote.write_keyring(&fresh.encode()?)?;
-    }
-    write_canonical(
-        remote.public_store(),
-        &Object::Tree(Tree::empty()),
-        &mut written,
-    )?;
-    write_canonical(
-        remote.public_store(),
-        &Object::Revision(root_revision()),
-        &mut written,
-    )?;
-
-    let mut public_ids = state.revisions.clone();
+    let mut outbox = Outbox::new(public);
+    write_canonical(&mut outbox, &Object::Tree(Tree::empty()))?;
+    write_canonical(&mut outbox, &Object::Revision(root_revision()))?;
+    let mut public_ids = known;
     for plan in &plans {
         let revision = store.get_revision(&plan.internal)?;
         let mut parents = Vec::with_capacity(revision.parents.len());
@@ -410,80 +566,136 @@ pub fn publish(
             parents.push(public_parent(&public_ids, *parent)?);
         }
         let public_rev = public_revision(&revision, plan.projection.public_tree, parents);
-        write_public_tree(
-            store,
-            remote.public_store(),
-            &plan.projection.public_tree,
-            &mut written,
-        )?;
+        write_public_tree(store, &mut outbox, &plan.projection.public_tree)?;
         let obj = Object::Revision(public_rev);
         let public_id = obj.id();
-        write_canonical(remote.public_store(), &obj, &mut written)?;
+        write_canonical(&mut outbox, &obj)?;
         public_ids.insert(plan.internal, public_id);
     }
-
-    let (sealed_objects, sealed_roots, new_wires, pack) =
-        write_pack(store, remote, &session.epoch_key, state, &plans)?;
-
-    let tip = public_parent(&public_ids, rev)?;
-    refs.insert(bookmark.to_string(), tip);
-    remote.write_refs(&refs)?;
-
-    // Last: the signed manifest makes the refs and the new pack official.
-    let epoch = session.epoch_key.context().epoch;
-    let group = session.epoch_key.context().group.clone();
-    let mut packs = previous.as_ref().map(|m| m.packs.clone()).unwrap_or_default();
-    if let Some((id, sealed)) = pack {
-        packs
-            .entry(id)
-            .or_insert_with(|| PackEntry { group: group.clone(), epoch, sealed: BTreeSet::new() })
-            .sealed
-            .extend(sealed);
-    }
-    let sequence = previous
-        .as_ref()
-        .map_or(0, |m| m.sequence)
-        .max(state.manifest_seq)
-        .checked_add(1)
-        .ok_or_else(|| PublishError::Invalid("manifest sequence overflow".into()))?;
-    let manifest = Manifest::signed(remote.remote_id(), sequence, refs, packs, identity)?;
-    remote.write_manifest(&manifest.encode()?)?;
-
-    state.remote_id = remote.remote_id();
-    state.owner_signing = Some(session.pin);
-    state.counter = session.counter;
-    for plan in &plans {
-        let public_id = public_ids[&plan.internal];
-        state.revisions.insert(plan.internal, public_id);
-    }
-    ever_public.extend(checked.new_public);
-    state.ever_public = ever_public;
-    state.confirmed_negations.extend(checked.confirmed);
-    state.ever_private.extend(checked.new_private);
-    state.declassified.extend(checked.new_declassified);
-    state.manifest_seq = sequence;
-    if !new_wires.is_empty() {
-        state
-            .sent
-            .entry((group, epoch))
-            .or_default()
-            .extend(new_wires);
-    }
-    Ok(PublishReport {
-        revisions_published: plans.len(),
-        public_objects_written: written,
-        private_objects_sealed: sealed_objects,
+    let (sealed_objects, sealed_roots, new_wires, pack_bytes, pack) =
+        build_pack(store, &session.epoch_key, state, &plans)?;
+    Ok(Prep {
+        plans,
+        public_ids,
+        pack,
+        new_wires,
+        objects: outbox.pending,
+        pack_bytes,
+        uploaded: false,
+        written: 0,
+        sealed_objects,
         sealed_roots,
-        new_owner_keys: None,
-        warnings: {
-            let mut warnings = checked.warnings;
-            warnings.extend(metadata_mentions(store, &plans)?);
-            let compatibility: BTreeSet<_> = plans.iter()
-                .flat_map(|plan| plan.projection.warnings.iter().cloned()).collect();
-            warnings.extend(compatibility);
-            warnings
-        },
+        epoch: session.epoch_key.context().epoch,
+        counter: session.counter,
+        group: session.epoch_key.context().group.clone(),
     })
+}
+
+fn upload(remote: &dyn Remote, prep: &mut Prep) -> Result<(), PublishError> {
+    let mut written = 0usize;
+    let mut start = 0usize;
+    while start < prep.objects.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < prep.objects.len() && end - start < BATCH_OBJECTS && bytes <= BATCH_BYTES {
+            let next = prep.objects[end].2.len();
+            if end > start && bytes.saturating_add(next) > BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
+        let chunk = &prep.objects[start..end];
+        let ids: Vec<ObjectId> = chunk.iter().map(|(id, _, _)| *id).collect();
+        let missing: BTreeSet<ObjectId> = remote.missing(&ids)?.into_iter().collect();
+        let send: Vec<_> = chunk
+            .iter()
+            .filter(|(id, _, _)| missing.contains(id))
+            .cloned()
+            .collect();
+        written += send.len();
+        if !send.is_empty() {
+            remote.put_batch(&send)?;
+        }
+        start = end;
+    }
+    if let Some(bytes) = &prep.pack_bytes {
+        remote.put_pack(bytes)?;
+    }
+    prep.written = written;
+    Ok(())
+}
+
+fn published_ids(state: &PublishState, fetched: &FetchState) -> BTreeMap<ObjectId, ObjectId> {
+    let mut ids = state.revisions.clone();
+    for (public, internal) in &fetched.revisions {
+        ids.entry(*internal).or_insert(*public);
+    }
+    ids
+}
+
+fn local_of_public(state: &PublishState, fetched: &FetchState) -> BTreeMap<ObjectId, ObjectId> {
+    let mut map = fetched.revisions.clone();
+    for (internal, public) in &state.revisions {
+        map.insert(*public, *internal);
+    }
+    map
+}
+
+/// `ancestor` is reachable from `rev` through parents or predecessors.
+/// Predecessors count: editing a change writes a new revision whose parent
+/// is still the old base, and the previous snapshot is listed as a
+/// predecessor. A bookmark that already points at that snapshot is moving
+/// forward with the change.
+fn change_ancestor(store: &dyn Store, rev: ObjectId, ancestor: ObjectId) -> Result<bool, PublishError> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![rev];
+    while let Some(id) = stack.pop() {
+        if id == ancestor {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        let revision = store.get_revision(&id)?;
+        stack.extend(revision.parents.iter().copied());
+        stack.extend(revision.predecessors.iter().copied());
+        if seen.len() > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_fast_forward(
+    store: &dyn Store,
+    rev: ObjectId,
+    bookmark: &str,
+    old: Option<ObjectId>,
+    new_public: ObjectId,
+    local_of_public: &BTreeMap<ObjectId, ObjectId>,
+    force: bool,
+) -> Result<(), PublishError> {
+    let Some(old) = old else {
+        return Ok(());
+    };
+    if old == new_public || force {
+        return Ok(());
+    }
+    let Some(local) = local_of_public.get(&old).copied() else {
+        return Err(PublishError::NotFastForward {
+            bookmark: bookmark.to_string(),
+        });
+    };
+    if change_ancestor(store, rev, local)? {
+        Ok(())
+    } else {
+        Err(PublishError::NotFastForward {
+            bookmark: bookmark.to_string(),
+        })
+    }
 }
 
 /// The metadata exception (DESIGN.md "Privacy"): `.private` and change
@@ -515,14 +727,15 @@ fn metadata_mentions(store: &dyn Store, plans: &[Plan]) -> Result<Vec<String>, P
 /// The remote's manifest, verified against `keyring`. Missing is fine only
 /// for a state that has never seen one (a new or pre-manifest remote).
 fn read_manifest(
-    remote: &DirRemote,
+    remote_id: [u8; 16],
+    bytes: Option<&[u8]>,
     keyring: &Keyring,
     min_sequence: u64,
 ) -> Result<Option<Manifest>, PublishError> {
-    match remote.read_manifest()? {
+    match bytes {
         Some(bytes) => {
-            let manifest = Manifest::decode(&bytes)?;
-            manifest.verify(remote.remote_id(), keyring, min_sequence)?;
+            let manifest = Manifest::decode(bytes)?;
+            manifest.verify(remote_id, keyring, min_sequence)?;
             Ok(Some(manifest))
         }
         None if min_sequence > 0 => Err(PublishError::Invalid(
@@ -533,15 +746,15 @@ fn read_manifest(
 }
 
 fn open_session(
-    remote: &DirRemote,
+    remote_id: [u8; 16],
+    keyring_bytes: Option<&[u8]>,
     identity: &Identity,
     owner_keys: Option<&OwnerKeys>,
     state: &PublishState,
 ) -> Result<Session, PublishError> {
-    let remote_id = remote.remote_id();
     let saved_pin = saved_pin(state, remote_id)?;
-    match remote.read_keyring() {
-        Err(RemoteError::Invalid(message)) if message == "keyring is missing" => {
+    match keyring_bytes {
+        None => {
             if saved_pin.is_some() {
                 return Err(PublishError::Invalid(
                     "this publish state is already bound, but the remote has no keyring".into(),
@@ -573,9 +786,8 @@ fn open_session(
                 fresh: Some(keyring),
             })
         }
-        Err(error) => Err(error.into()),
-        Ok(bytes) => {
-            let keyring = Keyring::decode(&bytes)?;
+        Some(bytes) => {
+            let keyring = Keyring::decode(bytes)?;
             if keyring.remote != remote_id {
                 return Err(PublishError::Invalid(
                     "keyring is for a different remote".into(),
@@ -736,11 +948,10 @@ struct Checked {
 /// A different publisher or branch may have exposed a path before this
 /// caller's state existed. Include the remote's reachable public history.
 fn remote_public_paths(
-    remote: &DirRemote,
+    store: &dyn Store,
     refs: &BTreeMap<String, ObjectId>,
 ) -> Result<BTreeSet<RepoPath>, PublishError> {
     let tips: Vec<_> = refs.values().copied().collect();
-    let store = remote.public_store();
     let revisions = parent_first(store, &tips, |id| id == root_revision_id())?;
     let mut paths = BTreeSet::new();
     let mut entries = 0usize;
@@ -922,29 +1133,34 @@ fn public_parent(
         .ok_or_else(|| PublishError::Invalid(format!("parent {id} has not been published")))
 }
 
-fn write_canonical(
-    store: &dyn Store,
-    obj: &Object,
-    written: &mut usize,
-) -> Result<(), PublishError> {
-    let body = obj.encode_body();
-    let id = hash_object(obj.kind(), &body);
-    put_missing(store, &id, obj.kind(), &body, written)
+struct Outbox<'a> {
+    public: &'a dyn Store,
+    pending: Vec<(ObjectId, ObjectKind, Vec<u8>)>,
+    seen: BTreeSet<ObjectId>,
 }
 
-fn put_missing(
-    store: &dyn Store,
-    id: &ObjectId,
-    kind: ObjectKind,
-    body: &[u8],
-    written: &mut usize,
-) -> Result<(), PublishError> {
-    if store.has(id)? {
-        return Ok(());
+impl<'a> Outbox<'a> {
+    fn new(public: &'a dyn Store) -> Self {
+        Outbox {
+            public,
+            pending: Vec::new(),
+            seen: BTreeSet::new(),
+        }
     }
-    store.put_raw(id, kind, body)?;
-    *written += 1;
-    Ok(())
+
+    fn push(&mut self, id: ObjectId, kind: ObjectKind, body: Vec<u8>) -> Result<(), PublishError> {
+        if !self.seen.insert(id) {
+            return Ok(());
+        }
+        self.pending.push((id, kind, body));
+        Ok(())
+    }
+}
+
+fn write_canonical(out: &mut Outbox<'_>, obj: &Object) -> Result<(), PublishError> {
+    let body = obj.encode_body();
+    let id = hash_object(obj.kind(), &body);
+    out.push(id, obj.kind(), body)
 }
 
 /// Copies a public tree. A tree the remote already has is skipped, children
@@ -953,9 +1169,8 @@ fn put_missing(
 /// thread stack.
 fn write_public_tree(
     local: &dyn Store,
-    remote: &dyn Store,
+    remote: &mut Outbox<'_>,
     root: &ObjectId,
-    written: &mut usize,
 ) -> Result<(), PublishError> {
     // (id, depth, entered). Entered means the children are already queued
     // above this frame, so they are written before the parent.
@@ -970,10 +1185,10 @@ fn write_public_tree(
                     "public tree {id} is not a tree"
                 )));
             }
-            put_missing(remote, &id, ObjectKind::Tree, &body, written)?;
+            remote.push(id, ObjectKind::Tree, body)?;
             continue;
         }
-        if remote.has(&id)? || !seen.insert(id) {
+        if remote.public.has(&id)? || !seen.insert(id) {
             continue;
         }
         if depth > MAX_TREE_DEPTH {
@@ -1004,7 +1219,7 @@ fn write_public_tree(
                             "public file {blob_id} is not a blob"
                         )));
                     }
-                    put_missing(remote, &blob_id, ObjectKind::Blob, &blob, written)?;
+                    remote.push(blob_id, ObjectKind::Blob, blob)?;
                 }
                 EntryKind::Sealed => {}
                 EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in public tree".into())),
@@ -1028,13 +1243,12 @@ fn too_deep() -> PublishError {
     )))
 }
 
-fn write_pack(
+fn build_pack(
     store: &dyn Store,
-    remote: &DirRemote,
     key: &EpochKey,
     state: &PublishState,
     plans: &[Plan],
-) -> Result<WrittenPack, PublishError> {
+) -> Result<BuiltPack, PublishError> {
     let epoch = key.context().epoch;
     let already = state
         .sent
@@ -1063,16 +1277,28 @@ fn write_pack(
     }
     let sealed_objects = new_wires.len();
     if sealed_objects == 0 && sealed_roots == 0 {
-        return Ok((0, 0, new_wires, None));
+        return Ok((0, 0, new_wires, None, None));
     }
     let bytes = builder.finish()?;
-    remote.put_pack(&bytes)?;
-    Ok((sealed_objects, sealed_roots, new_wires, Some((pack_id(&bytes), sealed_ids))))
+    let id = pack_id(&bytes);
+    Ok((
+        sealed_objects,
+        sealed_roots,
+        new_wires,
+        Some(bytes),
+        Some((id, sealed_ids)),
+    ))
 }
 
-/// Sealed objects, sealed roots, new wire ids, and the pack written (its id
-/// and the sealed ids it carries records for).
-type WrittenPack = (usize, usize, BTreeSet<WireId>, Option<([u8; 32], BTreeSet<SealedId>)>);
+/// Sealed objects, sealed roots, new wire ids, pack bytes, and the pack id
+/// with the sealed ids its records name.
+type BuiltPack = (
+    usize,
+    usize,
+    BTreeSet<WireId>,
+    Option<Vec<u8>>,
+    Option<([u8; 32], BTreeSet<SealedId>)>,
+);
 
 fn seal_root(
     store: &dyn Store,

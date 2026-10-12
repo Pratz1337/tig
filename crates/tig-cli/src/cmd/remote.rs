@@ -21,6 +21,7 @@ pub(super) struct RemoteCfg {
 /// Owner material for grant and revoke. The identity stays with the caller.
 pub(super) struct OwnerBundle {
     pub remote: DirRemote,
+    #[allow(dead_code)]
     pub keyring: Keyring,
     pub keys: OwnerKeys,
     pub state: PublishState,
@@ -231,6 +232,7 @@ pub(super) fn save_owner_keys_new(dir: &Path, keys: &OwnerKeys) -> Result<bool> 
     super::disk::write_new(&dir.join("owner-keys"), &bytes, true)
 }
 
+#[cfg(test)]
 pub(super) fn save_owner_keys(dir: &Path, keys: &OwnerKeys) -> Result<()> {
     let bytes = keys.encode()?;
     super::disk::write_replace(&dir.join("owner-keys"), &bytes, true)
@@ -241,7 +243,7 @@ pub(super) fn load_owner(
     cfg: &RemoteCfg,
     identity: &tig_private::keys::Identity,
 ) -> Result<OwnerBundle> {
-    finish_keyring_update(cfg)?;
+    finish_keyring_update(cfg, identity)?;
     let remote = open_existing(&cfg.path)?;
     let keys = load_owner_keys(&cfg.dir)?.ok_or_else(|| {
         CliError::msg("no owner keys for this remote; only the owner can grant or revoke")
@@ -280,59 +282,18 @@ pub(super) fn load_owner(
     })
 }
 
-/// Save keys, then a local signed pending head and rollback floor, before
-/// exposing the new head remotely. A retry completes a pending write first.
-pub(super) fn commit_keyring(cfg: &RemoteCfg, bundle: &mut OwnerBundle) -> Result<()> {
-    save_owner_keys(&cfg.dir, &bundle.keys)?;
-    let bytes = bundle.keyring.encode()?;
-    super::disk::write_replace(&cfg.dir.join("pending-keyring"), &bytes, false)?;
-    bundle.state.counter = bundle.keyring.head.counter;
-    save_publish_state(&cfg.dir, &bundle.state)?;
-    bundle.remote.write_keyring(&bytes)?;
-    fs::remove_file(cfg.dir.join("pending-keyring"))?;
-    Ok(())
-}
-
 /// Completes an interrupted owner update using only locally saved, signed
 /// material. Never roll back a newer verified remote head.
-pub(super) fn finish_keyring_update(cfg: &RemoteCfg) -> Result<()> {
-    let path = cfg.dir.join("pending-keyring");
-    let Some(bytes) = read_optional(&path)? else {
+pub(super) fn finish_keyring_update(
+    cfg: &RemoteCfg,
+    owner: &tig_private::keys::Identity,
+) -> Result<()> {
+    if !cfg.dir.join("pending-keyring").try_exists()? {
         return Ok(());
-    };
-    let pending = Keyring::decode(&bytes)?;
-    let mut state = load_publish_state(&cfg.dir)?;
-    let pin = state
-        .owner_signing
-        .ok_or_else(|| CliError::msg("pending keyring has no owner pin"))?;
-    let verified = pending.verify(&pin, 0)?;
-    let keys = load_owner_keys(&cfg.dir)?
-        .ok_or_else(|| CliError::msg("pending keyring has no saved owner keys"))?;
-    if keys.remote != pending.remote {
-        return Err(CliError::msg(
-            "pending keyring keys are for a different remote",
-        ));
-    }
-    for (group, epoch) in &pending.head.epochs {
-        if !keys.keys.contains_key(&(group.clone(), *epoch)) {
-            return Err(CliError::msg("pending keyring epoch key is missing"));
-        }
     }
     let remote = open_existing(&cfg.path)?;
-    if remote.remote_id() != pending.remote {
-        return Err(CliError::msg("pending keyring is for a different remote"));
-    }
-    let current = Keyring::decode(&remote.read_keyring()?)?;
-    if current.remote != pending.remote {
-        return Err(CliError::msg("remote keyring is for a different remote"));
-    }
-    current.verify(&pin, 0)?;
-    if current.head.counter <= verified.counter() {
-        remote.write_keyring(&bytes)?;
-    }
-    state.counter = state.counter.max(current.head.counter);
-    save_publish_state(&cfg.dir, &state)?;
-    fs::remove_file(path)?;
+    let mut state = load_publish_state(&cfg.dir)?;
+    tig_private::access::finish_pending(&remote, &cfg.dir, owner, &mut state)?;
     Ok(())
 }
 
@@ -371,6 +332,18 @@ fn path_text(path: &Path) -> Result<String> {
     Ok(format!("{text}\n"))
 }
 
+#[cfg(test)]
+fn put_keyring(remote: &DirRemote, bytes: &[u8]) {
+    use tig_private::remote::CommitOutcome;
+    let head = remote.read_head().unwrap();
+    assert!(matches!(
+        remote
+            .commit_head(&head.version(), Some(bytes), None)
+            .unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+}
+
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -401,7 +374,7 @@ mod tests {
             let remote = DirRemote::create(&cfg.path, [41; 16]).unwrap();
             let (mut ring, mut keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
             ring.grant(&keys, &owner, &member.public()).unwrap();
-            remote.write_keyring(&ring.encode().unwrap()).unwrap();
+            put_keyring(&remote, &ring.encode().unwrap());
             let mut state = PublishState::new();
             state.remote_id = remote.remote_id();
             state.owner_signing = Some(owner.public().signing);
@@ -416,7 +389,7 @@ mod tests {
             )
             .unwrap();
             if remote_updated {
-                remote.write_keyring(&ring.encode().unwrap()).unwrap();
+                put_keyring(&remote, &ring.encode().unwrap());
             }
             // Crash before persisting the new counter. Pending local state is
             // already a rollback floor, even before a mutating command retries.
@@ -453,13 +426,13 @@ mod tests {
         ring.grant(&keys, &owner, &Identity::generate().unwrap().public())
             .unwrap();
         let newest = ring.encode().unwrap();
-        remote.write_keyring(&newest).unwrap();
+        put_keyring(&remote, &newest);
         let mut state = PublishState::new();
         state.remote_id = remote.remote_id();
         state.owner_signing = Some(owner.public().signing);
         state.counter = ring.head.counter;
         save_publish_state(&cfg.dir, &state).unwrap();
-        finish_keyring_update(&cfg).unwrap();
+        finish_keyring_update(&cfg, &owner).unwrap();
         assert_eq!(remote.read_keyring().unwrap(), newest);
         assert_eq!(
             load_fetch_state(&cfg.dir).unwrap().counter,

@@ -119,6 +119,12 @@ impl From<tig_private::keyring::KeyringError> for CliError {
     }
 }
 
+impl From<tig_private::access::AccessError> for CliError {
+    fn from(err: tig_private::access::AccessError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
 impl From<tig_private::remote::RemoteError> for CliError {
     fn from(err: tig_private::remote::RemoteError) -> Self {
         CliError::msg(err.to_string())
@@ -317,6 +323,7 @@ pub fn run() -> Result<()> {
             acknowledge_leaked,
             confirm_negations,
             declassify,
+            force,
         } => publish::run(
             repository,
             remote,
@@ -325,6 +332,7 @@ pub fn run() -> Result<()> {
             acknowledge_leaked,
             confirm_negations,
             declassify,
+            force,
         )?,
         Cmd::Fetch { remote } => fetch::run(repository, remote)?,
         Cmd::Clone { path, dir } => clone::run(repository, path, dir)?,
@@ -513,6 +521,9 @@ enum Cmd {
         /// before (repeatable)
         #[arg(long, value_name = "PATH")]
         declassify: Vec<String>,
+        /// Move the bookmark even when the remote has changes you have not fetched
+        #[arg(long)]
+        force: bool,
     },
     /// Fetch bookmarks from a remote
     Fetch {

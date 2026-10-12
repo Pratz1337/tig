@@ -31,7 +31,7 @@ fn signed_remote_conflict_entries_are_refused_without_advancing_fetch_state() {
     let (_dir, remote) = remote_at([97; 16]);
     let owner = Identity::generate().unwrap();
     let (keyring, _) = Keyring::create(remote.remote_id(), &owner).unwrap();
-    remote.write_keyring(&keyring.encode().unwrap()).unwrap();
+    put_keyring(&remote, &keyring.encode().unwrap());
     let store = remote.public_store();
     store.put(&tig_core::Object::Tree(tig_core::Tree::empty())).unwrap();
     store.put(&tig_core::Object::Revision(tig_core::repo::root_revision())).unwrap();
@@ -46,7 +46,7 @@ fn signed_remote_conflict_entries_are_refused_without_advancing_fetch_state() {
     sign_main(&remote, &owner, tip);
     let mut state = FetchState::new();
     let before = state.clone();
-    let error = fetch(&remote, &MemoryStore::new(), None, &mut state).unwrap_err();
+    let error = fetch(&remote, &MemoryStore::new(), None, &mut state, &PublishState::new()).unwrap_err();
     assert!(error.to_string().contains("unresolved conflict"), "{error}");
     assert_eq!(state, before);
 }
@@ -140,6 +140,7 @@ fn publish_at(
         identity,
         keys.or(prepared.as_ref()),
         state,
+        &FetchState::new(),
         "main",
         rev,
         options,
@@ -154,7 +155,7 @@ fn fetch_new(
     state: &mut FetchState,
 ) -> Result<(MemoryStore, FetchReport), FetchError> {
     let store = MemoryStore::new();
-    let report = fetch(remote, &store, identity, state)?;
+    let report = fetch(remote, &store, identity, state, &PublishState::new())?;
     Ok((store, report))
 }
 
@@ -238,23 +239,46 @@ fn under(path: &Path, name: &str) -> bool {
 }
 
 fn public_kind(remote: &DirRemote, path: &str) -> EntryKind {
-    let id = remote.read_refs().unwrap()["main"];
+    let id = Manifest::decode(&remote.read_manifest().unwrap().unwrap())
+        .unwrap()
+        .refs["main"];
     let tree = remote.public_store().get_revision(&id).unwrap().tree;
     kind_at(remote.public_store(), tree, path).unwrap()
 }
 
-/// Points `main` at `id` the way publish does: refs plus a signed manifest.
+/// Points `main` at `id` the way publish does: a signed manifest.
 fn sign_main(remote: &DirRemote, owner: &Identity, id: ObjectId) {
     let refs = BTreeMap::from([("main".to_string(), id)]);
-    remote.write_refs(&refs).unwrap();
     let manifest = Manifest::signed(remote.remote_id(), 1, refs, BTreeMap::new(), owner).unwrap();
-    remote.write_manifest(&manifest.encode().unwrap()).unwrap();
+    put_manifest(remote, &manifest.encode().unwrap());
 }
 
 fn grant(remote: &DirRemote, keys: &OwnerKeys, owner: &Identity, member: &Identity) {
     let mut keyring = Keyring::decode(&remote.read_keyring().unwrap()).unwrap();
     keyring.grant(keys, owner, &member.public()).unwrap();
-    remote.write_keyring(&keyring.encode().unwrap()).unwrap();
+    put_keyring(remote, &keyring.encode().unwrap());
+}
+
+fn put_keyring(remote: &DirRemote, bytes: &[u8]) {
+    use tig_private::remote::CommitOutcome;
+    let head = remote.read_head().unwrap();
+    assert!(matches!(
+        remote
+            .commit_head(&head.version(), Some(bytes), None)
+            .unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+}
+
+fn put_manifest(remote: &DirRemote, bytes: &[u8]) {
+    use tig_private::remote::CommitOutcome;
+    let head = remote.read_head().unwrap();
+    assert!(matches!(
+        remote
+            .commit_head(&head.version(), None, Some(bytes))
+            .unwrap(),
+        CommitOutcome::Committed(_)
+    ));
 }
 
 #[test]
@@ -330,7 +354,7 @@ fn alice_publishes_secrets_bob_reads_them_carol_does_not() {
     assert_eq!(bob_report.unsealed, 2);
     assert_eq!(bob_report.still_sealed, 0);
 
-    let again_report = fetch(&remote, &bob_store, Some(&bob), &mut bob_state).unwrap();
+    let again_report = fetch(&remote, &bob_store, Some(&bob), &mut bob_state, &PublishState::new()).unwrap();
     assert_eq!(again_report.newly_pinned, None);
     assert_eq!(
         bob_store.get_revision(&tip(&again_report)).unwrap().tree,
@@ -423,15 +447,15 @@ fn later_grant_opens_already_fetched_revisions() {
     .unwrap();
     let store = MemoryStore::new();
     let mut state = FetchState::new();
-    let first = fetch(&remote, &store, Some(&bob), &mut state).unwrap();
+    let first = fetch(&remote, &store, Some(&bob), &mut state, &PublishState::new()).unwrap();
     let first_tree = store.get_revision(&tip(&first)).unwrap().tree;
     assert_eq!(kind_at(&store, first_tree, ".env"), Some(EntryKind::Sealed));
     grant(&remote, &keys, &alice, &bob);
-    let opened = fetch(&remote, &store, Some(&bob), &mut state).unwrap();
+    let opened = fetch(&remote, &store, Some(&bob), &mut state, &PublishState::new()).unwrap();
     let tree = store.get_revision(&tip(&opened)).unwrap().tree;
     assert_eq!(file_at(&store, tree, ".env"), ENV);
     assert_eq!(opened.unsealed, 1);
-    let again = fetch(&remote, &store, None, &mut state).unwrap();
+    let again = fetch(&remote, &store, None, &mut state, &PublishState::new()).unwrap();
     assert_eq!(tip(&again), tip(&opened));
     assert_eq!(again.unsealed, 0);
 }
@@ -650,12 +674,13 @@ fn unconfirmed_negation_writes_nothing_until_confirmed() {
     let keys = report.new_owner_keys.unwrap();
     assert!(state.confirmed_negations.contains(&p(".env")));
     assert_eq!(public_kind(&remote, ".env"), EntryKind::File);
+    let published = Manifest::decode(&remote.read_manifest().unwrap().unwrap()).unwrap();
     assert_eq!(
         file_at(
             remote.public_store(),
             remote
                 .public_store()
-                .get_revision(&remote.read_refs().unwrap()["main"])
+                .get_revision(&published.refs["main"])
                 .unwrap()
                 .tree,
             ".env"
@@ -796,7 +821,7 @@ fn revoked_member_reads_old_revisions_but_not_the_new_pack() {
     keyring
         .revoke(&mut owner_keys, &alice, &bob.public())
         .unwrap();
-    remote.write_keyring(&keyring.encode().unwrap()).unwrap();
+    put_keyring(&remote, &keyring.encode().unwrap());
 
     let rev2 = save_child(&mut repo, &[(".env", ENV_V2)], &[]);
     let new_env = blob_of(&repo, rev2, ".env");
@@ -877,10 +902,10 @@ fn rolled_back_keyring_is_refused() {
     let mut bob_state = FetchState::new();
     fetch_new(&remote, Some(&bob), &mut bob_state).unwrap();
     assert!(bob_state.counter > 1);
-    remote.write_keyring(&old_keyring).unwrap();
+    put_keyring(&remote, &old_keyring);
 
     let saved = bob_state.clone();
-    let err = fetch(&remote, &MemoryStore::new(), Some(&bob), &mut bob_state).unwrap_err();
+    let err = fetch(&remote, &MemoryStore::new(), Some(&bob), &mut bob_state, &PublishState::new()).unwrap_err();
     assert!(matches!(err, FetchError::Keyring(KeyringError::RolledBack)));
     assert_eq!(bob_state, saved);
 }
@@ -914,9 +939,9 @@ fn substituted_owner_is_refused_after_pinning() {
     );
 
     let (forged, _) = Keyring::create(remote.remote_id(), &mallory).unwrap();
-    remote.write_keyring(&forged.encode().unwrap()).unwrap();
+    put_keyring(&remote, &forged.encode().unwrap());
     let saved = bob_state.clone();
-    let err = fetch(&remote, &MemoryStore::new(), Some(&bob), &mut bob_state).unwrap_err();
+    let err = fetch(&remote, &MemoryStore::new(), Some(&bob), &mut bob_state, &PublishState::new()).unwrap_err();
     match err {
         FetchError::Keyring(KeyringError::Invalid(reason)) => {
             let lower = reason.to_lowercase();
@@ -942,6 +967,7 @@ fn first_publish_requires_keys_the_caller_can_save_before_remote_writes() {
         &owner,
         None,
         &mut state,
+        &FetchState::new(),
         "main",
         rev,
         &PublishOptions::default(),
@@ -1076,6 +1102,7 @@ fn all_remote_bytes_hide_multi_branch_rename_delete_readd_history() {
         &owner,
         Some(&keys),
         &mut state,
+        &FetchState::new(),
         "other",
         branch,
         &PublishOptions {
@@ -1086,6 +1113,7 @@ fn all_remote_bytes_hide_multi_branch_rename_delete_readd_history() {
     .unwrap();
     // Deleting .private cannot defeat the floor; secrets/ is absent here.
     let floor = save_child(&mut repo, &[("public", MAIN_V2)], &[".private", "secrets"]);
+    // `floor` descends from the side bookmark, not from `main`.
     publish_at(
         &repo,
         &remote,
@@ -1093,7 +1121,10 @@ fn all_remote_bytes_hide_multi_branch_rename_delete_readd_history() {
         Some(&keys),
         &mut state,
         floor,
-        &PublishOptions::default(),
+        &PublishOptions {
+            force: true,
+            ..PublishOptions::default()
+        },
     )
     .unwrap();
     let files = files_of(dir.path());
@@ -1125,7 +1156,7 @@ fn revoked_members_cannot_open_new_seals_even_when_blobs_deduplicate() {
     let (_dir, remote) = remote_at([24; 16]);
     let (mut ring, mut keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
     ring.grant(&keys, &owner, &member.public()).unwrap();
-    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    put_keyring(&remote, &ring.encode().unwrap());
     let mut state = PublishState::new();
     publish_at(
         &repo,
@@ -1138,7 +1169,7 @@ fn revoked_members_cannot_open_new_seals_even_when_blobs_deduplicate() {
     )
     .unwrap();
     ring.revoke(&mut keys, &owner, &member.public()).unwrap();
-    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    put_keyring(&remote, &ring.encode().unwrap());
     let next = save_child(&mut repo, &[("copy.key", ENV), ("public", MAIN)], &[]);
     publish_at(
         &repo,
@@ -1179,17 +1210,17 @@ fn malformed_keyrings_refs_and_portable_path_tricks_leave_fetch_state_unchanged(
         vec![1, 255, 255, 255],
         good_ring[..80].to_vec(),
     ] {
-        remote.write_keyring(&bytes).unwrap();
+        put_keyring(&remote, &bytes);
         let mut state = FetchState::new();
-        assert!(fetch(&remote, &MemoryStore::new(), None, &mut state).is_err());
+        assert!(fetch(&remote, &MemoryStore::new(), None, &mut state, &PublishState::new()).is_err());
         assert_eq!(state, FetchState::new());
     }
-    remote.write_keyring(&good_ring).unwrap();
+    put_keyring(&remote, &good_ring);
     let mut huge = Writer::new();
     huge.u8(1);
     huge.varint(u64::MAX);
     std::fs::write(dir.path().join("refs"), huge.finish()).unwrap();
-    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new()).is_err());
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new(), &PublishState::new()).is_err());
     for name in ["../outside", ".TiG", "C:escape", "x\\escape", ".env."] {
         let mut tree = Writer::new();
         tree.u8(1);
@@ -1209,7 +1240,7 @@ fn malformed_keyrings_refs_and_portable_path_tricks_leave_fetch_state_unchanged(
         sign_main(&remote, &owner, id);
         let mut state = FetchState::new();
         assert!(
-            fetch(&remote, &MemoryStore::new(), None, &mut state).is_err(),
+            fetch(&remote, &MemoryStore::new(), None, &mut state, &PublishState::new()).is_err(),
             "{name}"
         );
         assert_eq!(state, FetchState::new());
@@ -1223,7 +1254,7 @@ fn authenticated_seal_with_a_missing_target_is_refused() {
     let owner = Identity::generate().unwrap();
     let (_dir, remote) = remote_at([26; 16]);
     let (ring, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
-    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    put_keyring(&remote, &ring.encode().unwrap());
     let key = &keys.keys[&("private".into(), 1)];
     let missing = tig_core::object::hash_object(ObjectKind::Blob, ENV);
     let sid = key.seal(&p(".env"), EntryKind::File, &missing);
@@ -1238,7 +1269,7 @@ fn authenticated_seal_with_a_missing_target_is_refused() {
     let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
     sign_main(&remote, &owner, id);
     let mut state = FetchState::new();
-    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).unwrap_err();
+    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state, &PublishState::new()).unwrap_err();
     assert!(err.to_string().contains("sealed target"), "{err}");
     assert_eq!(state, FetchState::new());
 }
@@ -1302,7 +1333,7 @@ fn withheld_pack_is_an_error_for_members_and_invisible_to_outsiders() {
     // The signed manifest lists the pack, so a member can tell a withheld
     // pack from a seal they were never meant to open.
     let mut state = FetchState::new();
-    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).unwrap_err();
+    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state, &PublishState::new()).unwrap_err();
     assert!(
         matches!(err, FetchError::WithheldPack { epoch: 1, missing: 1 }),
         "{err}"
@@ -1333,7 +1364,15 @@ fn manifest_signs_refs_and_refuses_tampering_and_rollback() {
     .unwrap();
     let keys = report.new_owner_keys.unwrap();
     let first_manifest = remote.read_manifest().unwrap().unwrap();
-    let first_refs = std::fs::read(dir.path().join("refs")).unwrap();
+    let first_decoded = Manifest::decode(&first_manifest).unwrap();
+    let mut refs_bytes = tig_core::encode::Writer::new();
+    refs_bytes.u8(1);
+    refs_bytes.varint(first_decoded.refs.len() as u64);
+    for (name, id) in &first_decoded.refs {
+        refs_bytes.str(name);
+        refs_bytes.id(id);
+    }
+    let first_refs = refs_bytes.finish();
     let rev2 = save_child(&mut repo, &[("src/main.rs", MAIN_V2)], &[]);
     publish_at(
         &repo,
@@ -1363,21 +1402,21 @@ fn manifest_signs_refs_and_refuses_tampering_and_rollback() {
     let mut tampered = current.clone();
     let at = tampered.len() - 70;
     tampered[at] ^= 1;
-    remote.write_manifest(&tampered).unwrap();
+    put_manifest(&remote, &tampered);
     let saved = fetched.clone();
-    assert!(fetch(&remote, &MemoryStore::new(), None, &mut fetched).is_err());
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut fetched, &PublishState::new()).is_err());
     assert_eq!(fetched, saved);
 
     // A non-member's signature is refused even over the right content.
     let honest = Manifest::decode(&current).unwrap();
     let forged = Manifest::signed(honest.remote, 9, honest.refs.clone(), honest.packs.clone(), &carol).unwrap();
-    remote.write_manifest(&forged.encode().unwrap()).unwrap();
-    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched).unwrap_err();
+    put_manifest(&remote, &forged.encode().unwrap());
+    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched, &PublishState::new()).unwrap_err();
     assert!(matches!(err, FetchError::Manifest(ManifestError::BadSignature)), "{err}");
 
     // An older genuine manifest is a rollback for fetch and for publish.
-    remote.write_manifest(&first_manifest).unwrap();
-    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched).unwrap_err();
+    put_manifest(&remote, &first_manifest);
+    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched, &PublishState::new()).unwrap_err();
     assert!(
         matches!(err, FetchError::Manifest(ManifestError::RolledBack { found: 1, seen: 2 })),
         "{err}"
@@ -1409,7 +1448,7 @@ fn manifest_signs_refs_and_refuses_tampering_and_rollback() {
         &PublishOptions::default(),
     )
     .is_err());
-    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new()).is_err());
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new(), &PublishState::new()).is_err());
 }
 
 #[test]
@@ -1438,6 +1477,9 @@ fn member_publishes_and_revoke_resigns_the_manifest_as_owner() {
     let mut bob_state = PublishState::new();
     bob_state.remote_id = remote.remote_id();
     bob_state.owner_signing = Some(alice.public().signing);
+    // Bob already has Alice's revision (same repo). The correspondence is
+    // what stops him re-projecting it and lets `main` fast-forward.
+    bob_state.revisions = alice_state.revisions.clone();
     publish_at(
         &repo,
         &remote,
@@ -1462,11 +1504,24 @@ fn member_publishes_and_revoke_resigns_the_manifest_as_owner() {
         bobs.verify(remote.remote_id(), &new, 0),
         Err(ManifestError::BadSignature)
     ));
-    let sequence = tig_private::manifest::resign_as_owner(&remote, &alice, &old, bobs.sequence)
-        .unwrap()
-        .unwrap();
+    let resigned = tig_private::manifest::resign_as_owner(
+        remote.read_manifest().unwrap().as_deref(),
+        remote.remote_id(),
+        &alice,
+        &old,
+        bobs.sequence,
+    )
+    .unwrap()
+    .unwrap();
+    let sequence = Manifest::decode(&resigned).unwrap().sequence;
     assert_eq!(sequence, bobs.sequence + 1);
-    remote.write_keyring(&new.encode().unwrap()).unwrap();
+    let head = remote.read_head().unwrap();
+    assert!(matches!(
+        remote
+            .commit_head(&head.version(), Some(&new.encode().unwrap()), Some(&resigned))
+            .unwrap(),
+        tig_private::remote::CommitOutcome::Committed(_)
+    ));
     let (_store, report) = fetch_new(&remote, Some(&alice), &mut FetchState::new()).unwrap();
     assert!(report.unsealed > 0);
 
@@ -1518,18 +1573,17 @@ fn hostile_pack_bytes_and_cross_remote_replay_fail_without_accepting_state() {
     ] {
         std::fs::write(&pack_path, bytes).unwrap();
         let mut state = FetchState::new();
-        assert!(fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).is_err());
+        assert!(fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state, &PublishState::new()).is_err());
         assert_eq!(state, FetchState::new());
     }
     let (_other_dir, other) = remote_at([30; 16]);
-    other
-        .write_keyring(&remote.read_keyring().unwrap())
-        .unwrap();
+    put_keyring(&other, &remote.read_keyring().unwrap());
     assert!(fetch(
         &other,
         &MemoryStore::new(),
         Some(&owner),
-        &mut FetchState::new()
+        &mut FetchState::new(),
+        &PublishState::new()
     )
     .is_err());
     assert!(other.put_pack(&good).is_err());

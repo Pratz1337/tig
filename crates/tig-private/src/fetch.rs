@@ -28,7 +28,8 @@ use crate::keys::{Identity, KeyError};
 use crate::manifest::{pack_id, Manifest, ManifestError};
 use crate::pack::{Pack, PackError, SealedRecord};
 use crate::project::PRIVATE_GROUP;
-use crate::remote::{DirRemote, RemoteError};
+use crate::publish::PublishState;
+use crate::remote::{Remote, RemoteError};
 
 const VERSION: u8 = 2;
 const MAX_STORED_REVISIONS: usize = 1_000_000;
@@ -217,13 +218,22 @@ impl Budget {
 /// identity with no grant, leaves sealed entries sealed. A pack the signed
 /// manifest lists for an epoch the identity holds must be present. Not being
 /// a member is not an error.
+///
+/// `published` is the other half of this remote's correspondence. A public
+/// revision this machine already published is mapped back to that internal
+/// revision instead of being rebuilt.
 pub fn fetch(
-    remote: &DirRemote,
+    remote: &dyn Remote,
     store: &dyn Store,
     identity: Option<&Identity>,
     state: &mut FetchState,
+    published: &PublishState,
 ) -> Result<FetchReport, FetchError> {
-    let keyring = Keyring::decode(&remote.read_keyring()?)?;
+    let head = remote.read_head()?;
+    let keyring_bytes = head.keyring.ok_or_else(|| {
+        FetchError::Invalid("keyring is missing".into())
+    })?;
+    let keyring = Keyring::decode(&keyring_bytes)?;
     if keyring.remote != remote.remote_id() {
         return Err(FetchError::Invalid(
             "keyring is for a different remote".into(),
@@ -231,7 +241,7 @@ pub fn fetch(
     }
     let (pin, newly_pinned) = resolve_pin(state, remote.remote_id(), &keyring)?;
     let verified = keyring.verify(&pin, state.counter)?;
-    let manifest = match remote.read_manifest()? {
+    let manifest = match head.manifest {
         Some(bytes) => Manifest::decode(&bytes)?,
         None => {
             return Err(FetchError::Invalid(
@@ -248,7 +258,7 @@ pub fn fetch(
         entries: 0,
         bytes: 0,
     };
-    let order = copy_history(remote.public_store(), store, &tips, &mut budget)?;
+    let order = copy_history(remote, store, &tips, &mut budget)?;
     let records = open_member_packs(
         remote,
         store,
@@ -260,10 +270,20 @@ pub fn fetch(
     )?;
 
     let mut mapped = state.revisions.clone();
+    let ours = local_of_published(published);
     let mut built = BTreeMap::new();
     let mut unsealed = 0usize;
     let mut still_sealed = 0usize;
     for public_id in order {
+        if let Some(internal) = ours.get(&public_id) {
+            if store.has(internal)? {
+                if mapped.get(&public_id) != Some(internal) {
+                    mapped.insert(public_id, *internal);
+                    built.insert(public_id, *internal);
+                }
+                continue;
+            }
+        }
         let (internal, opened, closed) =
             rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
         if mapped.get(&public_id) == Some(&internal) {
@@ -328,8 +348,16 @@ fn member_epochs(keyring: &Keyring, identity: &Identity) -> BTreeSet<u64> {
         .collect()
 }
 
+fn local_of_published(published: &PublishState) -> BTreeMap<ObjectId, ObjectId> {
+    published
+        .revisions
+        .iter()
+        .map(|(internal, public)| (*public, *internal))
+        .collect()
+}
+
 fn open_member_packs(
-    remote: &DirRemote,
+    remote: &dyn Remote,
     store: &dyn Store,
     keyring: &Keyring,
     verified: &VerifiedKeyring,
@@ -415,73 +443,156 @@ fn remember(
     }
 }
 
-/// Parents first, root excluded. Copies each revision and its public tree.
+/// Parents first, root excluded. One `get_batch` per revision level and per
+/// tree level (plus the blobs at that level).
 fn copy_history(
-    remote: &dyn Store,
+    remote: &dyn Remote,
     local: &dyn Store,
     tips: &[ObjectId],
     budget: &mut Budget,
 ) -> Result<Vec<ObjectId>, FetchError> {
-    const VISITING: u8 = 1;
-    const DONE: u8 = 2;
-    let mut colors: BTreeMap<ObjectId, u8> = BTreeMap::new();
+    let mut parents_of: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    let mut stack: Vec<(ObjectId, bool)> = tips.iter().rev().map(|id| (*id, false)).collect();
-    let mut order = Vec::new();
-    while let Some((id, entered)) = stack.pop() {
-        if id == root_revision_id() {
-            ensure_root(remote, local, budget, &mut seen)?;
-            continue;
-        }
-        if entered {
-            colors.insert(id, DONE);
-            order.push(id);
-            if order.len() > MAX_FETCH_REVISIONS {
-                return Err(FetchError::TooLarge);
-            }
-            continue;
-        }
-        match colors.get(&id).copied() {
-            Some(DONE) => continue,
-            Some(VISITING) => {
-                return Err(FetchError::Invalid("revision parents form a cycle".into()))
-            }
-            _ => {}
-        }
-        colors.insert(id, VISITING);
-        stack.push((id, true));
-        let revision = copy_revision(remote, local, id, budget, &mut seen)?;
-        if revision.parents.len() > MAX_FETCH_REVISIONS {
+    ensure_root(remote, local, budget, &mut seen)?;
+    let mut frontier = dedup_ids(tips);
+    frontier.retain(|id| *id != root_revision_id());
+    let mut levels: Vec<Vec<ObjectId>> = Vec::new();
+    let mut visiting = BTreeSet::new();
+    while !frontier.is_empty() {
+        if levels.len() + frontier.len() > MAX_FETCH_REVISIONS {
             return Err(FetchError::TooLarge);
         }
-        for parent in revision.parents.iter().rev() {
-            match colors.get(parent).copied() {
-                Some(DONE) => {}
-                Some(VISITING) => {
-                    return Err(FetchError::Invalid("revision parents form a cycle".into()))
+        let batch: Vec<ObjectId> = frontier
+            .iter()
+            .copied()
+            .filter(|id| !parents_of.contains_key(id) && *id != root_revision_id())
+            .collect();
+        if batch.iter().any(|id| !visiting.insert(*id)) {
+            return Err(FetchError::Invalid("revision parents form a cycle".into()));
+        }
+        let got = fetch_objects(remote, &batch)?;
+        let mut next = Vec::new();
+        let mut trees = Vec::new();
+        for id in &batch {
+            let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
+            budget.bytes(body.len())?;
+            budget.object()?;
+            if *kind != ObjectKind::Revision {
+                return Err(FetchError::Invalid(format!(
+                    "revision {id} is not a revision"
+                )));
+            }
+            if !local.has(id)? {
+                local.put_raw(id, *kind, body)?;
+            }
+            let revision = Revision::decode(body)?;
+            if revision.parents.len() > MAX_FETCH_REVISIONS {
+                return Err(FetchError::TooLarge);
+            }
+            trees.push(revision.tree);
+            parents_of.insert(*id, revision.parents.clone());
+            for parent in &revision.parents {
+                if *parent != root_revision_id() && !parents_of.contains_key(parent) {
+                    next.push(*parent);
                 }
-                _ => stack.push((*parent, false)),
             }
         }
+        copy_tree_levels(remote, local, &trees, budget, &mut seen)?;
+        levels.push(batch);
+        frontier = dedup_ids(&next);
+        if parents_of.len() > MAX_FETCH_REVISIONS {
+            return Err(FetchError::TooLarge);
+        }
+    }
+    topo_parents_first(&parents_of)
+}
+
+fn dedup_ids(ids: &[ObjectId]) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if seen.insert(*id) {
+            out.push(*id);
+        }
+    }
+    out
+}
+
+fn topo_parents_first(
+    parents_of: &BTreeMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>, FetchError> {
+    let mut pending: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    let mut children: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+    for (id, parents) in parents_of {
+        let mut waiting = 0usize;
+        for parent in parents {
+            if parents_of.contains_key(parent) {
+                waiting += 1;
+                children.entry(*parent).or_default().push(*id);
+            }
+        }
+        pending.insert(*id, waiting);
+    }
+    let mut ready: Vec<ObjectId> = pending
+        .iter()
+        .filter(|(_, waiting)| **waiting == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut order = Vec::new();
+    while let Some(id) = ready.pop() {
+        order.push(id);
+        if order.len() > MAX_FETCH_REVISIONS {
+            return Err(FetchError::TooLarge);
+        }
+        for child in children.get(&id).into_iter().flatten() {
+            let left = pending.get_mut(child).expect("child is in the graph");
+            *left -= 1;
+            if *left == 0 {
+                ready.push(*child);
+            }
+        }
+    }
+    if order.len() != parents_of.len() {
+        return Err(FetchError::Invalid("revision parents form a cycle".into()));
     }
     Ok(order)
 }
 
+fn fetch_objects(
+    remote: &dyn Remote,
+    ids: &[ObjectId],
+) -> Result<BTreeMap<ObjectId, (ObjectKind, Vec<u8>)>, FetchError> {
+    let mut out = BTreeMap::new();
+    for (id, kind, body) in remote.get_batch(ids)? {
+        out.insert(id, (kind, body));
+    }
+    Ok(out)
+}
+
 fn ensure_root(
-    remote: &dyn Store,
+    remote: &dyn Remote,
     local: &dyn Store,
     budget: &mut Budget,
     seen: &mut BTreeSet<ObjectId>,
 ) -> Result<(), FetchError> {
     let id = root_revision_id();
-    if seen.contains(&id) {
+    if !seen.insert(id) {
         return Ok(());
     }
-    if remote.has(&id)? {
-        let _ = copy_revision(remote, local, id, budget, seen)?;
+    let got = fetch_objects(remote, &[id])?;
+    if let Some((kind, body)) = got.get(&id) {
+        budget.bytes(body.len())?;
+        budget.object()?;
+        if *kind != ObjectKind::Revision {
+            return Err(FetchError::Invalid("root object is not a revision".into()));
+        }
+        if !local.has(&id)? {
+            local.put_raw(&id, *kind, body)?;
+        }
+        let revision = Revision::decode(body)?;
+        copy_tree_levels(remote, local, &[revision.tree], budget, seen)?;
         return Ok(());
     }
-    seen.insert(id);
     budget.object()?;
     let empty = Object::Tree(Tree::empty());
     let empty_id = empty.id();
@@ -493,94 +604,75 @@ fn ensure_root(
     Ok(())
 }
 
-fn copy_revision(
-    remote: &dyn Store,
+fn copy_tree_levels(
+    remote: &dyn Remote,
     local: &dyn Store,
-    id: ObjectId,
-    budget: &mut Budget,
-    seen: &mut BTreeSet<ObjectId>,
-) -> Result<Revision, FetchError> {
-    if !seen.insert(id) {
-        let body = local.get_raw(&id)?.ok_or(tig_core::Error::NotFound(id))?.1;
-        return Ok(Revision::decode(&body)?);
-    }
-    budget.object()?;
-    let (kind, body) = must_get(remote, &id)?;
-    budget.bytes(body.len())?;
-    if kind != ObjectKind::Revision {
-        return Err(FetchError::Invalid(format!(
-            "revision {id} is not a revision"
-        )));
-    }
-    if !local.has(&id)? {
-        local.put_raw(&id, kind, &body)?;
-    }
-    let revision = Revision::decode(&body)?;
-    copy_tree(remote, local, revision.tree, budget, seen)?;
-    Ok(revision)
-}
-
-fn copy_tree(
-    remote: &dyn Store,
-    local: &dyn Store,
-    root: ObjectId,
+    roots: &[ObjectId],
     budget: &mut Budget,
     seen: &mut BTreeSet<ObjectId>,
 ) -> Result<(), FetchError> {
-    let mut stack = vec![(root, 0usize)];
-    while let Some((id, depth)) = stack.pop() {
+    let mut level = dedup_ids(roots);
+    level.retain(|id| seen.insert(*id));
+    let mut depth = 0usize;
+    while !level.is_empty() {
         if depth > MAX_TREE_DEPTH {
             return Err(too_deep());
         }
-        if !seen.insert(id) {
-            continue;
-        }
-        budget.object()?;
-        let (kind, body) = must_get(remote, &id)?;
-        budget.bytes(body.len())?;
-        if kind != ObjectKind::Tree {
-            return Err(FetchError::Invalid(format!("object {id} is not a tree")));
-        }
-        if !local.has(&id)? {
-            local.put_raw(&id, kind, &body)?;
-        }
-        let tree = Tree::decode(&body)?;
-        if !tree.entries().is_empty() && depth + 1 > MAX_TREE_DEPTH {
-            return Err(too_deep());
-        }
-        for entry in tree.entries() {
-            budget.entry()?;
-            match entry.kind() {
-                EntryKind::Tree => stack.push((entry.id(), depth + 1)),
-                EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
-                    copy_blob(remote, local, entry.id(), budget, seen)?;
+        let got = fetch_objects(remote, &level)?;
+        let mut next = Vec::new();
+        let mut blobs = Vec::new();
+        for id in &level {
+            let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
+            budget.bytes(body.len())?;
+            budget.object()?;
+            if *kind != ObjectKind::Tree {
+                return Err(FetchError::Invalid(format!("object {id} is not a tree")));
+            }
+            if !local.has(id)? {
+                local.put_raw(id, *kind, body)?;
+            }
+            let tree = Tree::decode(body)?;
+            if !tree.entries().is_empty() && depth + 1 > MAX_TREE_DEPTH {
+                return Err(too_deep());
+            }
+            for entry in tree.entries() {
+                budget.entry()?;
+                match entry.kind() {
+                    EntryKind::Tree => {
+                        if seen.insert(entry.id()) {
+                            next.push(entry.id());
+                        }
+                    }
+                    EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
+                        if seen.insert(entry.id()) {
+                            blobs.push(entry.id());
+                        }
+                    }
+                    EntryKind::Sealed => {}
+                    EntryKind::Conflict => {
+                        return Err(FetchError::Invalid(
+                            "remote contains an unresolved conflict".into(),
+                        ))
+                    }
                 }
-                EntryKind::Sealed => {}
-                EntryKind::Conflict => return Err(FetchError::Invalid("remote contains an unresolved conflict".into())),
             }
         }
-    }
-    Ok(())
-}
-
-fn copy_blob(
-    remote: &dyn Store,
-    local: &dyn Store,
-    id: ObjectId,
-    budget: &mut Budget,
-    seen: &mut BTreeSet<ObjectId>,
-) -> Result<(), FetchError> {
-    if !seen.insert(id) {
-        return Ok(());
-    }
-    budget.object()?;
-    let (kind, body) = must_get(remote, &id)?;
-    budget.bytes(body.len())?;
-    if kind != ObjectKind::Blob {
-        return Err(FetchError::Invalid(format!("object {id} is not a blob")));
-    }
-    if !local.has(&id)? {
-        local.put_raw(&id, kind, &body)?;
+        if !blobs.is_empty() {
+            let got = fetch_objects(remote, &blobs)?;
+            for id in &blobs {
+                let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
+                budget.bytes(body.len())?;
+                budget.object()?;
+                if *kind != ObjectKind::Blob {
+                    return Err(FetchError::Invalid(format!("object {id} is not a blob")));
+                }
+                if !local.has(id)? {
+                    local.put_raw(id, *kind, body)?;
+                }
+            }
+        }
+        level = next;
+        depth += 1;
     }
     Ok(())
 }
@@ -755,13 +847,6 @@ fn map_refs(
         out.insert(name.clone(), internal);
     }
     Ok(out)
-}
-
-fn must_get(store: &dyn Store, id: &ObjectId) -> Result<(ObjectKind, Vec<u8>), FetchError> {
-    match store.get_raw(id)? {
-        Some(found) => Ok(found),
-        None => Err(tig_core::Error::NotFound(*id).into()),
-    }
 }
 
 fn bump(used: &mut usize, cap: usize) -> Result<(), FetchError> {

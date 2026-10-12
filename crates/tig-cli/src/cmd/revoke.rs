@@ -1,9 +1,9 @@
 //! `tig revoke`
 //!
 //! Revoke inserts a new epoch key into the owner store before the head moves.
-//! [`super::remote::commit_keyring`] writes those keys before the remote
-//! keyring. A crash in between is retried using the saved epoch secret;
-//! a pending signed head is completed before the next owner operation.
+//! [`tig_private::access::revoke`] writes those keys and a pending keyring
+//! before the remote head. A crash in between is retried using the saved
+//! epoch secret; a pending head is completed before the next owner operation.
 
 use std::path::Path;
 
@@ -19,19 +19,14 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String, token: String)
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
     let mut bundle = super::remote::load_owner(&cfg, &identity)?;
-    // The revoked member may have signed the current manifest.
-    if let Some(sequence) = tig_private::manifest::resign_as_owner(
+    tig_private::access::revoke(
         &bundle.remote,
+        &cfg.dir,
         &identity,
-        &bundle.keyring,
-        bundle.state.manifest_seq,
-    )? {
-        bundle.state.manifest_seq = sequence;
-    }
-    bundle
-        .keyring
-        .revoke(&mut bundle.keys, &identity, &member)?;
-    super::remote::commit_keyring(&cfg, &mut bundle)?;
+        &mut bundle.keys,
+        &mut bundle.state,
+        &member,
+    )?;
     println!("revoked {} on {remote_name}", member.fingerprint());
     super::announce_if_moved(&mut session, before)
 }

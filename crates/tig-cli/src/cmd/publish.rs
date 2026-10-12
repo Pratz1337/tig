@@ -19,6 +19,7 @@ use super::workspace;
 use super::{CliError, Result};
 use crate::ui::RevLabel;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     repository: Option<&Path>,
     remote_name: String,
@@ -27,12 +28,13 @@ pub(super) fn run(
     acknowledge_leaked: bool,
     confirm_negations: bool,
     declassify: Vec<String>,
+    force: bool,
 ) -> Result<()> {
     let (mut session, before) = super::open_ready(repository)?;
     let identity = identity::load_or_create()?;
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
-    super::remote::finish_keyring_update(&cfg)?;
+    super::remote::finish_keyring_update(&cfg, &identity)?;
     let rev = publish_rev(&session, revision)?;
     let dir_remote = super::remote::open_or_create(&cfg.path)?;
     let missing_keyring = !cfg.path.join("keyring").try_exists()?;
@@ -47,6 +49,7 @@ pub(super) fn run(
         return Err(CliError::msg("could not save owner keys before publishing"));
     }
     let mut state = super::remote::load_publish_state(&cfg.dir)?;
+    let fetched = super::remote::load_fetch_state(&cfg.dir)?;
     if let Some(imported) = super::import_git::load_state(&tig)? {
         state.ever_public.extend(imported.exposed);
     }
@@ -57,6 +60,7 @@ pub(super) fn run(
             .iter()
             .map(|p| super::parse_path(p))
             .collect::<Result<_>>()?,
+        force,
     };
     let report = publish::publish(
         session.repo.store().as_ref(),
@@ -64,6 +68,7 @@ pub(super) fn run(
         &identity,
         owner_keys.as_ref(),
         &mut state,
+        &fetched,
         &bookmark,
         rev,
         &options,
@@ -127,8 +132,13 @@ fn publish_rev(session: &super::Session, revision: Option<String>) -> Result<Obj
 }
 
 fn sealed_paths(remote: &DirRemote, bookmark: &str) -> Result<Vec<String>> {
-    let refs = remote.read_refs()?;
-    let id = refs.get(bookmark).copied().ok_or_else(|| {
+    let bytes = remote.read_manifest()?.ok_or_else(|| {
+        CliError::msg(format!(
+            "remote bookmark {bookmark} is missing after publish"
+        ))
+    })?;
+    let manifest = tig_private::manifest::Manifest::decode(&bytes)?;
+    let id = manifest.refs.get(bookmark).copied().ok_or_else(|| {
         CliError::msg(format!(
             "remote bookmark {bookmark} is missing after publish"
         ))

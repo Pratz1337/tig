@@ -25,7 +25,7 @@ use tig_core::ObjectId;
 use crate::keyring::Keyring;
 use crate::keys::Identity;
 use crate::project::PRIVATE_GROUP;
-use crate::remote::{DirRemote, RemoteError};
+use crate::remote::RemoteError;
 
 const VERSION: u8 = 1;
 const MAX_REFS: usize = 100_000;
@@ -249,22 +249,24 @@ impl Manifest {
     }
 }
 
-/// Re-signs the remote's manifest as the owner, unchanged but for a higher
-/// sequence. Revoke calls this before writing the new keyring: the last
-/// publisher may lose their right to sign, and the remote must never show a
-/// manifest its own keyring rejects. `keyring` is the verified keyring still
-/// on the remote. Returns the new sequence, or `None` before any publish.
+/// Re-signs `manifest` as the owner, unchanged but for a higher sequence.
+/// Returns the new manifest bytes, or `None` when there is no manifest yet.
+/// `keyring` is the verified keyring still on the remote (the caller commits
+/// the bytes together with the next keyring). The last publisher may lose
+/// their right to sign, and the remote must never show a manifest its own
+/// keyring rejects.
 pub fn resign_as_owner(
-    remote: &DirRemote,
+    manifest: Option<&[u8]>,
+    remote_id: [u8; 16],
     owner: &Identity,
     keyring: &Keyring,
     min_sequence: u64,
-) -> Result<Option<u64>, ManifestError> {
-    let Some(bytes) = remote.read_manifest()? else {
+) -> Result<Option<Vec<u8>>, ManifestError> {
+    let Some(bytes) = manifest else {
         return Ok(None);
     };
-    let current = Manifest::decode(&bytes)?;
-    current.verify(remote.remote_id(), keyring, min_sequence)?;
+    let current = Manifest::decode(bytes)?;
+    current.verify(remote_id, keyring, min_sequence)?;
     if owner.public() != keyring.owner {
         return Err(ManifestError::BadSignature);
     }
@@ -273,8 +275,7 @@ pub fn resign_as_owner(
         .checked_add(1)
         .ok_or_else(|| ManifestError::Malformed("sequence overflow".into()))?;
     let resigned = Manifest::signed(current.remote, sequence, current.refs, current.packs, owner)?;
-    remote.write_manifest(&resigned.encode()?)?;
-    Ok(Some(sequence))
+    Ok(Some(resigned.encode()?))
 }
 
 /// Who may sign a manifest: the owner, and members with a grant for the

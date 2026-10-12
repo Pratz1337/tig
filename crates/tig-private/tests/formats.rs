@@ -480,10 +480,25 @@ fn directory_remote_stores_packs_refs_and_public_objects() {
         ("main".to_string(), blob_id),
         ("topic".to_string(), ObjectId([2; 32])),
     ]);
-    remote.write_refs(&refs).unwrap();
+    // Legacy unsigned refs are not part of the head. A pre-manifest remote
+    // still has the file; new remotes do not create it.
+    let mut refs_bytes = tig_core::encode::Writer::new();
+    refs_bytes.u8(1);
+    refs_bytes.varint(refs.len() as u64);
+    for (name, id) in &refs {
+        refs_bytes.str(name);
+        refs_bytes.id(id);
+    }
+    std::fs::write(dir.path().join("refs"), refs_bytes.finish()).unwrap();
     assert_eq!(remote.read_refs().unwrap(), refs);
 
-    remote.write_keyring(b"keyring-bytes").unwrap();
+    let head = remote.read_head().unwrap();
+    assert!(matches!(
+        remote
+            .commit_head(&head.version(), Some(b"keyring-bytes"), None)
+            .unwrap(),
+        tig_private::remote::CommitOutcome::Committed(_)
+    ));
     assert_eq!(remote.read_keyring().unwrap(), b"keyring-bytes");
 
     let again = DirRemote::create(dir.path(), remote_id).unwrap();

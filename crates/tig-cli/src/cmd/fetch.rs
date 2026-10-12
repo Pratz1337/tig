@@ -17,11 +17,13 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String) -> Result<()> 
     let cfg = super::remote::require(&tig, &remote_name)?;
     let dir_remote = super::remote::open_existing(&cfg.path)?;
     let mut state = super::remote::load_fetch_state(&cfg.dir)?;
+    let published = super::remote::load_publish_state(&cfg.dir)?;
     let report = fetch::fetch(
         &dir_remote,
         session.repo.store().as_ref(),
         identity.as_ref(),
         &mut state,
+        &published,
     )?;
     if let Some(fingerprint) = &report.newly_pinned {
         println!("pinned owner of {remote_name}: {fingerprint} (verify it with them)");

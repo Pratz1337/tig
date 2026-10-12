@@ -3,9 +3,11 @@
 //! ```text
 //! <root>/
 //!   remote-id
-//!   keyring
-//!   refs
-//!   manifest          signed: refs, packs, sequence (see manifest.rs)
+//!   keyring           } the head, updated together (see `commit_head`)
+//!   manifest          }
+//!   head.pending      crash journal for one head commit
+//!   head.lock
+//!   refs              unsigned copy; only remotes that predate manifests
 //!   objects/          public objects only (a DiskStore)
 //!   packs/<group>/<epoch>/<pack-id>.pack
 //! ```
@@ -19,9 +21,12 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tig_core::encode::{Reader, Writer};
+use tig_core::encode::Reader;
+#[cfg(test)]
+use tig_core::encode::Writer;
+use tig_core::object::hash_object;
 use tig_core::store::{DiskStore, Store};
 use tig_core::{ObjectId, ObjectKind};
 
@@ -35,6 +40,9 @@ const MAX_LISTED_PACKS: usize = 100_000;
 const MAX_REFS: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
 const REFS_VERSION: u8 = 1;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCK_NAME: &str = "head.lock";
+const PENDING_NAME: &str = "head.pending";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -185,10 +193,6 @@ impl DirRemote {
         } else {
             atomic_write(&root, &id_path, &remote_id, true)?;
         }
-        let refs = root.join("refs");
-        if !refs.try_exists()? {
-            atomic_write(&root, &refs, &encode_refs(&BTreeMap::new())?, true)?;
-        }
         let objects = DiskStore::open(root.join("objects"))?;
         Ok(DirRemote {
             root,
@@ -289,54 +293,346 @@ impl DirRemote {
     }
 
     pub fn read_keyring(&self) -> Result<Vec<u8>, RemoteError> {
-        let path = self.root.join("keyring");
-        match read_limited(&path, MAX_KEYRING_FILE) {
-            Ok(bytes) => Ok(bytes),
-            Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                Err(RemoteError::Invalid("keyring is missing".into()))
-            }
-            Err(error) => Err(error),
+        match self.read_head()?.keyring {
+            Some(bytes) => Ok(bytes),
+            None => Err(RemoteError::Invalid("keyring is missing".into())),
         }
     }
 
-    pub fn write_keyring(&self, bytes: &[u8]) -> Result<(), RemoteError> {
-        if bytes.len() as u64 > MAX_KEYRING_FILE {
-            return Err(RemoteError::Invalid("keyring is too large".into()));
-        }
-        atomic_write(&self.root, &self.root.join("keyring"), bytes, true)
-    }
-
+    /// Unsigned refs file from remotes that predate manifests. Missing is an
+    /// error here; [`Remote::read_legacy_refs`] returns `None` instead.
     pub fn read_refs(&self) -> Result<BTreeMap<String, ObjectId>, RemoteError> {
-        let path = self.root.join("refs");
-        let bytes = match read_limited(&path, MAX_REFS_FILE) {
-            Ok(bytes) => bytes,
-            Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(RemoteError::Invalid("refs are missing".into()));
-            }
-            Err(error) => return Err(error),
-        };
-        decode_refs(&bytes)
-    }
-
-    pub fn write_refs(&self, refs: &BTreeMap<String, ObjectId>) -> Result<(), RemoteError> {
-        let bytes = encode_refs(refs)?;
-        atomic_write(&self.root, &self.root.join("refs"), &bytes, true)
+        self.read_legacy_refs()?
+            .ok_or_else(|| RemoteError::Invalid("refs are missing".into()))
     }
 
     /// The signed publish manifest, or `None` before the first publish.
     pub fn read_manifest(&self) -> Result<Option<Vec<u8>>, RemoteError> {
-        match read_limited(&self.root.join("manifest"), MAX_MANIFEST_FILE) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(self.read_head()?.manifest)
     }
 
-    pub fn write_manifest(&self, bytes: &[u8]) -> Result<(), RemoteError> {
-        if bytes.len() as u64 > MAX_MANIFEST_FILE {
+    pub fn read_head(&self) -> Result<RemoteHead, RemoteError> {
+        self.with_lock(|guard| guard.roll_forward_and_read())
+    }
+
+    pub fn commit_head(
+        &self,
+        expected: &HeadVersion,
+        keyring: Option<&[u8]>,
+        manifest: Option<&[u8]>,
+    ) -> Result<CommitOutcome, RemoteError> {
+        if keyring.is_some_and(|bytes| bytes.len() as u64 > MAX_KEYRING_FILE) {
+            return Err(RemoteError::Invalid("keyring is too large".into()));
+        }
+        if manifest.is_some_and(|bytes| bytes.len() as u64 > MAX_MANIFEST_FILE) {
             return Err(RemoteError::Invalid("manifest is too large".into()));
         }
-        atomic_write(&self.root, &self.root.join("manifest"), bytes, true)
+        self.with_lock(|guard| {
+            let current = guard.roll_forward_and_read()?;
+            if &current.version() != expected {
+                return Ok(CommitOutcome::Stale(current));
+            }
+            let new_keyring = match keyring {
+                Some(bytes) => Some(bytes.to_vec()),
+                None => current.keyring,
+            };
+            let new_manifest = match manifest {
+                Some(bytes) => Some(bytes.to_vec()),
+                None => current.manifest,
+            };
+            let pending = encode_pending(new_keyring.as_deref(), new_manifest.as_deref())?;
+            atomic_write(guard.root, &guard.root.join(PENDING_NAME), &pending, true)?;
+            install_part(guard.root, &guard.root.join("keyring"), new_keyring.as_deref())?;
+            install_part(
+                guard.root,
+                &guard.root.join("manifest"),
+                new_manifest.as_deref(),
+            )?;
+            match fs::remove_file(guard.root.join(PENDING_NAME)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(CommitOutcome::Committed(HeadVersion::of(
+                new_keyring.as_deref(),
+                new_manifest.as_deref(),
+            )))
+        })
+    }
+
+    pub fn missing(&self, ids: &[ObjectId]) -> Result<Vec<ObjectId>, RemoteError> {
+        let mut out = Vec::new();
+        for id in ids {
+            if !self.objects.has(id)? {
+                out.push(*id);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_batch(
+        &self,
+        objects: &[(ObjectId, ObjectKind, Vec<u8>)],
+    ) -> Result<(), RemoteError> {
+        for (id, kind, body) in objects {
+            if hash_object(*kind, body) != *id {
+                return Err(RemoteError::Invalid(
+                    "public object does not match its id".into(),
+                ));
+            }
+            self.objects.put_raw(id, *kind, body)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_batch(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, ObjectKind, Vec<u8>)>, RemoteError> {
+        let mut out = Vec::new();
+        for id in ids {
+            let Some((kind, body)) = self.objects.get_raw(id)? else {
+                continue;
+            };
+            if hash_object(kind, &body) != *id {
+                return Err(RemoteError::Invalid(
+                    "public object does not match its id".into(),
+                ));
+            }
+            out.push((*id, kind, body));
+        }
+        Ok(out)
+    }
+
+    pub fn read_legacy_refs(&self) -> Result<Option<BTreeMap<String, ObjectId>>, RemoteError> {
+        let path = self.root.join("refs");
+        let bytes = match read_limited(&path, MAX_REFS_FILE) {
+            Ok(bytes) => bytes,
+            Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(decode_refs(&bytes)?))
+    }
+
+    fn with_lock<T>(
+        &self,
+        body: impl FnOnce(&HeadLock<'_>) -> Result<T, RemoteError>,
+    ) -> Result<T, RemoteError> {
+        let lock = self.root.join(LOCK_NAME);
+        let start = Instant::now();
+        let guard = loop {
+            match OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => break LockGuard(lock),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > LOCK_TIMEOUT {
+                        return Err(RemoteError::Invalid(format!(
+                            "timed out waiting for {}; if no other tig process is running, delete it",
+                            self.root.join(LOCK_NAME).display()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        body(&HeadLock {
+            root: &self.root,
+            _lock: &guard,
+        })
+    }
+}
+
+struct LockGuard(PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+struct HeadLock<'a> {
+    root: &'a Path,
+    _lock: &'a LockGuard,
+}
+
+impl HeadLock<'_> {
+    fn roll_forward_and_read(&self) -> Result<RemoteHead, RemoteError> {
+        match read_pending(&self.root.join(PENDING_NAME))? {
+            Pending::Absent => {}
+            Pending::Torn => {
+                remove_pending(&self.root.join(PENDING_NAME))?;
+            }
+            Pending::Valid { keyring, manifest } => {
+                install_part(self.root, &self.root.join("keyring"), keyring.as_deref())?;
+                install_part(self.root, &self.root.join("manifest"), manifest.as_deref())?;
+                remove_pending(&self.root.join(PENDING_NAME))?;
+            }
+        }
+        Ok(RemoteHead {
+            keyring: read_optional(&self.root.join("keyring"), MAX_KEYRING_FILE)?,
+            manifest: read_optional(&self.root.join("manifest"), MAX_MANIFEST_FILE)?,
+        })
+    }
+}
+
+enum Pending {
+    Absent,
+    Torn,
+    Valid {
+        keyring: Option<Vec<u8>>,
+        manifest: Option<Vec<u8>>,
+    },
+}
+
+fn remove_pending(path: &Path) -> Result<(), RemoteError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_part(root: &Path, dest: &Path, bytes: Option<&[u8]>) -> Result<(), RemoteError> {
+    match bytes {
+        Some(bytes) => atomic_write(root, dest, bytes, true),
+        None => match fs::remove_file(dest) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+/// `head.pending`: for keyring then manifest, a u64-le length (`u64::MAX`
+/// means that file is absent) and the bytes, then a 32-byte BLAKE3 of
+/// everything before the checksum. A short or mismatched record is torn.
+fn encode_pending(keyring: Option<&[u8]>, manifest: Option<&[u8]>) -> Result<Vec<u8>, RemoteError> {
+    let mut body = Vec::new();
+    write_part(&mut body, keyring)?;
+    write_part(&mut body, manifest)?;
+    let sum = blake3::hash(&body);
+    body.extend_from_slice(sum.as_bytes());
+    Ok(body)
+}
+
+fn write_part(out: &mut Vec<u8>, bytes: Option<&[u8]>) -> Result<(), RemoteError> {
+    match bytes {
+        None => out.extend_from_slice(&u64::MAX.to_le_bytes()),
+        Some(bytes) => {
+            let len = u64::try_from(bytes.len())
+                .map_err(|_| RemoteError::Invalid("pending record is too large".into()))?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+    Ok(())
+}
+
+fn read_pending(path: &Path) -> Result<Pending, RemoteError> {
+    let bytes = match read_limited(path, MAX_KEYRING_FILE + MAX_MANIFEST_FILE + 64) {
+        Ok(bytes) => bytes,
+        Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Pending::Absent)
+        }
+        Err(RemoteError::Invalid(_)) => return Ok(Pending::Torn),
+        Err(error) => return Err(error),
+    };
+    Ok(decode_pending(&bytes).unwrap_or(Pending::Torn))
+}
+
+fn decode_pending(bytes: &[u8]) -> Option<Pending> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let (body, sum) = bytes.split_at(bytes.len() - 32);
+    if blake3::hash(body).as_bytes() != sum {
+        return None;
+    }
+    let mut rest = body;
+    let keyring = take_part(&mut rest, MAX_KEYRING_FILE)?;
+    let manifest = take_part(&mut rest, MAX_MANIFEST_FILE)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(Pending::Valid { keyring, manifest })
+}
+
+fn take_part(input: &mut &[u8], max: u64) -> Option<Option<Vec<u8>>> {
+    if input.len() < 8 {
+        return None;
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&input[..8]);
+    *input = &input[8..];
+    let len = u64::from_le_bytes(len_bytes);
+    if len == u64::MAX {
+        return Some(None);
+    }
+    if len > max || input.len() < len as usize {
+        return None;
+    }
+    let (head, tail) = input.split_at(len as usize);
+    *input = tail;
+    Some(Some(head.to_vec()))
+}
+
+fn read_optional(path: &Path, max: u64) -> Result<Option<Vec<u8>>, RemoteError> {
+    match read_limited(path, max) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+impl Remote for DirRemote {
+    fn remote_id(&self) -> [u8; 16] {
+        DirRemote::remote_id(self)
+    }
+
+    fn public_store(&self) -> &dyn Store {
+        DirRemote::public_store(self)
+    }
+
+    fn missing(&self, ids: &[ObjectId]) -> Result<Vec<ObjectId>, RemoteError> {
+        DirRemote::missing(self, ids)
+    }
+
+    fn put_batch(&self, objects: &[(ObjectId, ObjectKind, Vec<u8>)]) -> Result<(), RemoteError> {
+        DirRemote::put_batch(self, objects)
+    }
+
+    fn get_batch(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, ObjectKind, Vec<u8>)>, RemoteError> {
+        DirRemote::get_batch(self, ids)
+    }
+
+    fn put_pack(&self, bytes: &[u8]) -> Result<(), RemoteError> {
+        DirRemote::put_pack(self, bytes)
+    }
+
+    fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError> {
+        DirRemote::list_packs(self, group, epoch)
+    }
+
+    fn read_head(&self) -> Result<RemoteHead, RemoteError> {
+        DirRemote::read_head(self)
+    }
+
+    fn commit_head(
+        &self,
+        expected: &HeadVersion,
+        keyring: Option<&[u8]>,
+        manifest: Option<&[u8]>,
+    ) -> Result<CommitOutcome, RemoteError> {
+        DirRemote::commit_head(self, expected, keyring, manifest)
+    }
+
+    fn read_legacy_refs(&self) -> Result<Option<BTreeMap<String, ObjectId>>, RemoteError> {
+        DirRemote::read_legacy_refs(self)
     }
 }
 
@@ -387,6 +683,7 @@ fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>, RemoteError> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn encode_refs(refs: &BTreeMap<String, ObjectId>) -> Result<Vec<u8>, RemoteError> {
     if refs.len() > MAX_REFS {
         return Err(RemoteError::Invalid("too many refs".into()));
