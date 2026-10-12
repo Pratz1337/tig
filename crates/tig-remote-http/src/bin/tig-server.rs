@@ -2,12 +2,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tig_private::keys::PublicIdentity;
-use tig_private::remote::{DirRemote, Remote};
-use tig_remote_http::{init_server_dir, read_server_owner, serve, TlsConfig};
+use tig_remote_http::{init_server_dir, read_server_owner, serve_dir, TlsConfig};
 
 #[derive(Parser)]
 #[command(name = "tig-server", about = "Dumb storage for a tig remote")]
@@ -76,7 +74,6 @@ fn run_serve(
     tls_key: Option<PathBuf>,
 ) -> Result<(), String> {
     let owner = read_server_owner(dir).map_err(|e| e.to_string())?;
-    let remote = DirRemote::open(dir).map_err(|e| e.to_string())?;
     let tls = match (tls_cert, tls_key) {
         (None, None) => None,
         (Some(cert), Some(key)) => Some(TlsConfig {
@@ -85,8 +82,7 @@ fn run_serve(
         }),
         _ => return Err("pass both --tls-cert and --tls-key, or neither".into()),
     };
-    let server = serve(Arc::new(remote) as Arc<dyn Remote>, owner, listen, tls)
-        .map_err(|e| e.to_string())?;
+    let server = serve_dir(dir, owner, listen, tls).map_err(|e| e.to_string())?;
     eprintln!("tig-server listening on {}", server.local_addr());
     // The accept thread runs until the process is killed. Parking keeps the
     // listener, and the files, alive.

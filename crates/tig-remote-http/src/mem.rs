@@ -85,10 +85,7 @@ impl Remote for MemRemote {
             .collect())
     }
 
-    fn put_batch(
-        &self,
-        objects: &[(ObjectId, ObjectKind, Vec<u8>)],
-    ) -> Result<(), RemoteError> {
+    fn put_batch(&self, objects: &[(ObjectId, ObjectKind, Vec<u8>)]) -> Result<(), RemoteError> {
         for (id, kind, body) in objects {
             self.objects.put_raw(id, *kind, body)?;
         }
@@ -125,9 +122,7 @@ impl Remote for MemRemote {
         }
         let id = *blake3::hash(bytes).as_bytes();
         let mut packs = self.packs.lock().unwrap_or_else(|p| p.into_inner());
-        let epoch = packs
-            .entry((header.group, header.epoch))
-            .or_default();
+        let epoch = packs.entry((header.group, header.epoch)).or_default();
         if epoch.len() >= MAX_LISTED_PACKS && !epoch.contains_key(&id) {
             return Err(RemoteError::Invalid("too many packs".into()));
         }
@@ -146,10 +141,19 @@ impl Remote for MemRemote {
     fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError> {
         check_group(group).map_err(RemoteError::Invalid)?;
         let packs = self.packs.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(packs
-            .get(&(group.to_string(), epoch))
-            .map(|epoch| epoch.values().cloned().collect())
-            .unwrap_or_default())
+        let Some(epoch) = packs.get(&(group.to_string(), epoch)) else {
+            return Ok(Vec::new());
+        };
+        if epoch.len() > MAX_LISTED_PACKS {
+            return Err(RemoteError::Invalid("too many packs".into()));
+        }
+        let mut remaining = MAX_PACK_FILE;
+        for bytes in epoch.values() {
+            remaining = remaining
+                .checked_sub(bytes.len())
+                .ok_or_else(|| RemoteError::Invalid("pack listing is too large".into()))?;
+        }
+        Ok(epoch.values().cloned().collect())
     }
 
     fn read_head(&self) -> Result<RemoteHead, RemoteError> {
@@ -179,5 +183,20 @@ impl Remote for MemRemote {
             head.manifest = Some(bytes.to_vec());
         }
         Ok(CommitOutcome::Committed(head.version()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_listing_cap_is_checked_before_copying() {
+        let remote = MemRemote::new([1; 16]);
+        remote.packs.lock().unwrap().insert(
+            ("private".into(), 1),
+            BTreeMap::from([([0; 32], vec![0; MAX_PACK_FILE]), ([1; 32], vec![0])]),
+        );
+        assert!(remote.list_packs("private", 1).is_err());
     }
 }
