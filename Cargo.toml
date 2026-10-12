@@ -30,4 +30,11 @@ tempfile = "3"
 gix = { version = "0.89", default-features = false, features = ["sha1", "sha256"] }
 
 [profile.release]
+# Shipped binaries carry no debug info: smaller to load and to scan.
+strip = "debuginfo"
+
+# `cargo build --profile profiling` keeps line tables for profilers.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = "none"

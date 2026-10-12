@@ -207,6 +207,9 @@ impl WorkingCopy {
         let (root, tig_dir) = find_tig(&start_dir)?;
         ensure_metadata_dirs(&tig_dir)?;
         let name = workspace_name_for(&tig_dir, &root)?;
+        // First, so recently edited files are being scanned while the
+        // journal and the stat cache load.
+        crate::prefetch::start(&root, &tig_dir, &name);
         let store = Arc::new(JournalStore::open(tig_dir.join("store"))?);
         let op_head = Arc::new(FileOpHead::new(&tig_dir));
         let repo = {
@@ -358,6 +361,12 @@ impl WorkingCopy {
         )?;
         drop(scan);
         stats.changed = ws.pending().len();
+        let edited: Vec<RepoPath> = ws
+            .pending()
+            .iter()
+            .filter(|(_, leaf)| leaf.is_some_and(|leaf| leaf.is_file_like()))
+            .map(|(path, _)| path.clone())
+            .collect();
         stats.warnings = warnings;
         stats.warnings.sort();
         stats.warnings.dedup();
@@ -370,6 +379,9 @@ impl WorkingCopy {
         {
             let _t = crate::trace::span("  snapshot: save workspace state");
             self.record_state(working, repo.revision(&working)?.tree, cache, false)?;
+        }
+        if !edited.is_empty() {
+            crate::prefetch::remember(&self.tig_dir, &self.name, &edited);
         }
         Ok(stats)
     }
@@ -1858,7 +1870,7 @@ fn ancestor_dirs(path: &RepoPath) -> Vec<RepoPath> {
 
 // --- paths and atomic writes ----------------------------------------------
 
-fn disk_path(root: &Path, rel: &RepoPath) -> PathBuf {
+pub(crate) fn disk_path(root: &Path, rel: &RepoPath) -> PathBuf {
     let mut out = root.to_path_buf();
     for component in rel.components() {
         out.push(component);

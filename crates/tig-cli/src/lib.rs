@@ -2,6 +2,7 @@
 //! plus the filesystem working copy.
 
 pub mod cmd;
+pub mod prefetch;
 pub mod ui;
 pub mod wc;
 pub mod trace;
