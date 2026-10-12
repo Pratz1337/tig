@@ -335,7 +335,7 @@ pub fn run() -> Result<()> {
             force,
         )?,
         Cmd::Fetch { remote } => fetch::run(repository, remote)?,
-        Cmd::Clone { path, dir } => clone::run(repository, path, dir)?,
+        Cmd::Clone { source, dir } => clone::run(repository, &source, dir)?,
         Cmd::Grant { remote, token } => grant::run(repository, remote, token)?,
         Cmd::Revoke { remote, token } => revoke::run(repository, remote, token)?,
     }
@@ -496,7 +496,7 @@ enum Cmd {
         #[arg(long)]
         show: bool,
     },
-    /// Directory remotes
+    /// Remotes: directories or tig servers
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
@@ -532,8 +532,8 @@ enum Cmd {
     },
     /// Copy a remote into a new repository
     Clone {
-        /// Remote directory to copy
-        path: PathBuf,
+        /// Remote directory or server URL (https://host[:port]/...) to copy
+        source: String,
         /// Directory for the new repository
         dir: PathBuf,
     },
@@ -615,12 +615,12 @@ enum BookmarkAction {
 
 #[derive(Subcommand)]
 enum RemoteAction {
-    /// Remember a remote directory
+    /// Remember a remote directory or server
     Add {
         /// Remote name
         name: String,
-        /// Path of the remote directory
-        path: PathBuf,
+        /// Directory path, or server URL (https://, or http:// to loopback only)
+        location: String,
     },
     /// List remotes
     List,

@@ -20,7 +20,7 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String, token: String)
     let cfg = super::remote::require(&tig, &remote_name)?;
     let mut bundle = super::remote::load_owner(&cfg, &identity)?;
     tig_private::access::revoke(
-        &bundle.remote,
+        bundle.remote.as_ref(),
         &cfg.dir,
         &identity,
         &mut bundle.keys,

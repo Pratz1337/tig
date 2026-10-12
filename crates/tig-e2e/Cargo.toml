@@ -1,0 +1,14 @@
+[package]
+name = "tig-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Multi-user acceptance tests over directory and HTTP remotes (test-only)"
+
+[dev-dependencies]
+tig-core = { workspace = true }
+tig-private = { workspace = true }
+tig-remote-http = { path = "../tig-remote-http" }
+tempfile = { workspace = true }

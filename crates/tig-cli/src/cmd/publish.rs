@@ -12,7 +12,7 @@ use tig_core::treeops::walk;
 use tig_core::{EntryKind, ObjectId, RepoPath};
 use tig_private::keyring::Keyring;
 use tig_private::publish::{self, PublishOptions};
-use tig_private::remote::DirRemote;
+use tig_private::remote::Remote;
 
 use super::identity;
 use super::workspace;
@@ -36,12 +36,12 @@ pub(super) fn run(
     let cfg = super::remote::require(&tig, &remote_name)?;
     super::remote::finish_keyring_update(&cfg, &identity)?;
     let rev = publish_rev(&session, revision)?;
-    let dir_remote = super::remote::open_or_create(&cfg.path)?;
-    let missing_keyring = !cfg.path.join("keyring").try_exists()?;
+    let remote = super::remote::connect(&cfg, Some(&identity), true)?;
+    let missing_keyring = remote.read_head()?.keyring.is_none();
     // Keys hit disk before publish can write a keyring. A refusal still
     // leaves the remote keyring absent; the saved keys are what a retry uses.
     if missing_keyring && super::remote::load_owner_keys(&cfg.dir)?.is_none() {
-        let (_preview, keys) = Keyring::create(dir_remote.remote_id(), &identity)?;
+        let (_preview, keys) = Keyring::create(remote.remote_id(), &identity)?;
         super::remote::save_owner_keys_new(&cfg.dir, &keys)?;
     }
     let owner_keys = super::remote::load_owner_keys(&cfg.dir)?;
@@ -64,7 +64,7 @@ pub(super) fn run(
     };
     let report = publish::publish(
         session.repo.store().as_ref(),
-        &dir_remote,
+        remote.as_ref(),
         &identity,
         owner_keys.as_ref(),
         &mut state,
@@ -72,7 +72,8 @@ pub(super) fn run(
         &bookmark,
         rev,
         &options,
-    )?;
+    )
+    .map_err(|err| super::remote::explain(&cfg, err))?;
     super::remote::save_publish_state(&cfg.dir, &state)?;
     let mut tx = session
         .repo
@@ -80,7 +81,7 @@ pub(super) fn run(
     tx.set_bookmark(&bookmark, rev)?;
     session.commit(tx)?;
 
-    let sealed = sealed_paths(&dir_remote, &bookmark)?;
+    let sealed = sealed_paths(remote.as_ref(), &bookmark)?;
     let noun = if report.revisions_published == 1 {
         "revision"
     } else {
@@ -131,8 +132,8 @@ fn publish_rev(session: &super::Session, revision: Option<String>) -> Result<Obj
     }
 }
 
-fn sealed_paths(remote: &DirRemote, bookmark: &str) -> Result<Vec<String>> {
-    let bytes = remote.read_manifest()?.ok_or_else(|| {
+fn sealed_paths(remote: &dyn Remote, bookmark: &str) -> Result<Vec<String>> {
+    let bytes = remote.read_head()?.manifest.ok_or_else(|| {
         CliError::msg(format!(
             "remote bookmark {bookmark} is missing after publish"
         ))
