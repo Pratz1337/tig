@@ -85,8 +85,7 @@ def _strip_ddash(args: list[str]) -> list[str]:
     return args
 
 
-SRC_HASHES = f"{TARGET_DIR}/src-hashes.json"
-OLD_MTIME = 1_000_000_000  # 2001: older than any cached build artifact
+SRC_HASHES = f"{TARGET_DIR}/src-mtimes.json"
 
 
 def _sync_mtimes() -> None:
@@ -94,8 +93,10 @@ def _sync_mtimes() -> None:
 
     Uploaded files do not carry trustworthy mtimes, so cargo could reuse
     artifacts on the cache volume that were built from different sources.
-    Every file whose content changed since the last run gets "now"; every
-    unchanged file gets a fixed old time.
+    Each file gets the time its current content was first seen in this lane.
+    A fixed "old" time for unchanged files is not enough: an artifact built
+    for another package or feature selection from an earlier version of the
+    file would then look fresh.
     """
     import hashlib
     import json
@@ -114,12 +115,14 @@ def _sync_mtimes() -> None:
             with open(path, "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
             rel = os.path.relpath(path, REMOTE_REPO)
-            current[rel] = digest
-            if previous.get(rel) == digest:
-                os.utime(path, (OLD_MTIME, OLD_MTIME))
+            seen = previous.get(rel)
+            if isinstance(seen, list) and len(seen) == 2 and seen[0] == digest:
+                stamp = float(seen[1])
             else:
-                os.utime(path, (now, now))
+                stamp = now
                 changed += 1
+            current[rel] = [digest, stamp]
+            os.utime(path, (stamp, stamp))
     with open(SRC_HASHES, "w", encoding="utf-8") as f:
         json.dump(current, f)
     print(f"sources: {len(current)} files, {changed} changed since last run", flush=True)
