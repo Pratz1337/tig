@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tig-core", "crates/tig-private", "crates/tig-cli"]
+members = ["crates/tig-core", "crates/tig-private", "crates/tig-cli", "crates/tig-remote-http"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,6 +28,9 @@ similar = "2"
 proptest = "1"
 tempfile = "3"
 gix = { version = "0.89", default-features = false, features = ["sha1", "sha256"] }
+ureq = "2.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 
 [profile.release]
 # Shipped binaries carry no debug info: smaller to load and to scan.
