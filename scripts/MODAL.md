@@ -15,3 +15,11 @@
 The upload is the working tree, including uncommitted edits. It skips `target/`, `bin/`, `.git/`, any `.tig/` directory, and `pending/`. Registry, git, and build outputs persist on the Modal volume `tig-cargo-cache`.
 
 Tests gated with `#[cfg(windows)]` do not run on Modal (Linux). Run those locally only when Windows-specific code changes, for example `cargo test -p tig-cli -- <windows test names>`.
+
+## Parallel agents
+
+Agents running Modal at the same time must each set their own cache lane, e.g.
+`TIG_MODAL_CACHE=review-a python scripts/modal_build.py test -p tig-private`.
+Each lane has its own target directory and source-hash record on the volume
+(the first run in a new lane rebuilds the workspace crates once). The default
+lane is `main`.

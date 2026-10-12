@@ -21,7 +21,10 @@ REPO = Path(__file__).resolve().parents[1]
 REMOTE_REPO = "/repo"
 CACHE_ROOT = "/cargo-cache"
 CARGO_HOME = f"{CACHE_ROOT}/cargo-home"
-TARGET_DIR = f"{CACHE_ROOT}/target"
+# Concurrent agents must not share a target dir or the source-hash record
+# (their trees differ), so each picks a lane: TIG_MODAL_CACHE=<name>.
+LANE = "".join(c for c in os.environ.get("TIG_MODAL_CACHE", "main") if c.isalnum() or c in "-_") or "main"
+TARGET_DIR = f"{CACHE_ROOT}/target" if LANE == "main" else f"{CACHE_ROOT}/target-{LANE}"
 RELEASE_DIR = f"{TARGET_DIR}/x86_64-pc-windows-gnu/release"
 
 # Dockerignore-style. A name without a slash matches that path segment anywhere,
@@ -69,6 +72,7 @@ app = modal.App("tig-build")
 RUN_ENV = {
     "CARGO_HOME": CARGO_HOME,
     "CARGO_TARGET_DIR": TARGET_DIR,
+    "TIG_MODAL_CACHE": LANE,
     "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER": "x86_64-w64-mingw32-gcc",
     "CC_x86_64_pc_windows_gnu": "x86_64-w64-mingw32-gcc",
     "CXX_x86_64_pc_windows_gnu": "x86_64-w64-mingw32-g++",
@@ -81,7 +85,7 @@ def _strip_ddash(args: list[str]) -> list[str]:
     return args
 
 
-SRC_HASHES = f"{CACHE_ROOT}/src-hashes.json"
+SRC_HASHES = f"{TARGET_DIR}/src-hashes.json"
 OLD_MTIME = 1_000_000_000  # 2001: older than any cached build artifact
 
 
