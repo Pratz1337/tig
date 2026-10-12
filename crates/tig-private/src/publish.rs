@@ -30,7 +30,7 @@ use crate::pack::{PackBuilder, PackError};
 use crate::project::{project_tree, public_revision, Projection, SealedRoot, PRIVATE_GROUP};
 use crate::remote::{DirRemote, RemoteError};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_PATHS: usize = 1_000_000;
 const MAX_WIRES: usize = 1_000_000;
@@ -60,6 +60,13 @@ pub enum PublishError {
     /// A public file has the same bytes as a non-empty private file.
     #[error("public file repeats a private file: {}", join_pastes(pastes))]
     PastedSecret { pastes: Vec<Paste> },
+    /// A public file repeats bytes that were sealed before (the private file
+    /// was renamed, deleted, or reclassified). Declassify the path to allow it.
+    #[error(
+        "these public files contain bytes that were private before; pass --declassify <path> for each one you really mean to publish: {}",
+        join_paths(paths)
+    )]
+    PreviouslyPrivate { paths: Vec<RepoPath> },
     /// A `!` rule makes a path public that has not been confirmed.
     #[error(
         "a negation makes these paths public; confirm them: {}",
@@ -88,6 +95,9 @@ pub struct PublishOptions {
     pub acknowledge_leaked: bool,
     /// Accept every still-unconfirmed `!` path in this publish.
     pub confirm_negations: bool,
+    /// Publish these paths in the clear even though their bytes were sealed
+    /// before (an explicit, per-path declassification).
+    pub declassify: BTreeSet<RepoPath>,
 }
 
 /// Per-remote publish memory. The caller persists [`PublishState::encode`].
@@ -109,6 +119,12 @@ pub struct PublishState {
     pub confirmed_negations: BTreeSet<RepoPath>,
     /// Wire ids already sent, per group and epoch.
     pub sent: BTreeMap<(String, u64), BTreeSet<WireId>>,
+    /// Every non-empty blob ever sealed to this remote (local only). Those
+    /// bytes may not reappear in a public file unless declassified, even
+    /// after the private file was renamed or deleted.
+    pub ever_private: BTreeSet<ObjectId>,
+    /// Blobs the user explicitly declassified with `declassify`.
+    pub declassified: BTreeSet<ObjectId>,
 }
 
 impl Default for PublishState {
@@ -128,6 +144,8 @@ impl PublishState {
             ever_public: BTreeSet::new(),
             confirmed_negations: BTreeSet::new(),
             sent: BTreeMap::new(),
+            ever_private: BTreeSet::new(),
+            declassified: BTreeSet::new(),
         }
     }
 
@@ -169,13 +187,15 @@ impl PublishState {
                 w.buf.extend_from_slice(&wire.0);
             }
         }
+        write_ids(&mut w, &self.ever_private)?;
+        write_ids(&mut w, &self.declassified)?;
         Ok(w.finish())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PublishError> {
         let mut r = Reader::new(bytes, "publish state");
         let version = r.u8()?;
-        if version != VERSION {
+        if version != VERSION && version != 1 {
             return Err(PublishError::Invalid(format!(
                 "unsupported publish state version {version}"
             )));
@@ -249,6 +269,12 @@ impl PublishState {
             }
             sent.insert(rank, wires);
         }
+        // Version 1 predates historical private-blob tracking.
+        let (ever_private, declassified) = if version >= 2 {
+            (read_ids(&mut r)?, read_ids(&mut r)?)
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
         r.finish()?;
         Ok(PublishState {
             remote_id,
@@ -258,6 +284,8 @@ impl PublishState {
             ever_public,
             confirmed_negations,
             sent,
+            ever_private,
+            declassified,
         })
     }
 }
@@ -387,6 +415,8 @@ pub fn publish(
     ever_public.extend(checked.new_public);
     state.ever_public = ever_public;
     state.confirmed_negations.extend(checked.confirmed);
+    state.ever_private.extend(checked.new_private);
+    state.declassified.extend(checked.new_declassified);
     if !new_wires.is_empty() {
         state
             .sent
@@ -597,6 +627,10 @@ struct Checked {
     warnings: Vec<String>,
     new_public: BTreeSet<RepoPath>,
     confirmed: BTreeSet<RepoPath>,
+    /// Non-empty private blobs of this publish, to remember.
+    new_private: BTreeSet<ObjectId>,
+    /// Blobs declassified in this publish.
+    new_declassified: BTreeSet<ObjectId>,
 }
 
 /// A different publisher or branch may have exposed a path before this
@@ -639,6 +673,34 @@ fn check_refusals(
     options: &PublishOptions,
 ) -> Result<Checked, PublishError> {
     let empty = empty_blob();
+    // Everything private in this batch plus everything ever sealed to this
+    // remote: a rename or delete inside an unpublished window, or after an
+    // earlier publish, must not let those bytes out.
+    let mut new_private = BTreeSet::new();
+    for plan in plans {
+        for (_, leaf) in &plan.projection.private_files {
+            if leaf.is_file_like() && leaf.id() != empty {
+                new_private.insert(leaf.id());
+            }
+        }
+    }
+    let mut previously_private = BTreeSet::new();
+    let mut new_declassified = BTreeSet::new();
+    for plan in plans {
+        for (path, leaf) in &plan.projection.public_files {
+            let id = leaf.id();
+            if !leaf.is_file_like() || id == empty || state.declassified.contains(&id) {
+                continue;
+            }
+            if new_private.contains(&id) || state.ever_private.contains(&id) {
+                if options.declassify.contains(path) {
+                    new_declassified.insert(id);
+                } else {
+                    previously_private.insert(path.clone());
+                }
+            }
+        }
+    }
     let mut seen_public = ever_public.clone();
     let mut leaked = BTreeSet::new();
     let mut pastes = BTreeSet::new();
@@ -684,6 +746,13 @@ fn check_refusals(
             paths: negations.into_iter().collect(),
         });
     }
+    // After the rule-level question: confirming a negation makes a path
+    // public going forward; it never declassifies bytes that were sealed.
+    if !previously_private.is_empty() {
+        return Err(PublishError::PreviouslyPrivate {
+            paths: previously_private.into_iter().collect(),
+        });
+    }
     let confirmed = if options.confirm_negations {
         negations
     } else {
@@ -693,6 +762,8 @@ fn check_refusals(
         warnings,
         new_public,
         confirmed,
+        new_private,
+        new_declassified,
     })
 }
 
@@ -985,6 +1056,35 @@ fn queue_object(
     builder.add_object(kind, id, &body)?;
     new_wires.insert(wire);
     Ok(())
+}
+
+fn write_ids(w: &mut Writer, ids: &BTreeSet<ObjectId>) -> Result<(), PublishError> {
+    if ids.len() > MAX_PATHS {
+        return Err(PublishError::Invalid("too many blob ids".into()));
+    }
+    w.varint(ids.len() as u64);
+    for id in ids {
+        w.id(id);
+    }
+    Ok(())
+}
+
+fn read_ids(r: &mut Reader<'_>) -> Result<BTreeSet<ObjectId>, PublishError> {
+    let n = r.count(32)?;
+    if n > MAX_PATHS {
+        return Err(PublishError::Invalid("too many blob ids".into()));
+    }
+    let mut ids = BTreeSet::new();
+    let mut previous: Option<ObjectId> = None;
+    for _ in 0..n {
+        let id = r.id()?;
+        if previous.is_some_and(|prev| id <= prev) {
+            return Err(PublishError::Invalid("blob ids are not in canonical order".into()));
+        }
+        previous = Some(id);
+        ids.insert(id);
+    }
+    Ok(ids)
 }
 
 fn write_paths(w: &mut Writer, paths: &BTreeSet<RepoPath>) -> Result<(), PublishError> {

@@ -1295,7 +1295,7 @@ fn hostile_pack_bytes_and_cross_remote_replay_fail_without_accepting_state() {
 }
 
 #[test]
-fn historical_paste_policy_currently_only_checks_the_same_revision() {
+fn historical_private_bytes_need_explicit_declassification() {
     let mut repo = repo();
     let owner = Identity::generate().unwrap();
     let (dir, remote) = remote_at([31; 16]);
@@ -1303,11 +1303,35 @@ fn historical_paste_policy_currently_only_checks_the_same_revision() {
     let first = save(&mut repo, &[(".env", ENV)], &[]);
     let keys = publish_at(&repo, &remote, &owner, None, &mut state, first,
         &PublishOptions::default()).unwrap().new_owner_keys.unwrap();
-    // Renaming a historical secret out of the floor after deleting its old
-    // path bypasses same-revision equality checks. Requires a policy decision
-    // about historical paste detection versus explicit declassification.
+    // The secret was sealed; deleting `.env` and reusing its bytes in a
+    // public file must not let them out.
     let renamed = save_child(&mut repo, &[("public-copy", ENV)], &[".env"]);
-    publish_at(&repo, &remote, &owner, Some(&keys), &mut state, renamed,
-        &PublishOptions::default()).unwrap();
+    let before = files_of(dir.path());
+    let err = publish_at(&repo, &remote, &owner, Some(&keys), &mut state, renamed,
+        &PublishOptions::default()).unwrap_err();
+    assert!(matches!(err, PublishError::PreviouslyPrivate { ref paths } if paths.len() == 1), "{err}");
+    assert_eq!(files_of(dir.path()), before, "a refusal writes nothing");
+    assert!(!files_of(dir.path()).values().any(|bytes| contains(bytes, ENV)));
+    // Declassifying a different path does not help; naming this one does.
+    let wrong = PublishOptions { declassify: [RepoPath::new("other").unwrap()].into(), ..Default::default() };
+    assert!(publish_at(&repo, &remote, &owner, Some(&keys), &mut state, renamed, &wrong).is_err());
+    let right = PublishOptions { declassify: [RepoPath::new("public-copy").unwrap()].into(), ..Default::default() };
+    publish_at(&repo, &remote, &owner, Some(&keys), &mut state, renamed, &right).unwrap();
     assert!(files_of(dir.path()).values().any(|bytes| contains(bytes, ENV)));
+}
+
+#[test]
+fn rename_inside_an_unpublished_window_is_also_refused() {
+    let mut repo = repo();
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([32; 16]);
+    let mut state = PublishState::new();
+    // Sealed in one revision, renamed public in the next; neither was
+    // published yet, so publish sees both at once.
+    save(&mut repo, &[(".env", ENV)], &[]);
+    let renamed = save_child(&mut repo, &[("public-copy", ENV)], &[".env"]);
+    let err = publish_at(&repo, &remote, &owner, None, &mut state, renamed,
+        &PublishOptions::default()).unwrap_err();
+    assert!(matches!(err, PublishError::PreviouslyPrivate { .. }), "{err}");
+    assert!(!files_of(dir.path()).values().any(|bytes| contains(bytes, ENV)));
 }

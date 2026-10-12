@@ -26,6 +26,7 @@ pub(super) fn run(
     revision: Option<String>,
     acknowledge_leaked: bool,
     confirm_negations: bool,
+    declassify: Vec<String>,
 ) -> Result<()> {
     let (mut session, before) = super::open_ready(repository)?;
     let identity = identity::load_or_create()?;
@@ -52,6 +53,10 @@ pub(super) fn run(
     let options = PublishOptions {
         acknowledge_leaked,
         confirm_negations,
+        declassify: declassify
+            .iter()
+            .map(|p| super::parse_path(p))
+            .collect::<Result<_>>()?,
     };
     let report = publish::publish(
         session.repo.store().as_ref(),

@@ -362,7 +362,19 @@ fn alice_publishes_bob_reads_carol_does_not() {
         "refusal wrote the remote"
     );
 
-    let confirmed = expect_ok(alice(&repo).args(["publish", "origin", "--confirm-negations"]));
+    // Confirming the negation is not enough: those bytes were sealed before,
+    // so publishing them in the clear needs an explicit declassification.
+    let undeclassified = run(alice(&repo).args(["publish", "origin", "--confirm-negations"]));
+    assert_eq!(undeclassified.code, Some(1), "{}", undeclassified.stderr);
+    assert!(undeclassified.stderr.contains("--declassify"), "{}", undeclassified.stderr);
+    assert_eq!(snapshot_files(&remote), before_refuse, "refusal wrote the remote");
+    let confirmed = expect_ok(alice(&repo).args([
+        "publish",
+        "origin",
+        "--confirm-negations",
+        "--declassify",
+        ".env",
+    ]));
     let sealed = sealed_names(&confirmed);
     assert!(!sealed.iter().any(|name| name == ".env"), "{confirmed}");
     assert!(

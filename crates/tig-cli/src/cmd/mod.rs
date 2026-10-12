@@ -294,6 +294,7 @@ pub fn run() -> Result<()> {
             revision,
             acknowledge_leaked,
             confirm_negations,
+            declassify,
         } => publish::run(
             repository,
             remote,
@@ -301,6 +302,7 @@ pub fn run() -> Result<()> {
             revision,
             acknowledge_leaked,
             confirm_negations,
+            declassify,
         )?,
         Cmd::Fetch { remote } => fetch::run(repository, remote)?,
         Cmd::Clone { path, dir } => clone::run(repository, path, dir)?,
@@ -456,6 +458,10 @@ enum Cmd {
         /// Publish paths a `!` rule makes public
         #[arg(long)]
         confirm_negations: bool,
+        /// Publish this path in the clear although its bytes were private
+        /// before (repeatable)
+        #[arg(long, value_name = "PATH")]
+        declassify: Vec<String>,
     },
     /// Fetch bookmarks from a remote
     Fetch {
