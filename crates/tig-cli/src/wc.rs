@@ -775,6 +775,7 @@ impl WorkingCopy {
                     stats.scanned += 1;
                     warnings.push(warning);
                 }
+                #[cfg(windows)]
                 Outcome::Blocked(warning, keep) => {
                     stats.scanned += 1;
                     warnings.push(warning);
@@ -1221,6 +1222,7 @@ fn ensure_file_leaf(leaf: Option<&Leaf>, path: &RepoPath) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn path_name_block(path: &RepoPath) -> Option<&'static str> {
     path.components().find_map(windows_name_block)
 }
@@ -1612,6 +1614,7 @@ enum Outcome {
     /// Not a usable path or file; the warning says why.
     Skipped(String),
     /// A Windows-reserved name: skipped, but still tracked if it was before.
+    #[cfg(windows)]
     Blocked(String, Option<RepoPath>),
     /// The stat cache vouches for it.
     Unchanged(RepoPath),
