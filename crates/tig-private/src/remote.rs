@@ -5,6 +5,7 @@
 //!   remote-id
 //!   keyring
 //!   refs
+//!   manifest          signed: refs, packs, sequence (see manifest.rs)
 //!   objects/          public objects only (a DiskStore)
 //!   packs/<group>/<epoch>/<pack-id>.pack
 //! ```
@@ -29,6 +30,7 @@ use crate::pack::Pack;
 const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
 const MAX_KEYRING_FILE: u64 = 64 * 1024 * 1024;
 const MAX_REFS_FILE: u64 = 16 * 1024 * 1024;
+const MAX_MANIFEST_FILE: u64 = 256 * 1024 * 1024;
 const MAX_LISTED_PACKS: usize = 100_000;
 const MAX_REFS: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
@@ -226,6 +228,22 @@ impl DirRemote {
     pub fn write_refs(&self, refs: &BTreeMap<String, ObjectId>) -> Result<(), RemoteError> {
         let bytes = encode_refs(refs)?;
         atomic_write(&self.root, &self.root.join("refs"), &bytes, true)
+    }
+
+    /// The signed publish manifest, or `None` before the first publish.
+    pub fn read_manifest(&self) -> Result<Option<Vec<u8>>, RemoteError> {
+        match read_limited(&self.root.join("manifest"), MAX_MANIFEST_FILE) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn write_manifest(&self, bytes: &[u8]) -> Result<(), RemoteError> {
+        if bytes.len() as u64 > MAX_MANIFEST_FILE {
+            return Err(RemoteError::Invalid("manifest is too large".into()));
+        }
+        atomic_write(&self.root, &self.root.join("manifest"), bytes, true)
     }
 }
 

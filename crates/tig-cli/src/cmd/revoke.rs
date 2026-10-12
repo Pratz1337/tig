@@ -19,6 +19,15 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String, token: String)
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
     let mut bundle = super::remote::load_owner(&cfg, &identity)?;
+    // The revoked member may have signed the current manifest.
+    if let Some(sequence) = tig_private::manifest::resign_as_owner(
+        &bundle.remote,
+        &identity,
+        &bundle.keyring,
+        bundle.state.manifest_seq,
+    )? {
+        bundle.state.manifest_seq = sequence;
+    }
     bundle
         .keyring
         .revoke(&mut bundle.keys, &identity, &member)?;

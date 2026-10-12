@@ -123,6 +123,12 @@ impl From<tig_private::remote::RemoteError> for CliError {
     }
 }
 
+impl From<tig_private::manifest::ManifestError> for CliError {
+    fn from(err: tig_private::manifest::ManifestError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
 impl From<tig_private::keys::KeyError> for CliError {
     fn from(err: tig_private::keys::KeyError) -> Self {
         CliError::msg(err.to_string())

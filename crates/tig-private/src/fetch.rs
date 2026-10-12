@@ -1,7 +1,10 @@
 //! Fetch a directory remote and rebuild local history.
 //!
 //! The first successful fetch pins the keyring owner's signing key (TOFU).
-//! Later fetches refuse a different owner or an older head counter. Public
+//! Later fetches refuse a different owner or an older head counter. Refs come
+//! only from the signed publish manifest (see `manifest.rs`), which also
+//! lists every sealed pack; a member must find each listed pack of an epoch
+//! they hold, so a withheld pack is an error, not a quiet sealed gap. Public
 //! objects are copied and checked by the remote's store. A member opens the
 //! packs for epochs they still hold, then replaces sealed entries whose
 //! records they have. An outsider keeps those entries sealed. See DESIGN.md
@@ -22,11 +25,12 @@ use tig_core::{EntryKind, ObjectId, RepoPath};
 
 use crate::keyring::{Keyring, KeyringError, VerifiedKeyring};
 use crate::keys::{Identity, KeyError};
+use crate::manifest::{pack_id, Manifest, ManifestError};
 use crate::pack::{Pack, PackError, SealedRecord};
 use crate::project::PRIVATE_GROUP;
 use crate::remote::{DirRemote, RemoteError};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_STORED_REVISIONS: usize = 1_000_000;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_ENTRIES: usize = 1_000_000;
@@ -45,6 +49,14 @@ pub enum FetchError {
     Pack(#[from] PackError),
     #[error(transparent)]
     Key(#[from] KeyError),
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    /// The signed manifest lists packs for an epoch this member holds, but
+    /// the remote does not serve them (or serves them without their records).
+    #[error(
+        "the remote is missing {missing} sealed pack(s) of epoch {epoch} that its signed manifest lists; it may be withholding private history"
+    )]
+    WithheldPack { epoch: u64, missing: usize },
     #[error("remote is too large to fetch")]
     TooLarge,
     #[error("{0}")]
@@ -63,6 +75,8 @@ pub struct FetchState {
     /// Highest keyring counter this state has accepted.
     pub counter: u64,
     pub revisions: BTreeMap<ObjectId, ObjectId>,
+    /// Highest publish manifest sequence accepted (rollback floor).
+    pub manifest_seq: u64,
 }
 
 impl Default for FetchState {
@@ -79,6 +93,7 @@ impl FetchState {
             owner_signing: None,
             counter: 0,
             revisions: BTreeMap::new(),
+            manifest_seq: 0,
         }
     }
 
@@ -102,13 +117,14 @@ impl FetchState {
             w.id(public);
             w.id(internal);
         }
+        w.varint(self.manifest_seq);
         Ok(w.finish())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         let mut r = Reader::new(bytes, "fetch state");
         let version = r.u8()?;
-        if version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(FetchError::Invalid(format!(
                 "unsupported fetch state version {version}"
             )));
@@ -142,12 +158,15 @@ impl FetchState {
             previous = Some(public);
             revisions.insert(public, internal);
         }
+        // Version 1 predates publish manifests.
+        let manifest_seq = if version >= 2 { r.varint()? } else { 0 };
         r.finish()?;
         Ok(FetchState {
             remote_id,
             owner_signing,
             counter,
             revisions,
+            manifest_seq,
         })
     }
 }
@@ -195,8 +214,9 @@ impl Budget {
 /// An empty `state` pins the keyring owner. A saved pin is checked, and a
 /// head older than `state.counter` is refused, before any object is copied.
 /// `identity` opens packs for epochs that still grant it; `None`, or an
-/// identity with no grant, leaves sealed entries sealed. Missing pack bytes
-/// for a grant that should open are an error. Not being a member is not.
+/// identity with no grant, leaves sealed entries sealed. A pack the signed
+/// manifest lists for an epoch the identity holds must be present. Not being
+/// a member is not an error.
 pub fn fetch(
     remote: &DirRemote,
     store: &dyn Store,
@@ -211,8 +231,17 @@ pub fn fetch(
     }
     let (pin, newly_pinned) = resolve_pin(state, remote.remote_id(), &keyring)?;
     let verified = keyring.verify(&pin, state.counter)?;
+    let manifest = match remote.read_manifest()? {
+        Some(bytes) => Manifest::decode(&bytes)?,
+        None => {
+            return Err(FetchError::Invalid(
+                "the remote has no signed publish manifest; nothing is published yet".into(),
+            ))
+        }
+    };
+    manifest.verify(remote.remote_id(), &keyring, state.manifest_seq)?;
 
-    let refs = remote.read_refs()?;
+    let refs = manifest.refs.clone();
     let tips: Vec<ObjectId> = refs.values().copied().collect();
     let mut budget = Budget {
         objects: 0,
@@ -220,7 +249,15 @@ pub fn fetch(
         bytes: 0,
     };
     let order = copy_history(remote.public_store(), store, &tips, &mut budget)?;
-    let records = open_member_packs(remote, store, &keyring, &verified, identity, &mut budget)?;
+    let records = open_member_packs(
+        remote,
+        store,
+        &keyring,
+        &verified,
+        &manifest,
+        identity,
+        &mut budget,
+    )?;
 
     let mut mapped = state.revisions.clone();
     let mut built = BTreeMap::new();
@@ -242,6 +279,7 @@ pub fn fetch(
     state.remote_id = remote.remote_id();
     state.owner_signing = Some(pin);
     state.counter = verified.counter();
+    state.manifest_seq = manifest.sequence;
     state.revisions.extend(built);
     Ok(FetchReport {
         refs: reported,
@@ -295,6 +333,7 @@ fn open_member_packs(
     store: &dyn Store,
     keyring: &Keyring,
     verified: &VerifiedKeyring,
+    manifest: &Manifest,
     identity: Option<&Identity>,
     budget: &mut Budget,
 ) -> Result<BTreeMap<SealedId, SealedRecord>, FetchError> {
@@ -309,9 +348,24 @@ fn open_member_packs(
             Err(KeyringError::NotMember) => continue,
             Err(error) => return Err(error.into()),
         };
+        // Packs the manifest lists for this epoch, and the sealed records
+        // each must carry. Unlisted packs are still read.
+        let mut expected: BTreeMap<[u8; 32], &BTreeSet<SealedId>> = manifest
+            .packs
+            .iter()
+            .filter(|(_, entry)| entry.group == PRIVATE_GROUP && entry.epoch == epoch)
+            .map(|(id, entry)| (*id, &entry.sealed))
+            .collect();
         for bytes in remote.list_packs(PRIVATE_GROUP, epoch)? {
             budget.bytes(bytes.len())?;
             let opened = Pack::open(&bytes, &key)?;
+            if let Some(listed) = expected.remove(&pack_id(&bytes)) {
+                let carried: BTreeSet<SealedId> =
+                    opened.sealed.iter().map(|record| record.sealed_id).collect();
+                if !listed.is_subset(&carried) {
+                    return Err(FetchError::WithheldPack { epoch, missing: 1 });
+                }
+            }
             for (kind, id, body) in opened.objects {
                 budget.bytes(body.len())?;
                 if !matches!(kind, ObjectKind::Blob | ObjectKind::Tree) {
@@ -335,6 +389,9 @@ fn open_member_packs(
             for record in opened.sealed {
                 remember(budget, &mut records, record)?;
             }
+        }
+        if !expected.is_empty() {
+            return Err(FetchError::WithheldPack { epoch, missing: expected.len() });
         }
     }
     Ok(records)
@@ -828,6 +885,7 @@ mod tests {
         state.counter = 4;
         state.revisions.insert(ObjectId([3; 32]), ObjectId([7; 32]));
         state.revisions.insert(ObjectId([4; 32]), ObjectId([8; 32]));
+        state.manifest_seq = 5;
         let bytes = state.encode().unwrap();
         assert_eq!(FetchState::decode(&bytes).unwrap(), state);
 
@@ -836,7 +894,7 @@ mod tests {
         assert!(FetchState::decode(&trailing).is_err());
 
         let mut bad_version = bytes.clone();
-        bad_version[0] = 2;
+        bad_version[0] = 3;
         assert!(matches!(
             FetchState::decode(&bad_version),
             Err(FetchError::Invalid(ref reason)) if reason.contains("version")

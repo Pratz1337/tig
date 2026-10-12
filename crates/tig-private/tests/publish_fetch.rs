@@ -15,6 +15,7 @@ use tig_core::{EntryKind, MemoryStore, ObjectId, RepoPath};
 use tig_private::fetch::{fetch, FetchError, FetchReport, FetchState};
 use tig_private::keyring::{Keyring, KeyringError, OwnerKeys};
 use tig_private::keys::Identity;
+use tig_private::manifest::{Manifest, ManifestError};
 use tig_private::publish::{publish, PublishError, PublishOptions, PublishReport, PublishState};
 use tig_private::remote::DirRemote;
 
@@ -191,6 +192,14 @@ fn public_kind(remote: &DirRemote, path: &str) -> EntryKind {
     let id = remote.read_refs().unwrap()["main"];
     let tree = remote.public_store().get_revision(&id).unwrap().tree;
     kind_at(remote.public_store(), tree, path).unwrap()
+}
+
+/// Points `main` at `id` the way publish does: refs plus a signed manifest.
+fn sign_main(remote: &DirRemote, owner: &Identity, id: ObjectId) {
+    let refs = BTreeMap::from([("main".to_string(), id)]);
+    remote.write_refs(&refs).unwrap();
+    let manifest = Manifest::signed(remote.remote_id(), 1, refs, BTreeMap::new(), owner).unwrap();
+    remote.write_manifest(&manifest.encode().unwrap()).unwrap();
 }
 
 fn grant(remote: &DirRemote, keys: &OwnerKeys, owner: &Identity, member: &Identity) {
@@ -667,7 +676,7 @@ fn incremental_republish_writes_only_new_objects() {
 
     let after = files_of(dir.path());
     for (path, bytes) in &before {
-        if path == Path::new("refs") {
+        if path == Path::new("refs") || path == Path::new("manifest") {
             continue;
         }
         assert_eq!(after.get(path).unwrap(), bytes, "{}", path.display());
@@ -1148,9 +1157,7 @@ fn malformed_keyrings_refs_and_portable_path_tricks_leave_fetch_state_unchanged(
         let mut rev = tig_core::repo::root_revision();
         rev.tree = tree_id;
         let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
-        remote
-            .write_refs(&BTreeMap::from([("main".into(), id)]))
-            .unwrap();
+        sign_main(&remote, &owner, id);
         let mut state = FetchState::new();
         assert!(
             fetch(&remote, &MemoryStore::new(), None, &mut state).is_err(),
@@ -1180,11 +1187,10 @@ fn authenticated_seal_with_a_missing_target_is_refused() {
     let mut rev = tig_core::repo::root_revision();
     rev.tree = tree_id;
     let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
-    remote
-        .write_refs(&BTreeMap::from([("main".into(), id)]))
-        .unwrap();
+    sign_main(&remote, &owner, id);
     let mut state = FetchState::new();
-    assert!(fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).is_err());
+    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).unwrap_err();
+    assert!(err.to_string().contains("sealed target"), "{err}");
     assert_eq!(state, FetchState::new());
 }
 
@@ -1226,7 +1232,7 @@ fn public_rules_can_disclose_a_name_inside_a_sealed_root() {
 }
 
 #[test]
-fn withheld_packs_are_currently_indistinguishable_from_foreign_seals() {
+fn withheld_pack_is_an_error_for_members_and_invisible_to_outsiders() {
     let mut repo = repo();
     let rev = save(&mut repo, &[(".env", ENV)], &[]);
     let owner = Identity::generate().unwrap();
@@ -1244,9 +1250,189 @@ fn withheld_packs_are_currently_indistinguishable_from_foreign_seals() {
     for entry in std::fs::read_dir(dir.path().join("packs/private/1")).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
-    let (_store, report) = fetch_new(&remote, Some(&owner), &mut FetchState::new()).unwrap();
-    assert_eq!(report.unsealed, 0);
+    // The signed manifest lists the pack, so a member can tell a withheld
+    // pack from a seal they were never meant to open.
+    let mut state = FetchState::new();
+    let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).unwrap_err();
+    assert!(
+        matches!(err, FetchError::WithheldPack { epoch: 1, missing: 1 }),
+        "{err}"
+    );
+    assert_eq!(state, FetchState::new());
+    // An outsider holds no epoch, so nothing is expected of them.
+    let (_store, report) = fetch_new(&remote, None, &mut FetchState::new()).unwrap();
     assert_eq!(report.still_sealed, 1);
+}
+
+#[test]
+fn manifest_signs_refs_and_refuses_tampering_and_rollback() {
+    let mut repo = repo();
+    let rev1 = save(&mut repo, &[("src/main.rs", MAIN)], &[]);
+    let owner = Identity::generate().unwrap();
+    let carol = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([30; 16]);
+    let mut state = PublishState::new();
+    let report = publish_at(
+        &repo,
+        &remote,
+        &owner,
+        None,
+        &mut state,
+        rev1,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let keys = report.new_owner_keys.unwrap();
+    let first_manifest = remote.read_manifest().unwrap().unwrap();
+    let first_refs = std::fs::read(dir.path().join("refs")).unwrap();
+    let rev2 = save_child(&mut repo, &[("src/main.rs", MAIN_V2)], &[]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        rev2,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(state.manifest_seq, 2);
+
+    let mut fetched = FetchState::new();
+    let (store, report) = fetch_new(&remote, None, &mut fetched).unwrap();
+    assert_eq!(fetched.manifest_seq, 2);
+    let tip2 = tip(&report);
+    assert_eq!(file_at(&store, store.get_revision(&tip2).unwrap().tree, "src/main.rs"), MAIN_V2);
+
+    // The unsigned refs file is ignored: an old one cannot hide history.
+    std::fs::write(dir.path().join("refs"), &first_refs).unwrap();
+    let (_store, report) = fetch_new(&remote, None, &mut fetched.clone()).unwrap();
+    assert_eq!(tip(&report), tip2);
+
+    // Tampered bytes fail the signature.
+    let current = remote.read_manifest().unwrap().unwrap();
+    let mut tampered = current.clone();
+    let at = tampered.len() - 70;
+    tampered[at] ^= 1;
+    remote.write_manifest(&tampered).unwrap();
+    let saved = fetched.clone();
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut fetched).is_err());
+    assert_eq!(fetched, saved);
+
+    // A non-member's signature is refused even over the right content.
+    let honest = Manifest::decode(&current).unwrap();
+    let forged = Manifest::signed(honest.remote, 9, honest.refs.clone(), honest.packs.clone(), &carol).unwrap();
+    remote.write_manifest(&forged.encode().unwrap()).unwrap();
+    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched).unwrap_err();
+    assert!(matches!(err, FetchError::Manifest(ManifestError::BadSignature)), "{err}");
+
+    // An older genuine manifest is a rollback for fetch and for publish.
+    remote.write_manifest(&first_manifest).unwrap();
+    let err = fetch(&remote, &MemoryStore::new(), None, &mut fetched).unwrap_err();
+    assert!(
+        matches!(err, FetchError::Manifest(ManifestError::RolledBack { found: 1, seen: 2 })),
+        "{err}"
+    );
+    assert_eq!(fetched, saved);
+    let before = state.clone();
+    let err = publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        rev2,
+        &PublishOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, PublishError::Manifest(ManifestError::RolledBack { .. })), "{err}");
+    assert_eq!(state, before);
+
+    // Deleting the manifest does not reset a publisher that has seen one.
+    std::fs::remove_file(dir.path().join("manifest")).unwrap();
+    assert!(publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        rev2,
+        &PublishOptions::default(),
+    )
+    .is_err());
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new()).is_err());
+}
+
+#[test]
+fn member_publishes_and_revoke_resigns_the_manifest_as_owner() {
+    let mut repo = repo();
+    let rev1 = save(&mut repo, &[(".env", ENV), ("src/main.rs", MAIN)], &[]);
+    let alice = Identity::generate().unwrap();
+    let bob = Identity::generate().unwrap();
+    let (_dir, remote) = remote_at([31; 16]);
+    let mut alice_state = PublishState::new();
+    let report = publish_at(
+        &repo,
+        &remote,
+        &alice,
+        None,
+        &mut alice_state,
+        rev1,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let mut keys = report.new_owner_keys.unwrap();
+    grant(&remote, &keys, &alice, &bob);
+
+    // Bob, a member of the current epoch, may publish and sign.
+    let rev2 = save_child(&mut repo, &[(".env", ENV_V2)], &[]);
+    let mut bob_state = PublishState::new();
+    bob_state.remote_id = remote.remote_id();
+    bob_state.owner_signing = Some(alice.public().signing);
+    publish_at(
+        &repo,
+        &remote,
+        &bob,
+        None,
+        &mut bob_state,
+        rev2,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let bobs = Manifest::decode(&remote.read_manifest().unwrap().unwrap()).unwrap();
+    assert_eq!(bobs.publisher, bob.public().signing);
+    assert_eq!(bobs.packs.len(), 2);
+    let (_store, report) = fetch_new(&remote, Some(&alice), &mut FetchState::new()).unwrap();
+    assert!(report.unsealed > 0);
+
+    // Revoking Bob would orphan his signature, so the owner re-signs first.
+    let old = Keyring::decode(&remote.read_keyring().unwrap()).unwrap();
+    let mut new = old.clone();
+    new.revoke(&mut keys, &alice, &bob.public()).unwrap();
+    assert!(matches!(
+        bobs.verify(remote.remote_id(), &new, 0),
+        Err(ManifestError::BadSignature)
+    ));
+    let sequence = tig_private::manifest::resign_as_owner(&remote, &alice, &old, bobs.sequence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sequence, bobs.sequence + 1);
+    remote.write_keyring(&new.encode().unwrap()).unwrap();
+    let (_store, report) = fetch_new(&remote, Some(&alice), &mut FetchState::new()).unwrap();
+    assert!(report.unsealed > 0);
+
+    // Bob can no longer publish a manifest anyone accepts.
+    let rev3 = save_child(&mut repo, &[("src/main.rs", MAIN_V2)], &[]);
+    assert!(publish_at(
+        &repo,
+        &remote,
+        &bob,
+        None,
+        &mut bob_state,
+        rev3,
+        &PublishOptions::default(),
+    )
+    .is_err());
 }
 
 #[test]

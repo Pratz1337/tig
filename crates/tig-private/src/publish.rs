@@ -20,17 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use tig_core::encode::{Reader, Writer};
 use tig_core::object::{hash_object, Object, ObjectKind, Tree};
 use tig_core::repo::{root_revision, root_revision_id};
+use tig_core::seal::SealedId;
 use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{Leaf, MAX_TREE_DEPTH};
 use tig_core::{EntryKind, ObjectId, RepoPath};
 
 use crate::keyring::{Keyring, KeyringError, OwnerKeys};
 use crate::keys::{EpochKey, Identity, KeyError, WireId};
+use crate::manifest::{pack_id, Manifest, ManifestError, PackEntry};
 use crate::pack::{PackBuilder, PackError};
 use crate::project::{project_tree, public_revision, Projection, SealedRoot, PRIVATE_GROUP};
 use crate::remote::{DirRemote, RemoteError};
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_PATHS: usize = 1_000_000;
 const MAX_WIRES: usize = 1_000_000;
@@ -50,6 +52,8 @@ pub enum PublishError {
     Keyring(#[from] KeyringError),
     #[error(transparent)]
     Remote(#[from] RemoteError),
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
     #[error(transparent)]
     Pack(#[from] PackError),
     #[error(transparent)]
@@ -125,6 +129,8 @@ pub struct PublishState {
     pub ever_private: BTreeSet<ObjectId>,
     /// Blobs the user explicitly declassified with `declassify`.
     pub declassified: BTreeSet<ObjectId>,
+    /// Highest publish manifest sequence seen or written (rollback floor).
+    pub manifest_seq: u64,
 }
 
 impl Default for PublishState {
@@ -146,6 +152,7 @@ impl PublishState {
             sent: BTreeMap::new(),
             ever_private: BTreeSet::new(),
             declassified: BTreeSet::new(),
+            manifest_seq: 0,
         }
     }
 
@@ -189,13 +196,14 @@ impl PublishState {
         }
         write_ids(&mut w, &self.ever_private)?;
         write_ids(&mut w, &self.declassified)?;
+        w.varint(self.manifest_seq);
         Ok(w.finish())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PublishError> {
         let mut r = Reader::new(bytes, "publish state");
         let version = r.u8()?;
-        if version != VERSION && version != 1 {
+        if !(1..=VERSION).contains(&version) {
             return Err(PublishError::Invalid(format!(
                 "unsupported publish state version {version}"
             )));
@@ -275,6 +283,8 @@ impl PublishState {
         } else {
             (BTreeSet::new(), BTreeSet::new())
         };
+        // Version 3 adds the manifest floor.
+        let manifest_seq = if version >= 3 { r.varint()? } else { 0 };
         r.finish()?;
         Ok(PublishState {
             remote_id,
@@ -286,6 +296,7 @@ impl PublishState {
             sent,
             ever_private,
             declassified,
+            manifest_seq,
         })
     }
 }
@@ -316,6 +327,8 @@ struct Session {
     pin: [u8; 32],
     /// Keyring not yet written. Held until refusal checks have passed.
     fresh: Option<Keyring>,
+    /// The verified keyring (or `fresh`), for manifest signers.
+    keyring: Keyring,
 }
 
 /// Publishes `rev` and its unpublished ancestors to `remote` under `bookmark`.
@@ -359,8 +372,14 @@ pub fn publish(
             description: revision.description,
         });
     }
+    let previous = read_manifest(remote, &session.keyring, state.manifest_seq)?;
+    let mut refs = match &previous {
+        Some(manifest) => manifest.refs.clone(),
+        // Remotes from before manifests: the unsigned refs file.
+        None => remote.read_refs()?,
+    };
     let mut ever_public = state.ever_public.clone();
-    ever_public.extend(remote_public_paths(remote)?);
+    ever_public.extend(remote_public_paths(remote, &refs)?);
     let checked = check_refusals(state, &ever_public, &plans, options)?;
 
     let mut written = 0usize;
@@ -398,16 +417,33 @@ pub fn publish(
         public_ids.insert(plan.internal, public_id);
     }
 
-    let (sealed_objects, sealed_roots, new_wires) =
+    let (sealed_objects, sealed_roots, new_wires, pack) =
         write_pack(store, remote, &session.epoch_key, state, &plans)?;
 
     let tip = public_parent(&public_ids, rev)?;
-    let mut refs = remote.read_refs()?;
     refs.insert(bookmark.to_string(), tip);
     remote.write_refs(&refs)?;
 
+    // Last: the signed manifest makes the refs and the new pack official.
     let epoch = session.epoch_key.context().epoch;
     let group = session.epoch_key.context().group.clone();
+    let mut packs = previous.as_ref().map(|m| m.packs.clone()).unwrap_or_default();
+    if let Some((id, sealed)) = pack {
+        packs
+            .entry(id)
+            .or_insert_with(|| PackEntry { group: group.clone(), epoch, sealed: BTreeSet::new() })
+            .sealed
+            .extend(sealed);
+    }
+    let sequence = previous
+        .as_ref()
+        .map_or(0, |m| m.sequence)
+        .max(state.manifest_seq)
+        .checked_add(1)
+        .ok_or_else(|| PublishError::Invalid("manifest sequence overflow".into()))?;
+    let manifest = Manifest::signed(remote.remote_id(), sequence, refs, packs, identity)?;
+    remote.write_manifest(&manifest.encode()?)?;
+
     state.remote_id = remote.remote_id();
     state.owner_signing = Some(session.pin);
     state.counter = session.counter;
@@ -420,6 +456,7 @@ pub fn publish(
     state.confirmed_negations.extend(checked.confirmed);
     state.ever_private.extend(checked.new_private);
     state.declassified.extend(checked.new_declassified);
+    state.manifest_seq = sequence;
     if !new_wires.is_empty() {
         state
             .sent
@@ -477,6 +514,26 @@ fn metadata_mentions(store: &dyn Store, plans: &[Plan]) -> Result<Vec<String>, P
     })
 }
 
+/// The remote's manifest, verified against `keyring`. Missing is fine only
+/// for a state that has never seen one (a new or pre-manifest remote).
+fn read_manifest(
+    remote: &DirRemote,
+    keyring: &Keyring,
+    min_sequence: u64,
+) -> Result<Option<Manifest>, PublishError> {
+    match remote.read_manifest()? {
+        Some(bytes) => {
+            let manifest = Manifest::decode(&bytes)?;
+            manifest.verify(remote.remote_id(), keyring, min_sequence)?;
+            Ok(Some(manifest))
+        }
+        None if min_sequence > 0 => Err(PublishError::Invalid(
+            "the remote's publish manifest is missing, but this state has seen one".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
 fn open_session(
     remote: &DirRemote,
     identity: &Identity,
@@ -514,6 +571,7 @@ fn open_session(
                 epoch_key,
                 counter: keyring.head.counter,
                 pin,
+                keyring: keyring.clone(),
                 fresh: Some(keyring),
             })
         }
@@ -557,6 +615,7 @@ fn open_session(
                 counter: verified.counter(),
                 pin,
                 fresh: None,
+                keyring,
             })
         }
     }
@@ -678,8 +737,11 @@ struct Checked {
 
 /// A different publisher or branch may have exposed a path before this
 /// caller's state existed. Include the remote's reachable public history.
-fn remote_public_paths(remote: &DirRemote) -> Result<BTreeSet<RepoPath>, PublishError> {
-    let tips: Vec<_> = remote.read_refs()?.values().copied().collect();
+fn remote_public_paths(
+    remote: &DirRemote,
+    refs: &BTreeMap<String, ObjectId>,
+) -> Result<BTreeSet<RepoPath>, PublishError> {
+    let tips: Vec<_> = refs.values().copied().collect();
     let store = remote.public_store();
     let revisions = parent_first(store, &tips, |id| id == root_revision_id())?;
     let mut paths = BTreeSet::new();
@@ -973,7 +1035,7 @@ fn write_pack(
     key: &EpochKey,
     state: &PublishState,
     plans: &[Plan],
-) -> Result<(usize, usize, BTreeSet<WireId>), PublishError> {
+) -> Result<WrittenPack, PublishError> {
     let epoch = key.context().epoch;
     let already = state
         .sent
@@ -984,9 +1046,10 @@ fn write_pack(
     let mut added: BTreeSet<ObjectId> = BTreeSet::new();
     let mut new_wires = BTreeSet::new();
     let mut sealed_roots = 0usize;
+    let mut sealed_ids = BTreeSet::new();
     for plan in plans {
         for root in &plan.projection.sealed {
-            seal_root(
+            let sealed_id = seal_root(
                 store,
                 key,
                 root,
@@ -995,17 +1058,22 @@ fn write_pack(
                 &mut new_wires,
                 &mut builder,
             )?;
+            sealed_ids.insert(sealed_id);
             sealed_roots += 1;
         }
     }
     let sealed_objects = new_wires.len();
     if sealed_objects == 0 && sealed_roots == 0 {
-        return Ok((0, 0, new_wires));
+        return Ok((0, 0, new_wires, None));
     }
     let bytes = builder.finish()?;
     remote.put_pack(&bytes)?;
-    Ok((sealed_objects, sealed_roots, new_wires))
+    Ok((sealed_objects, sealed_roots, new_wires, Some((pack_id(&bytes), sealed_ids))))
 }
+
+/// Sealed objects, sealed roots, new wire ids, and the pack written (its id
+/// and the sealed ids it carries records for).
+type WrittenPack = (usize, usize, BTreeSet<WireId>, Option<([u8; 32], BTreeSet<SealedId>)>);
 
 fn seal_root(
     store: &dyn Store,
@@ -1015,7 +1083,7 @@ fn seal_root(
     added: &mut BTreeSet<ObjectId>,
     new_wires: &mut BTreeSet<WireId>,
     builder: &mut PackBuilder<'_>,
-) -> Result<(), PublishError> {
+) -> Result<SealedId, PublishError> {
     let sealed_id = key.seal(&root.path, root.leaf.kind(), &root.leaf.id());
     builder.add_sealed(
         sealed_id,
@@ -1070,7 +1138,7 @@ fn seal_root(
             EntryKind::Sealed => {}
         }
     }
-    Ok(())
+    Ok(sealed_id)
 }
 
 #[allow(clippy::too_many_arguments)]
