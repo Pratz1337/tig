@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use super::{CliError, Result};
 use crate::ui;
 
-pub(super) fn run(_repository: Option<&Path>, source: PathBuf, dir: PathBuf) -> Result<()> {
+pub(super) fn run(_repository: Option<&Path>, source: &str, dir: PathBuf) -> Result<()> {
     ensure_fresh_dir(&dir)?;
     // Ignore global `-R`: the new repo is `dir`, not the caller's checkout.
     super::init::run(None, Some(dir.clone()))?;
-    super::remote::add(Some(&dir), "origin", &source)?;
+    super::remote::add(Some(&dir), "origin", source)?;
     super::fetch::run(Some(&dir), "origin".to_string())?;
     let spec = checkout_spec(&dir)?;
     super::new_change::run(Some(&dir), vec![spec], None)

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use tig_private::fetch::FetchState;
 use tig_private::keyring::{Keyring, OwnerKeys};
+use tig_private::keys::Identity;
 use tig_private::publish::PublishState;
-use tig_private::remote::{DirRemote, RemoteError};
+use tig_private::remote::{DirRemote, Remote, RemoteError};
+use tig_remote_http::HttpRemote;
 
 use super::workspace;
 use super::{CliError, Result};
@@ -15,12 +17,39 @@ use crate::ui;
 pub(super) struct RemoteCfg {
     pub name: String,
     pub dir: PathBuf,
-    pub path: PathBuf,
+    pub location: Location,
+}
+
+/// Where a remote lives. A directory remote keeps its path in
+/// `.tig/remotes/<name>/path`, as it always has; a server remote keeps its URL
+/// in `.tig/remotes/<name>/url` instead.
+pub(super) enum Location {
+    Dir(PathBuf),
+    Url(String),
+}
+
+impl Location {
+    /// Anything with a scheme is a URL. The HTTP client refuses schemes other
+    /// than https, and plain http to anything but loopback.
+    fn parse(text: &str) -> Result<Location> {
+        if text.contains("://") {
+            Ok(Location::Url(text.trim().to_string()))
+        } else {
+            Ok(Location::Dir(absolute_path(Path::new(text))?))
+        }
+    }
+
+    fn show(&self) -> String {
+        match self {
+            Location::Dir(path) => ui::show_path(path),
+            Location::Url(url) => url.clone(),
+        }
+    }
 }
 
 /// Owner material for grant and revoke. The identity stays with the caller.
 pub(super) struct OwnerBundle {
-    pub remote: DirRemote,
+    pub remote: Box<dyn Remote>,
     #[allow(dead_code)]
     pub keyring: Keyring,
     pub keys: OwnerKeys,
@@ -29,13 +58,13 @@ pub(super) struct OwnerBundle {
 
 pub(super) fn run(repository: Option<&Path>, action: super::RemoteAction) -> Result<()> {
     match action {
-        super::RemoteAction::Add { name, path } => add(repository, &name, &path),
+        super::RemoteAction::Add { name, location } => add(repository, &name, &location),
         super::RemoteAction::List => list(repository),
         super::RemoteAction::Remove { name } => remove(repository, &name),
     }
 }
 
-pub(super) fn add(repository: Option<&Path>, name: &str, path: &Path) -> Result<()> {
+pub(super) fn add(repository: Option<&Path>, name: &str, location: &str) -> Result<()> {
     validate_name(name)?;
     let (mut session, before) = super::open_ready(repository)?;
     let tig = workspace::main_tig_dir(session.wc.root())?;
@@ -43,13 +72,23 @@ pub(super) fn add(repository: Option<&Path>, name: &str, path: &Path) -> Result<
     if dir.try_exists()? {
         return Err(CliError::msg(format!("remote {name} already exists")));
     }
-    let absolute = absolute_path(path)?;
-    fs::create_dir_all(&dir)?;
-    let text = path_text(&absolute)?;
-    if !super::disk::write_new(&dir.join("path"), text.as_bytes(), false)? {
+    let cfg = RemoteCfg {
+        name: name.to_string(),
+        dir,
+        location: Location::parse(location)?,
+    };
+    let (file, text) = match &cfg.location {
+        Location::Dir(path) => ("path", path_text(path)?),
+        Location::Url(url) => {
+            let url = tig_remote_http::check_url(url)?;
+            ("url", format!("{url}\n"))
+        }
+    };
+    fs::create_dir_all(&cfg.dir)?;
+    if !super::disk::write_new(&cfg.dir.join(file), text.as_bytes(), false)? {
         return Err(CliError::msg(format!("remote {name} already exists")));
     }
-    println!("added remote {name} at {}", ui::show_path(&absolute));
+    println!("added remote {name} at {}", cfg.location.show());
     super::announce_if_moved(&mut session, before)
 }
 
@@ -75,7 +114,7 @@ fn list(repository: Option<&Path>) -> Result<()> {
                     continue;
                 }
                 let cfg = require(&tig, &name)?;
-                rows.push((cfg.name, cfg.path));
+                rows.push((cfg.name, cfg.location.show()));
             }
         }
     }
@@ -83,8 +122,8 @@ fn list(repository: Option<&Path>) -> Result<()> {
     if rows.is_empty() {
         println!("No remotes.");
     } else {
-        for (name, path) in rows {
-            println!("{name} {}", ui::show_path(&path));
+        for (name, location) in rows {
+            println!("{name} {location}");
         }
     }
     super::announce_if_moved(&mut session, before)
@@ -106,29 +145,83 @@ fn remove(repository: Option<&Path>, name: &str) -> Result<()> {
 pub(super) fn require(tig: &Path, name: &str) -> Result<RemoteCfg> {
     validate_name(name)?;
     let dir = tig.join("remotes").join(name);
-    let text = match fs::read_to_string(dir.join("path")) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CliError::msg(format!("no remote named {name}")));
-        }
-        Err(err) => {
-            return Err(CliError::msg(format!("cannot read remote {name}: {err}")));
-        }
+    // A `url` file names a server. Otherwise read the `path` file that
+    // every remote had before servers existed.
+    let location = match read_optional(&dir.join("url"))? {
+        Some(bytes) => Location::Url(config_text(name, bytes)?),
+        None => match read_optional(&dir.join("path"))? {
+            Some(bytes) => Location::Dir(PathBuf::from(config_text(name, bytes)?)),
+            None => return Err(CliError::msg(format!("no remote named {name}"))),
+        },
     };
-    let path = PathBuf::from(text.trim());
-    if path.as_os_str().is_empty() {
-        return Err(CliError::msg(format!("remote {name} has an empty path")));
-    }
     Ok(RemoteCfg {
         name: name.to_string(),
         dir,
-        path,
+        location,
     })
+}
+
+fn config_text(name: &str, bytes: Vec<u8>) -> Result<String> {
+    let text = String::from_utf8(bytes)
+        .map_err(|_| CliError::msg(format!("remote {name} is not valid text")))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(CliError::msg(format!(
+            "remote {name} has an empty location"
+        )));
+    }
+    Ok(text.to_string())
+}
+
+/// The one place a remote config becomes a connection. `create` makes a
+/// missing directory remote; a server remote is created by `tig-server
+/// init`. `identity` signs writes to a server; a directory ignores it.
+pub(super) fn connect(
+    cfg: &RemoteCfg,
+    identity: Option<&Identity>,
+    create: bool,
+) -> Result<Box<dyn Remote>> {
+    match &cfg.location {
+        Location::Dir(path) if create => Ok(Box::new(open_or_create(path)?)),
+        Location::Dir(path) => Ok(Box::new(open_existing(path)?)),
+        Location::Url(url) => {
+            // The client keeps its own copy of the identity for signing.
+            let identity = identity.map(|id| Identity::from_bytes(*id.to_bytes()));
+            match HttpRemote::connect(url, identity) {
+                Ok(remote) => Ok(Box::new(remote)),
+                Err(RemoteError::Io(err)) => {
+                    Err(CliError::msg(format!("cannot reach {url}: {err}")))
+                }
+                Err(err) => Err(CliError::msg(format!("remote {url}: {err}"))),
+            }
+        }
+    }
+}
+
+/// Says what a refused publish means before converting its typed error.
+pub(super) fn explain(cfg: &RemoteCfg, err: tig_private::publish::PublishError) -> CliError {
+    use tig_private::publish::PublishError;
+    let name = &cfg.name;
+    let denied = match &err {
+        PublishError::Remote(RemoteError::Denied(message)) => Some(message.as_str()),
+        PublishError::Keyring(tig_private::keyring::KeyringError::NotMember) => Some("you are not a member"),
+        PublishError::Invalid(message) if message == "you are not a member" => Some(message.as_str()),
+        _ => None,
+    };
+    if denied == Some("you are not a member") {
+        CliError::msg(format!(
+            "you are not a member of remote {name}; ask its owner to grant you access"
+        ))
+    } else if let Some(message) = denied {
+        CliError::msg(format!("remote {name} refused the signed request: {message}"))
+    } else {
+        err.into()
+    }
 }
 
 /// Opens a remote, creating the directory layout and a random id when it
 /// has none yet. Does not write a keyring.
-pub(super) fn open_or_create(path: &Path) -> Result<DirRemote> {
+fn open_or_create(path: &Path) -> Result<DirRemote> {
     match DirRemote::open(path) {
         Ok(remote) => Ok(remote),
         Err(RemoteError::Invalid(message)) if message == "remote-id is missing" => {
@@ -141,7 +234,7 @@ pub(super) fn open_or_create(path: &Path) -> Result<DirRemote> {
     }
 }
 
-pub(super) fn open_existing(path: &Path) -> Result<DirRemote> {
+fn open_existing(path: &Path) -> Result<DirRemote> {
     match DirRemote::open(path) {
         Ok(remote) => Ok(remote),
         Err(RemoteError::Invalid(message)) if message == "remote-id is missing" => {
@@ -155,12 +248,12 @@ pub(super) fn open_existing(path: &Path) -> Result<DirRemote> {
 }
 
 pub(super) fn load_publish_state(dir: &Path) -> Result<PublishState> {
-    Ok(load_states(dir)?.0)
+    Ok(load_states(dir, true)?.0)
 }
 
 /// Fetch, publish, grant and revoke share one owner pin and rollback floor.
 /// A head learned through one command must be trusted by the others.
-fn load_states(dir: &Path) -> Result<(PublishState, FetchState)> {
+fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchState)> {
     let mut published = match read_optional(&dir.join("publish-state"))? {
         None => Ok(PublishState::new()),
         Some(bytes) => PublishState::decode(&bytes)
@@ -187,7 +280,7 @@ fn load_states(dir: &Path) -> Result<(PublishState, FetchState)> {
             fetched.remote_id
         };
         let mut counter = published.counter.max(fetched.counter);
-        if let Some(bytes) = read_optional(&dir.join("pending-keyring"))? {
+        if let Some(bytes) = read_optional(&dir.join("pending-keyring"))?.filter(|_| pending_floor) {
             let pending = Keyring::decode(&bytes)?;
             if pending.remote != remote_id {
                 return Err(CliError::msg("pending keyring is for a different remote"));
@@ -201,6 +294,9 @@ fn load_states(dir: &Path) -> Result<(PublishState, FetchState)> {
         fetched.owner_signing = Some(pin);
         published.counter = counter;
         fetched.counter = counter;
+        let sequence = published.manifest_seq.max(fetched.manifest_seq);
+        published.manifest_seq = sequence;
+        fetched.manifest_seq = sequence;
     }
     Ok((published, fetched))
 }
@@ -211,7 +307,7 @@ pub(super) fn save_publish_state(dir: &Path, state: &PublishState) -> Result<()>
 }
 
 pub(super) fn load_fetch_state(dir: &Path) -> Result<FetchState> {
-    Ok(load_states(dir)?.1)
+    Ok(load_states(dir, true)?.1)
 }
 
 pub(super) fn save_fetch_state(dir: &Path, state: &FetchState) -> Result<()> {
@@ -239,27 +335,19 @@ pub(super) fn save_owner_keys(dir: &Path, keys: &OwnerKeys) -> Result<()> {
 }
 
 /// Loads the keyring, owner keys, and publish state, and checks the pin.
-pub(super) fn load_owner(
-    cfg: &RemoteCfg,
-    identity: &tig_private::keys::Identity,
-) -> Result<OwnerBundle> {
+pub(super) fn load_owner(cfg: &RemoteCfg, identity: &Identity) -> Result<OwnerBundle> {
     finish_keyring_update(cfg, identity)?;
-    let remote = open_existing(&cfg.path)?;
+    let remote = connect(cfg, Some(identity), false)?;
     let keys = load_owner_keys(&cfg.dir)?.ok_or_else(|| {
         CliError::msg("no owner keys for this remote; only the owner can grant or revoke")
     })?;
     if keys.remote != remote.remote_id() {
         return Err(CliError::msg("owner keys are for a different remote"));
     }
-    let bytes = match remote.read_keyring() {
-        Ok(bytes) => bytes,
-        Err(RemoteError::Invalid(message)) if message == "keyring is missing" => {
-            return Err(CliError::msg(
-                "this remote has no keyring yet; publish to it first",
-            ));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let bytes = remote
+        .read_head()?
+        .keyring
+        .ok_or_else(|| CliError::msg("this remote has no keyring yet; publish to it first"))?;
     let keyring = Keyring::decode(&bytes)?;
     if identity.public() != keyring.owner {
         return Err(CliError::msg(
@@ -284,16 +372,14 @@ pub(super) fn load_owner(
 
 /// Completes an interrupted owner update using only locally saved, signed
 /// material. Never roll back a newer verified remote head.
-pub(super) fn finish_keyring_update(
-    cfg: &RemoteCfg,
-    owner: &tig_private::keys::Identity,
-) -> Result<()> {
+pub(super) fn finish_keyring_update(cfg: &RemoteCfg, owner: &Identity) -> Result<()> {
     if !cfg.dir.join("pending-keyring").try_exists()? {
         return Ok(());
     }
-    let remote = open_existing(&cfg.path)?;
-    let mut state = load_publish_state(&cfg.dir)?;
-    tig_private::access::finish_pending(&remote, &cfg.dir, owner, &mut state)?;
+    let remote = connect(cfg, Some(owner), false)?;
+    // Recovery checks committed floors; the pending counter has not landed yet.
+    let mut state = load_states(&cfg.dir, false)?.0;
+    tig_private::access::finish_pending(remote.as_ref(), &cfg.dir, owner, &mut state)?;
     Ok(())
 }
 
@@ -364,14 +450,15 @@ mod tests {
         use tig_private::keys::Identity;
         for remote_updated in [false, true] {
             let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("remote");
             let cfg = RemoteCfg {
                 name: "origin".into(),
                 dir: dir.path().join("cfg"),
-                path: dir.path().join("remote"),
+                location: Location::Dir(path.clone()),
             };
             let owner = Identity::generate().unwrap();
             let member = Identity::generate().unwrap();
-            let remote = DirRemote::create(&cfg.path, [41; 16]).unwrap();
+            let remote = DirRemote::create(&path, [41; 16]).unwrap();
             let (mut ring, mut keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
             ring.grant(&keys, &owner, &member.public()).unwrap();
             put_keyring(&remote, &ring.encode().unwrap());
@@ -408,13 +495,14 @@ mod tests {
     fn pending_update_never_overwrites_a_newer_verified_head() {
         use tig_private::keys::Identity;
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote");
         let cfg = RemoteCfg {
             name: "origin".into(),
             dir: dir.path().join("cfg"),
-            path: dir.path().join("remote"),
+            location: Location::Dir(path.clone()),
         };
         let owner = Identity::generate().unwrap();
-        let remote = DirRemote::create(&cfg.path, [42; 16]).unwrap();
+        let remote = DirRemote::create(&path, [42; 16]).unwrap();
         let (mut ring, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
         save_owner_keys(&cfg.dir, &keys).unwrap();
         super::super::disk::write_replace(
@@ -447,14 +535,18 @@ mod tests {
         fetched.remote_id = [1; 16];
         fetched.owner_signing = Some([2; 32]);
         fetched.counter = 7;
+        fetched.manifest_seq = 11;
         save_fetch_state(dir.path(), &fetched).unwrap();
         let mut published = load_publish_state(dir.path()).unwrap();
         assert_eq!(published.owner_signing, fetched.owner_signing);
         assert_eq!(published.remote_id, fetched.remote_id);
         assert_eq!(published.counter, 7);
+        assert_eq!(published.manifest_seq, 11);
         published.counter = 9;
+        published.manifest_seq = 12;
         save_publish_state(dir.path(), &published).unwrap();
         assert_eq!(load_fetch_state(dir.path()).unwrap().counter, 9);
+        assert_eq!(load_fetch_state(dir.path()).unwrap().manifest_seq, 12);
         fetched.owner_signing = Some([3; 32]);
         save_fetch_state(dir.path(), &fetched).unwrap();
         assert!(load_publish_state(dir.path()).is_err());

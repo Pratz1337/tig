@@ -68,6 +68,34 @@ fn identity_lines(stdout: &str) -> (String, String) {
     (token, fingerprint)
 }
 
+#[test]
+fn publishing_a_rewritten_change_prints_the_rebase_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote");
+    let identity = tmp.path().join("owner.id");
+    let owner = |dir: &Path| tig(dir, "owner", "owner@x", &identity);
+    expect_ok(owner(tmp.path()).arg("init").arg(&repo));
+    fs::write(repo.join("public"), "first").unwrap();
+    expect_ok(owner(&repo).args(["remote", "add", "origin"]).arg(&remote));
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    let dir_remote = tig_private::remote::DirRemote::open(&remote).unwrap();
+    let head = dir_remote.read_head().unwrap();
+    let manifest =
+        tig_private::manifest::Manifest::decode(head.manifest.as_ref().unwrap()).unwrap();
+    use tig_core::store::StoreExt;
+    let change = dir_remote
+        .public_store()
+        .get_revision(&manifest.refs["main"])
+        .unwrap()
+        .change_id
+        .short(8);
+    fs::write(repo.join("public"), "second").unwrap();
+    let published = run(owner(&repo).args(["publish", "origin"]));
+    assert_eq!(published.code, Some(0), "{}", published.stderr);
+    assert!(published.stderr.contains(&format!("warning: rewrites published change `{change}`; collaborators who built on it must rebase")), "{}", published.stderr);
+}
+
 fn sealed_names(stdout: &str) -> Vec<String> {
     let line = stdout
         .lines()
