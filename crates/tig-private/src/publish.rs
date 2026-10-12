@@ -306,6 +306,8 @@ pub struct PublishReport {
 struct Plan {
     internal: ObjectId,
     projection: Projection,
+    /// Public metadata: published as-is with the public revision.
+    description: String,
 }
 
 struct Session {
@@ -354,6 +356,7 @@ pub fn publish(
         plans.push(Plan {
             internal,
             projection,
+            description: revision.description,
         });
     }
     let mut ever_public = state.ever_public.clone();
@@ -430,7 +433,47 @@ pub fn publish(
         private_objects_sealed: sealed_objects,
         sealed_roots,
         new_owner_keys: None,
-        warnings: checked.warnings,
+        warnings: {
+            let mut warnings = checked.warnings;
+            warnings.extend(metadata_mentions(store, &plans)?);
+            warnings
+        },
+    })
+}
+
+/// The metadata exception (DESIGN.md "Privacy"): `.private` and change
+/// descriptions are public, so they can name what a sealed folder hides.
+/// Warns (never refuses) when they mention a name found only inside a
+/// sealed root. Names under 4 characters are skipped as noise.
+fn metadata_mentions(store: &dyn Store, plans: &[Plan]) -> Result<Vec<String>, PublishError> {
+    let mut hidden: BTreeSet<String> = BTreeSet::new();
+    let mut public_text = String::new();
+    for plan in plans {
+        for root in &plan.projection.sealed {
+            for (path, _) in &plan.projection.private_files {
+                if path.starts_with(&root.path) && *path != root.path {
+                    let below = &path.as_str()[root.path.as_str().len() + 1..];
+                    hidden.extend(below.split('/').filter(|name| name.len() >= 4).map(str::to_string));
+                }
+            }
+        }
+        public_text.push_str(&plan.description);
+        public_text.push('\n');
+        for (path, leaf) in &plan.projection.public_files {
+            if path.as_str() == crate::project::RULES_FILE && leaf.is_file_like() {
+                public_text.push_str(&String::from_utf8_lossy(&store.get_blob(&leaf.id())?));
+                public_text.push('\n');
+            }
+        }
+    }
+    let named: Vec<&str> = hidden.iter().map(String::as_str).filter(|name| public_text.contains(name)).collect();
+    Ok(if named.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "public text (.private or a change description) mentions names hidden inside a sealed folder: {}; that text is published as-is",
+            named.join(", ")
+        )]
     })
 }
 

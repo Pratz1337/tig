@@ -1201,7 +1201,7 @@ fn public_rules_can_disclose_a_name_inside_a_sealed_root() {
     );
     let owner = Identity::generate().unwrap();
     let (dir, remote) = remote_at([27; 16]);
-    publish_at(
+    let report = publish_at(
         &repo,
         &remote,
         &owner,
@@ -1211,6 +1211,12 @@ fn public_rules_can_disclose_a_name_inside_a_sealed_root() {
         &PublishOptions::default(),
     )
     .unwrap();
+    // The metadata exception is allowed, but never silent.
+    assert!(
+        report.warnings.iter().any(|w| w.contains("named-in-rules")),
+        "{:?}",
+        report.warnings
+    );
     assert_eq!(public_kind(&remote, "secrets"), EntryKind::Sealed);
     // Contract requires .private to be public. Name confidentiality therefore
     // excludes names explicitly written in this public metadata.
