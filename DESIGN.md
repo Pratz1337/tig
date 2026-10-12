@@ -183,10 +183,18 @@ Without the existing epoch key a server cannot grant access to existing cipherte
 - **Wide directories:** a tree object lists all of a directory's entries, as in git. Editing one file in a directory of N entries re-encodes and rehashes O(N) bytes, and lookup or diff decode the whole directory. Depth-wise cost already follows the changed paths. If benchmarks on real monorepos show this matters, directories get chunked into bounded-size nodes with structural sharing (a prolly or B-tree layout). That is a format change, so it is decided by measurement, not guesswork.
 - **Visual spoofing in `.private`:** matching uses NFC plus Unicode case folding. Fullwidth or zero-width look-alikes (`．ｅｎｖ`) are different names and are not treated as `.env`. A publish-time warning for confusable names is a possible later addition.
 
+## Git import
+
+`tig import-git <path>` imports all commits reachable from Git refs and HEAD via gitoxide, preserving author, committer, message, timestamps and ordered parents. Branches become bookmarks; the first import starts a working change on Git HEAD. Subsequent imports preserve local working-copy edits. Submodules and non-portable path entries are skipped with a per-path warning; shallow history and invalid UTF-8 metadata/rules are refused rather than silently changed.
+
+Imports classify each revision with its own `.private` plus the built-in floor. Matching paths, including ones subsequently deleted, are reported as already exposed in Git history and seed first-publish leak evidence. `--strip-private` is for never-public Git repositories: the union of paths private in any reachable commit is removed from every imported revision before their blobs are stored. An incremental strip import that would retroactively change earlier imported revisions is refused and requires a fresh destination. It does not redact public metadata or detect unclassified copies of a secret.
+
+ChangeIds are derived deterministically from Git commit IDs under a random local import secret saved in `.tig/git-import` before use. The frozen `GIT_IMPORT_CHANGE_ID` label derives that subkey; its keyed hash covers the strip flag, Git ID byte length and Git ID bytes, taking the first 16 output bytes. Re-import with the same secret and mode is idempotent; independent destination secrets give different identities. The secret prevents importing a private Git hash as an unsalted public guessing oracle. Changing strip mode requires a separate destination. Object encodings and ordinary hot paths do not change. See `IMPORT_GIT.md` for the complete behavior and `bench/IMPORT.md` for measured bulk-storage costs.
+
 ## Phases
 
 - **Phase 1 (now):** core objects + stores, path index, trees/diff, revisions/changes, op log + undo, in-memory and filesystem workspaces, CLI (`init status diff log show new describe edit undo op-log workspace bookmark cat why`), `.private` rules plus local publish/fetch with sealing in simple mode, benchmarks against git.
-- **Phase 2:** git import/export (via gitoxide, MIT/Apache), remotes and a server, roles/hierarchy, conflicts as objects, filesystem watcher, packs.
+- **Phase 2:** git import is implemented (via gitoxide, MIT/Apache); git export, network remotes and a server, roles/hierarchy, conflicts as objects, filesystem watcher and storage packs remain.
 
 ## Licensing
 

@@ -43,6 +43,22 @@ fn describe(r: &mut Repo, text: &str) {
 }
 
 #[test]
+fn imported_history_rejects_bad_bookmarks_without_partly_changing_the_view() {
+    let mut r = repo();
+    let imported = raw_rev(r.store().as_ref(), &[root_revision_id()], empty_tree_id(), "imported");
+    let mut tx = r.start("import history");
+    let before = tx.view().clone();
+    let bookmarks = BTreeMap::from([("bad name".into(), imported)]);
+    assert!(tx.import_history(&[imported], &bookmarks).is_err());
+    assert_eq!(tx.view(), &before);
+    let bookmarks = BTreeMap::from([("main".into(), imported)]);
+    tx.import_history(&[imported], &bookmarks).unwrap();
+    r.commit(tx).unwrap();
+    assert_eq!(r.view().bookmarks["main"], imported);
+    assert!(r.visible_revisions().unwrap().iter().any(|(id, _)| *id == imported));
+}
+
+#[test]
 fn snapshot_skips_a_merge_when_its_rewritten_parents_conflict() {
     let mut r = repo();
     let mut w = Workspace::open(&r, "default").unwrap();

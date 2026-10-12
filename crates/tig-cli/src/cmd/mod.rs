@@ -13,6 +13,7 @@ mod edit;
 mod fetch;
 mod grant;
 mod identity;
+mod import_git;
 mod init;
 mod log;
 #[path = "new.rs"]
@@ -124,6 +125,12 @@ impl From<tig_private::remote::RemoteError> for CliError {
 
 impl From<tig_private::keys::KeyError> for CliError {
     fn from(err: tig_private::keys::KeyError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+impl From<tig_private::import_git::ImportError> for CliError {
+    fn from(err: tig_private::import_git::ImportError) -> Self {
         CliError::msg(err.to_string())
     }
 }
@@ -258,6 +265,10 @@ pub fn run() -> Result<()> {
     let repository = cli.repository.as_deref();
     match cli.command {
         Cmd::Init { dir } => init::run(repository, dir)?,
+        Cmd::ImportGit {
+            path,
+            strip_private,
+        } => import_git::run(repository, &path, strip_private)?,
         Cmd::Status => status::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
@@ -319,6 +330,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Import complete Git history into this repository (creates an empty destination)
+    ImportGit {
+        /// Source Git working tree or bare repository
+        path: PathBuf,
+        /// Remove private paths from every imported revision (never-public Git repos)
+        #[arg(long)]
+        strip_private: bool,
+    },
     /// Record the disk in the working change
     Snapshot {
         /// Re-read every file instead of using the stat cache

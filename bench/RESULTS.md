@@ -40,3 +40,25 @@ Median wall time minus the command span is 11.81 ms clean / 11.11 ms edited. A s
 The initial `new` also opens and compacts the ~40 MB journal left by initialization into loose objects, because it exceeds 4 MiB. Bulk creation and this deferred compaction are part of the measured init/new workflow. The small journal avoids that many-file cost during subsequent one-file edits.
 
 Follow-up only: measure removing redundant stat-cache copies on clean scans, and bulk import's journal/loose-object tradeoff. The phase evidence locates opportunities; it does not prove a speedup. No hot-path optimization was made for this baseline.
+
+## Check after security fixes and import
+
+A separate five-run trace after the implementation measured clean/edited wall medians of 35.94/68.87 ms, compared with the original trace's 32.48/55.16 ms. The slower sample was retained in `target/bench-trace-post.json`; the original `target/bench-trace.json` was preserved. Comparing separate times on this desktop cannot establish whether the change caused that difference.
+
+To check that concern, `trace_compare.py` alternates the retained baseline release executable and the final executable on **one** fresh 10k-file workspace. Ten samples per executable per scenario, with the first executable alternating each pair. Clean scans are warmed after the racy window; each edited sample appends to the same file before that executable runs, so both commands actually snapshot an edit. No builds/tests or other benchmark drivers ran concurrently.
+
+| Paired trace median | Retained baseline | Final build |
+|---|---:|---:|
+| Clean status, wall | 31.63 ms | 31.31 ms |
+| Edited status, wall | 57.01 ms | 57.27 ms |
+| Clean status, in-process | 19.90 ms | 19.62 ms |
+| Edited status, in-process | 45.56 ms | 46.02 ms |
+| `--version`, wall | 9.40 ms | 9.08 ms |
+
+This paired sample shows no material status/startup regression; it is limited evidence, not proof of zero overhead on every workload. Privacy/crypto/import-state reads remain confined to trust boundaries; the snapshot/walker implementation was not changed. No optimization was applied in response to the earlier slower sample.
+
+```powershell
+python bench/trace_compare.py target/release/deps/tig-ed9e0d448ee9a563.exe
+```
+
+The baseline executable is an ignored retained build artifact, not reproduced by a fresh build of the final sources. Preserve the executable from a baseline build before repeating this comparison. Raw paired samples: `target/bench-trace-paired.json`.

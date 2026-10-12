@@ -102,7 +102,9 @@ pub struct PublishState {
     /// Highest keyring counter this state has accepted.
     pub counter: u64,
     pub revisions: BTreeMap<ObjectId, ObjectId>,
-    /// Every file path published as public to this remote.
+    /// Every file path published as public to this remote, plus Git exposure
+    /// evidence seeded by import before the first publish. This evidence alone
+    /// does not bind an otherwise unused state to an owner or remote.
     pub ever_public: BTreeSet<RepoPath>,
     pub confirmed_negations: BTreeSet<RepoPath>,
     /// Wire ids already sent, per group and epoch.
@@ -500,7 +502,6 @@ fn saved_pin(state: &PublishState, remote_id: [u8; 16]) -> Result<Option<[u8; 32
         None => {
             let unused = state.counter == 0
                 && state.revisions.is_empty()
-                && state.ever_public.is_empty()
                 && state.confirmed_negations.is_empty()
                 && state.sent.is_empty();
             if unused {

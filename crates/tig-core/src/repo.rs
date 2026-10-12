@@ -7,7 +7,7 @@
 //! set (log, rebasing descendants). That is fine for small and medium repos;
 //! a persistent revision index replaces these walks before large-repo work.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -790,6 +790,27 @@ impl Transaction {
         })
     }
 
+    /// Makes imported history visible and updates its bookmarks in one step.
+    /// Normalize once for the whole batch, rather than walking history once
+    /// for each branch. Objects must already have been stored.
+    pub fn import_history(
+        &mut self,
+        heads: &[ObjectId],
+        bookmarks: &BTreeMap<String, ObjectId>,
+    ) -> Result<()> {
+        self.atomically(|tx| {
+            for id in heads.iter().chain(bookmarks.values()) {
+                tx.store.get_revision(id)?;
+                tx.view.heads.insert(*id);
+            }
+            for (name, id) in bookmarks {
+                validate_bookmark(name)?;
+                tx.view.bookmarks.insert(name.clone(), *id);
+            }
+            tx.normalize_heads()
+        })
+    }
+
     pub fn delete_bookmark(&mut self, name: &str) -> Result<()> {
         self.view
             .bookmarks
@@ -959,7 +980,8 @@ fn conflict_error(what: &str, paths: &[crate::path::RepoPath]) -> Error {
     ))
 }
 
-fn validate_bookmark(name: &str) -> Result<()> {
+/// Validates a bookmark name without changing repository state.
+pub fn validate_bookmark(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name != "@"
         && name != "root"

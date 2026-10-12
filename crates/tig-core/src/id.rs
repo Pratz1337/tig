@@ -47,7 +47,8 @@ impl FromStr for ObjectId {
     }
 }
 
-/// Stable identity of a change across rewrites. Random, never derived from content.
+/// Stable identity of a change across rewrites. Random for new changes;
+/// Git imports derive it from the Git ID under a locally saved secret key.
 ///
 /// Displayed with the letters k..z instead of hex digits (jj's trick), so a change ID
 /// can never be confused with an object ID.

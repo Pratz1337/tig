@@ -6,7 +6,7 @@ members = ["crates/tig-core", "crates/tig-private", "crates/tig-cli"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.80"
+rust-version = "1.89"
 
 [workspace.dependencies]
 tig-core = { path = "crates/tig-core" }
@@ -27,6 +27,7 @@ ignore = "0.4"
 similar = "2"
 proptest = "1"
 tempfile = "3"
+gix = { version = "0.89", default-features = false, features = ["sha1", "sha256"] }
 
 [profile.release]
 debug = 1

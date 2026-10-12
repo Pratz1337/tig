@@ -191,10 +191,16 @@ impl Rules {
     /// The path and every pattern are compared in Unicode NFC, without regard
     /// to case (Unicode simple case folding). The last matching line wins.
     pub fn classify(&self, path: &RepoPath) -> Verdict {
-        if path.is_root() {
+        self.classify_text(path.as_str())
+    }
+
+    // Git's exposure inventory also covers UTF-8 names that cannot become
+    // RepoPaths. This only matches text; it never makes a filesystem path.
+    pub(crate) fn classify_text(&self, path: &str) -> Verdict {
+        if path.is_empty() {
             return Verdict::Public { rule: None };
         }
-        let normalized: String = path.as_str().nfc().collect();
+        let normalized: String = path.nfc().collect();
         // One RegexSet query. Indices follow rule order.
         let winner = self.set.matches(&normalized).into_iter().max();
         match winner {

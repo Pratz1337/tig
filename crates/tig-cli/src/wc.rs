@@ -145,6 +145,20 @@ impl WorkingCopy {
     /// Creates `ROOT/.tig`, a repo, and the default `.private` when `ROOT`
     /// does not already have one, then snapshots whatever is already there.
     pub fn init(root: &Path, settings: Settings) -> Result<(Repo, WorkingCopy)> {
+        Self::init_inner(root, settings, true)
+    }
+
+    /// Import gets .private from Git history; do not invent a tracked file
+    /// that Git HEAD did not contain. The built-in floor still applies.
+    pub fn init_for_import(root: &Path, settings: Settings) -> Result<(Repo, WorkingCopy)> {
+        Self::init_inner(root, settings, false)
+    }
+
+    fn init_inner(
+        root: &Path,
+        settings: Settings,
+        write_private: bool,
+    ) -> Result<(Repo, WorkingCopy)> {
         let root = canonicalize_creating(root)?;
         let tig_dir = root.join(".tig");
         if symlink_metadata_kind(&tig_dir)?.is_some() {
@@ -160,7 +174,7 @@ impl WorkingCopy {
         let mut repo = Repo::init(store, op_head, settings)?;
 
         let private = root.join(".private");
-        if symlink_metadata_kind(&private)?.is_none() {
+        if write_private && symlink_metadata_kind(&private)?.is_none() {
             atomic_write(&private, PRIVATE_FILE_TEMPLATE.as_bytes(), false)?;
         }
 

@@ -50,3 +50,6 @@ pub const WORKSPACE_STATE: &[u8] = b"tig workspace state v2";
 
 /// First line of the unsynced snapshot head record (`op_head.light`).
 pub const LIGHT_OP_HEAD: &str = "tig light op head v1";
+
+/// Derives the local secret used to map Git commit IDs to opaque ChangeIds.
+pub const GIT_IMPORT_CHANGE_ID: &str = "tig git import change id v1";

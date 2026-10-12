@@ -46,6 +46,9 @@ pub(super) fn run(
         return Err(CliError::msg("could not save owner keys before publishing"));
     }
     let mut state = super::remote::load_publish_state(&cfg.dir)?;
+    if let Some(imported) = super::import_git::load_state(&tig)? {
+        state.ever_public.extend(imported.exposed);
+    }
     let options = PublishOptions {
         acknowledge_leaked,
         confirm_negations,

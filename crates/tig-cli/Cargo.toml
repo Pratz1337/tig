@@ -3,6 +3,7 @@ name = "tig-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "tig"
@@ -17,6 +18,7 @@ similar.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
