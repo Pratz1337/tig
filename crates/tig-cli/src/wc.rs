@@ -327,7 +327,7 @@ impl WorkingCopy {
                 let tree = apply_edits(repo.store().as_ref(), &self.state.tree, ws.pending())?;
                 if tree == rev_tree {
                     warnings.push("recovered workspace state after a completed snapshot".into());
-                    self.record_state(current, tree, cache)?;
+                    self.record_state(current, tree, cache, false)?;
                     stats.warnings = warnings;
                     return Ok(stats);
                 }
@@ -369,7 +369,7 @@ impl WorkingCopy {
         let working = ws.working_revision();
         {
             let _t = crate::trace::span("  snapshot: save workspace state");
-            self.record_state(working, repo.revision(&working)?.tree, cache)?;
+            self.record_state(working, repo.revision(&working)?.tree, cache, false)?;
         }
         Ok(stats)
     }
@@ -414,7 +414,7 @@ impl WorkingCopy {
             )?;
             let saved = tx.rewrite(change, |rev| rev.tree = tree)?;
             repo.commit(tx)?;
-            self.record_state(saved, tree, cache).map_err(|err| {
+            self.record_state(saved, tree, cache, true).map_err(|err| {
                 Error::Msg(format!(
                     "saved local edits as {}; could not save workspace state: {err}",
                     saved.short(12)
@@ -456,7 +456,7 @@ impl WorkingCopy {
         let current = repo.working_revision(&self.name)?;
         let new_tree = repo.revision(&current)?.tree;
         if new_tree == self.state.tree {
-            self.record_state(current, new_tree, self.state.cache.clone())?;
+            self.record_state(current, new_tree, self.state.cache.clone(), true)?;
             return Ok(CheckoutStats {
                 written: 0,
                 removed: 0,
@@ -533,7 +533,7 @@ impl WorkingCopy {
         self.state.cache = cache;
         let now = self.now();
         mark_racy(&mut self.state.cache, now);
-        self.save_state()?;
+        self.save_state(true)?;
         Ok(stats)
     }
 
@@ -594,11 +594,17 @@ impl WorkingCopy {
         self.clock.unwrap_or_else(SystemTime::now)
     }
 
-    fn save_state(&self) -> Result<()> {
+    /// `durable` fsyncs the file. A snapshot passes `false`: its op head is
+    /// itself unsynced (see `OpHeadStore`), and every way the state can be
+    /// lost or left behind by a crash is detected on load (checksum, or a
+    /// working revision ahead of or behind the repo) and costs a re-scan,
+    /// never an edit. Checkouts pass `true`, so a crash cannot leave a state
+    /// that describes files the checkout already replaced.
+    fn save_state(&self, durable: bool) -> Result<()> {
         let dir = self.tig_dir.join("workspaces").join(&self.name);
         ensure_metadata_dirs(&self.tig_dir)?;
         ensure_real_directory(&dir)?;
-        atomic_write(&dir.join("state"), &encode_state(&self.state), true)?;
+        atomic_write(&dir.join("state"), &encode_state(&self.state), durable)?;
         Ok(())
     }
 
@@ -607,6 +613,7 @@ impl WorkingCopy {
         working: ObjectId,
         tree: ObjectId,
         mut cache: PathIndex<FileState>,
+        durable: bool,
     ) -> Result<()> {
         mark_racy(&mut cache, self.now());
         if self.trusted
@@ -621,17 +628,22 @@ impl WorkingCopy {
         self.state.working = working;
         self.state.tree = tree;
         self.state.cache = cache;
-        self.save_state()?;
+        self.save_state(durable)?;
         self.trusted = true;
         self.load_warning = None;
         Ok(())
     }
 
-    /// One directory walk. Hashes a file only when the stat cache cannot
-    /// prove it is unchanged.
-    /// Decides what the snapshot must do with one file, without touching
-    /// shared state, so it can run on the walk's worker threads.
-    fn classify(&self, found: crate::walk::Found<'_>, rehash: bool, baseline: &BTreeMap<RepoPath, Leaf>) -> Outcome {
+    /// Decides what the snapshot must do with one file, reading it only when
+    /// the stat cache cannot prove it unchanged. It touches nothing shared
+    /// but the thread-safe store, so it runs on the walk's worker threads.
+    fn classify(
+        &self,
+        store: &dyn tig_core::Store,
+        found: crate::walk::Found<'_>,
+        rehash: bool,
+        baseline: &BTreeMap<RepoPath, Leaf>,
+    ) -> Outcome {
         let repo_path = match found.path {
             Ok(path) => path,
             Err(why) => return Outcome::Skipped(format!("skipping {why}")),
@@ -673,7 +685,7 @@ impl WorkingCopy {
             }
         }
         let (kind, stand_in) = desired_kind(meta, shape, prev, baseline.get(&repo_path).copied());
-        Outcome::Hash(ToHash {
+        let item = ToHash {
             disk: found.disk,
             shape,
             row: FileState {
@@ -687,7 +699,12 @@ impl WorkingCopy {
             },
             prev: prev.cloned(),
             repo_path,
-        })
+        };
+        // Read and store right here, on the walk thread. Reading is the slow
+        // part (on Windows the first open of a modified file waits for the
+        // antivirus scan), so that wait overlaps the rest of the walk.
+        let id = read_and_store(store, &item);
+        Outcome::Hashed(item, id)
     }
 
     fn scan(
@@ -721,15 +738,25 @@ impl WorkingCopy {
                 .filter(|(_, leaf)| leaf.is_file_like())
                 .collect()
         };
-        let mut seen: BTreeSet<RepoPath> = BTreeSet::new();
-        let mut to_hash: Vec<ToHash> = Vec::new();
+        // Every path the walk accounted for, and how many of them have a row
+        // in the trusted cache. When that count covers the whole cache,
+        // nothing tracked went missing and the deletion pass is skipped.
+        let mut seen: Vec<RepoPath> = Vec::new();
+        let mut cached_seen = 0usize;
 
-        // One parallel walk; each file is classified on the worker threads.
+        // One parallel walk; each file is classified, and read if needed,
+        // on the worker thread that found it.
+        let store = repo.store().as_ref();
+        let walk_span = crate::trace::span("    scan: walk + classify + hash");
         let (outcomes, walk_warnings) = crate::walk::walk(&self.root, is_scratch_name, |found| {
-            self.classify(found, rehash, &baseline)
+            self.classify(store, found, rehash, &baseline)
         })
         .map_err(|e| Error::Msg(format!("walking {}: {e}", self.root.display())))?;
+        drop(walk_span);
         warnings.extend(walk_warnings);
+        // Outcomes arrive in thread-timing order; the overlay and the cache
+        // are keyed by path, so the result does not depend on that order.
+        let apply = crate::trace::span("    scan: apply");
         for outcome in outcomes {
             match outcome {
                 Outcome::Skipped(warning) => {
@@ -740,51 +767,67 @@ impl WorkingCopy {
                     stats.scanned += 1;
                     warnings.push(warning);
                     if let Some(path) = keep {
-                        seen.insert(path);
+                        cached_seen += usize::from(self.trusted);
+                        seen.push(path);
                     }
                 }
                 Outcome::Unchanged(path) => {
                     stats.scanned += 1;
-                    seen.insert(path);
+                    cached_seen += 1;
+                    seen.push(path);
                 }
                 Outcome::Retyped(path, row) => {
                     stats.scanned += 1;
                     ws.set(repo, path.clone(), Some(leaf_of(row.kind, row.id)?))?;
                     cache.insert(path.clone(), row);
-                    seen.insert(path);
+                    cached_seen += 1;
+                    seen.push(path);
                 }
-                Outcome::Hash(item) => {
+                Outcome::Hashed(item, id) => {
+                    let id = id?;
                     stats.scanned += 1;
-                    seen.insert(item.repo_path.clone());
-                    to_hash.push(item);
+                    stats.hashed += 1;
+                    let ToHash {
+                        repo_path,
+                        mut row,
+                        prev,
+                        ..
+                    } = item;
+                    row.id = id;
+                    let unchanged = self.trusted
+                        && prev
+                            .as_ref()
+                            .is_some_and(|old| old.id == id && old.kind == row.kind);
+                    if !unchanged {
+                        ws.set(repo, repo_path.clone(), Some(leaf_of(row.kind, id)?))?;
+                    }
+                    cached_seen += usize::from(prev.is_some());
+                    cache.insert(repo_path.clone(), row);
+                    seen.push(repo_path);
                 }
             }
         }
-
-        // Reading is the slow part (on Windows, every first open of a new
-        // file waits for the antivirus scan), so read, hash and store in
-        // parallel. Overlay edits are then applied in walk order, so the
-        // result does not depend on thread timing.
-        let ids = hash_in_parallel(repo.store().as_ref(), &to_hash)?;
-        for (item, id) in to_hash.into_iter().zip(ids) {
-            stats.hashed += 1;
-            let ToHash {
-                repo_path,
-                mut row,
-                prev,
-                ..
-            } = item;
-            row.id = id;
-            let unchanged = self.trusted
-                && prev
-                    .as_ref()
-                    .is_some_and(|old| old.id == id && old.kind == row.kind);
-            if !unchanged {
-                ws.set(repo, repo_path.clone(), Some(leaf_of(row.kind, id)?))?;
-            }
-            cache.insert(repo_path, row);
+        drop(apply);
+        if !(self.trusted && cached_seen == self.state.cache.len()) {
+            let _t = crate::trace::span("    scan: deletions");
+            let seen: BTreeSet<RepoPath> = seen.into_iter().collect();
+            self.drop_absent(repo, ws, &mut cache, &mut stats, &seen, &baseline, include_tracked)?;
         }
+        Ok((stats, cache))
+    }
 
+    /// Tracked paths the walk did not report: deleted, ignored or retyped.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_absent(
+        &self,
+        repo: &Repo,
+        ws: &mut Workspace,
+        cache: &mut PathIndex<FileState>,
+        stats: &mut SnapshotStats,
+        seen: &BTreeSet<RepoPath>,
+        baseline: &BTreeMap<RepoPath, Leaf>,
+        include_tracked: bool,
+    ) -> Result<()> {
         // The walker skips ignored paths. A path still on disk is not a
         // deletion: drop it only when it is gone. Tracked ignored files keep
         // their cache row so a later delete is still noticed.
@@ -855,7 +898,7 @@ impl WorkingCopy {
             }
         }
 
-        Ok((stats, cache))
+        Ok(())
     }
 }
 
@@ -1562,8 +1605,8 @@ enum Outcome {
     Unchanged(RepoPath),
     /// Same content, different kind (executable bit, symlink stand-in).
     Retyped(RepoPath, FileState),
-    /// Must be read and hashed.
-    Hash(ToHash),
+    /// The stat cache could not vouch for it, so it was read and stored.
+    Hashed(ToHash, Result<ObjectId>),
 }
 
 /// A file the stat cache could not vouch for; it must be read and hashed.
@@ -1576,52 +1619,11 @@ struct ToHash {
     prev: Option<FileState>,
 }
 
-/// Reads, hashes and stores every file in `items` on a small thread pool.
-/// Returns the blob ids in the same order as `items`. The first error wins.
-fn hash_in_parallel(store: &dyn tig_core::Store, items: &[ToHash]) -> Result<Vec<ObjectId>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+/// Reads one file the stat cache could not vouch for and stores its blob.
+fn read_and_store(store: &dyn tig_core::Store, item: &ToHash) -> Result<ObjectId> {
     use tig_core::store::StoreExt;
-
-    if items.is_empty() {
-        return Ok(Vec::new());
-    }
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .clamp(1, 16)
-        .min(items.len());
-    let next = AtomicUsize::new(0);
-    let ids: Mutex<Vec<Option<ObjectId>>> = Mutex::new(vec![None; items.len()]);
-    let failure: Mutex<Option<Error>> = Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= items.len() || failure.lock().expect("lock poisoned").is_some() {
-                    return;
-                }
-                let item = &items[i];
-                let result = read_shape(&item.disk, item.shape)
-                    .map_err(Error::from)
-                    .and_then(|bytes| Ok(store.put_blob(&bytes)?));
-                match result {
-                    Ok(id) => ids.lock().expect("lock poisoned")[i] = Some(id),
-                    Err(e) => {
-                        failure.lock().expect("lock poisoned").get_or_insert(e);
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    if let Some(e) = failure.into_inner().expect("lock poisoned") {
-        return Err(e);
-    }
-    ids.into_inner()
-        .expect("lock poisoned")
-        .into_iter()
-        .map(|id| id.ok_or_else(|| Error::Msg("hashing stopped early".into())))
-        .collect()
+    let bytes = read_shape(&item.disk, item.shape)?;
+    Ok(store.put_blob(&bytes)?)
 }
 
 fn read_shape(path: &Path, shape: Shape) -> io::Result<Vec<u8>> {
