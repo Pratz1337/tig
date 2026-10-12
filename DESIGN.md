@@ -175,6 +175,36 @@ Without the existing epoch key a server cannot grant access to existing cipherte
 
 **Remote layout (a plain directory).** `objects/` (a DiskStore of public objects only), `packs/<group>/<epoch>/<pack-id>.pack`, `keyring`, `manifest` (signed refs and pack list), `refs` (unsigned copy of the bookmarks). It is dumb storage: no server-side decryption, ever.
 
+### Collaboration: many contributors, one remote (phase 2a, simple mode)
+
+Simple mode stays one private group with many members. This phase makes several people publishing to the same remote safe, first on a directory remote and then over HTTPS. The rules:
+
+**1. One correspondence per remote.** Publish and fetch share a single local map per remote, from internal revision to public revision, in both directions. Publish never re-projects a revision that fetch rebuilt from the remote, and fetch never rebuilds a revision this machine published. It reuses the local original instead. Re-projecting is not just wasted work: after a revocation the epoch changes, the same history projects to different sealed IDs, and public history would fork. A rebuilt duplicate would put two revisions of one change in the log, so `remote/main` would look diverged from `main` when they are identical.
+
+**2. Bookmarks only move forward.** Publish moves a remote bookmark only when its current target is absent, equal, or an ancestor of the new tip. The check runs locally: the old public target must map to a local revision that is an ancestor of the tip. A target this machine has never fetched is not a fast-forward. Otherwise publish refuses with "remote `main` has changes you have not fetched; run `tig fetch`, merge, and publish again", unless `--force` is given. Like git push, but checked against signed history.
+
+**3. One atomic remote head.** The keyring and the manifest are the only mutable remote state, and they move together. `RemoteHead` is `(keyring bytes, manifest bytes)`. Its `HeadVersion` is `derive_key(REMOTE_HEAD_VERSION, len‖keyring‖len‖manifest)`, with lengths as u64 little-endian and an absent file encoded as length `u64::MAX`. Every write is `commit_head(expected_version, new_keyring?, new_manifest?)`. It either installs both files or returns `Stale(current head)` and changes nothing. Objects and packs are content-addressed and uploaded *before* the commit; uploads that never get committed are harmless orphans, which a later GC can remove. The unsigned `refs` copy is no longer written; it is read only from remotes that predate manifests.
+
+**4. Publish retries cleanly.** On `Stale`, publish re-reads the head:
+- Keyring unchanged (same counter): rebase the manifest. Take the new refs and pack list, redo the fast-forward check for our bookmark against the new target, add our pack, sign `sequence = new + 1`, and commit again. Two people publishing different bookmarks, or one fast-forwarding past the other, both succeed without user action.
+- Keyring changed (a grant or revoke landed): start over from projection under the newest epoch. Content projected under an older epoch is never committed after a revocation, so a removed member cannot read new work through a race.
+- Retries are bounded (8). Then publish fails with a clear "remote is busy" error. Local state is updated only after a successful commit.
+
+**5. Grant and revoke are library functions** (`tig_private::access`), not CLI code, and they go through `commit_head` too. Revoke commits the owner re-signed manifest and the new keyring in **one** `commit_head`. A stale head means re-verify, recompute and retry, so a concurrent publish can never leave a manifest signed by a member who was just removed. The owner's local pending-keyring record (crash recovery) stays.
+
+**6. The `Remote` trait.** Publish, fetch and access take `&dyn Remote`. `DirRemote` implements it with a lock file plus compare-and-replace, like `FileOpHead`. `HttpRemote` implements it over HTTP. Public objects move in batches (`missing`, `put_batch`, `get_batch`), so a fetch costs one round trip per tree level, not one per object.
+
+**7. The server (`tig-server`) is dumb storage with authenticated writes.** It wraps a `DirRemote` and never decrypts.
+- **Reads** are open. Public objects are public, packs are ciphertext, and the head is signed. The server already sees exactly what the design says it sees.
+- **Writes** (objects, packs, head commits) carry an Ed25519 signature from a tig identity. It covers `(REMOTE_REQUEST_SIGNATURE, remote id, method, path, body hash, server-issued nonce)`. The nonce is single-use and short-lived, so a captured request cannot be replayed.
+- The server accepts a write only from the keyring owner or a member with a grant for the current epoch, checked against the keyring it holds. The very first head commit (no keyring yet) is accepted only from the identity named when the remote was created (`tig-server init --owner <fingerprint/public key>`). The server never decides trust for clients: they still verify the pin, the counter and the manifest signature themselves. Server authorization only limits who can fill the disk and who can move the head.
+- `commit_head` maps to `PUT /head` with `If-Match: "<version>"` (RFC 9110 conditional requests). A mismatch returns `412` with the current head.
+- Every response is bounded, and clients apply the same size limits as for a directory remote.
+- TLS: the client requires `https://` except for loopback addresses. Integrity never depends on TLS, because signatures, hashes and AEAD cover everything; TLS hides metadata from the network. The server can terminate TLS itself or run behind a proxy.
+- Restarts: all state is files written by temp-then-rename, so a killed server loses at most uncommitted uploads.
+
+**8. Not in this phase:** sharing unresolved conflicts (publish keeps refusing them), roles, outside contributors without a grant (patches and PRs), server-side GC, and push of operation history.
+
 ### Paths
 
 `object::validate_name` enforces a portable-name policy everywhere, including when decoding stored trees. It rejects `\`, `:`, control characters, a trailing `.` or space (Windows silently strips them, so `.env.` would land on disk as `.env`), and anything that aliases `.tig` (any case, or with HFS+-ignorable characters). Some names are only dangerous on some filesystems but exist in real repos, such as `aux.c` in Linux and `A` next to `a`. The filesystem working copy must check those before writing anything: Windows device names, case collisions on case-insensitive volumes, NTFS 8.3 aliases such as `TIG~1`, and never writing through a symlink or reparse-point ancestor.
@@ -187,7 +217,7 @@ Without the existing epoch key a server cannot grant access to existing cipherte
 - **Tampered `.tig` store:** `DiskStore` follows junctions or symlinks planted inside `.tig/store` shard directories. `.tig` is trusted local metadata (opening a workspace already refuses redirected metadata directories), so this needs local tampering first. Hardening the store's own writes is deferred.
 - **Huge objects:** `DiskStore` reads a whole loose file into memory. Large files get chunked blobs and streaming in the storage phase. Until then, a corrupt multi-gigabyte file can cost one large allocation.
 - **Wide directories:** a tree object lists all of a directory's entries, as in git. Editing one file in a directory of N entries re-encodes and rehashes O(N) bytes, and lookup or diff decode the whole directory. Depth-wise cost already follows the changed paths. If benchmarks on real monorepos show this matters, directories get chunked into bounded-size nodes with structural sharing (a prolly or B-tree layout). That is a format change, so it is decided by measurement, not guesswork.
-- **Concurrent publishers on a directory remote:** the remote has no compare-and-swap, so two publishers racing can each write a manifest and the last one wins, dropping the other's ref update and pack listing (the pack file itself stays). The loser's next publish restores neither automatically; it republishes its own revisions. A network remote will make the manifest write conditional on the sequence it read.
+- **Concurrent publishers:** being closed by "Collaboration" above (atomic remote head, fast-forward-only bookmarks, shared correspondence). Until that lands, two racing publishers can drop each other's ref update.
 - **Server-side denial:** a server can still refuse to serve anything, or serve nothing new to a fresh fetcher who has seen no manifest yet (TOFU, like the owner pin). The manifest turns silent omission into an error only for readers that have seen a newer sequence or hold the withheld epoch.
 - **Visual spoofing in `.private`:** matching uses NFC plus Unicode case folding. Fullwidth or zero-width look-alikes (`．ｅｎｖ`) are different names and are not treated as `.env`. A publish-time warning for confusable names is a possible later addition.
 

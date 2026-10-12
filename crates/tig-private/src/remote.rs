@@ -52,6 +52,99 @@ pub enum RemoteError {
     Invalid(String),
 }
 
+/// Version of a remote head (see DESIGN.md "Collaboration", rule 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadVersion(pub [u8; 32]);
+
+impl HeadVersion {
+    /// `derive_key(REMOTE_HEAD_VERSION, len || keyring || len || manifest)`,
+    /// lengths u64 little-endian, an absent file encoded as length `u64::MAX`.
+    pub fn of(keyring: Option<&[u8]>, manifest: Option<&[u8]>) -> Self {
+        let mut h = blake3::Hasher::new_derive_key(tig_core::domain::REMOTE_HEAD_VERSION);
+        for part in [keyring, manifest] {
+            match part {
+                None => {
+                    h.update(&u64::MAX.to_le_bytes());
+                }
+                Some(bytes) => {
+                    h.update(&(bytes.len() as u64).to_le_bytes());
+                    h.update(bytes);
+                }
+            }
+        }
+        HeadVersion(*h.finalize().as_bytes())
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// The only mutable remote state: keyring and manifest, read together.
+/// Nothing here is trusted until the caller verifies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteHead {
+    pub keyring: Option<Vec<u8>>,
+    pub manifest: Option<Vec<u8>>,
+}
+
+impl RemoteHead {
+    pub fn version(&self) -> HeadVersion {
+        HeadVersion::of(self.keyring.as_deref(), self.manifest.as_deref())
+    }
+}
+
+/// Result of a conditional head write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Committed(HeadVersion),
+    /// Someone else moved the head first. Nothing was written.
+    Stale(RemoteHead),
+}
+
+/// Storage a repo publishes to and fetches from: a directory or a server.
+/// It is dumb: it never decrypts and never decides trust. See DESIGN.md
+/// "Collaboration".
+pub trait Remote: Send + Sync {
+    fn remote_id(&self) -> [u8; 16];
+
+    /// Public objects only. Packs do not go through this store.
+    fn public_store(&self) -> &dyn Store;
+
+    /// Of `ids`, the public objects the remote does not have, in input order.
+    fn missing(&self, ids: &[ObjectId]) -> Result<Vec<ObjectId>, RemoteError>;
+
+    /// Uploads public objects in one batch. The remote checks every id.
+    fn put_batch(&self, objects: &[(ObjectId, ObjectKind, Vec<u8>)]) -> Result<(), RemoteError>;
+
+    /// Downloads public objects in one batch, verified against their ids.
+    /// Missing objects are absent from the result.
+    fn get_batch(&self, ids: &[ObjectId]) -> Result<Vec<(ObjectId, ObjectKind, Vec<u8>)>, RemoteError>;
+
+    /// Stores a pack. Writing the same bytes again is a no-op.
+    fn put_pack(&self, bytes: &[u8]) -> Result<(), RemoteError>;
+
+    /// Pack bytes for one group and epoch, ordered by pack id.
+    fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError>;
+
+    fn read_head(&self) -> Result<RemoteHead, RemoteError>;
+
+    /// Installs the given files (None = leave that file as it is) only if the
+    /// head is still at `expected`; otherwise returns `Stale` with the current
+    /// head and changes nothing.
+    fn commit_head(
+        &self,
+        expected: &HeadVersion,
+        keyring: Option<&[u8]>,
+        manifest: Option<&[u8]>,
+    ) -> Result<CommitOutcome, RemoteError>;
+
+    /// Unsigned refs of remotes that predate manifests. Never trusted.
+    fn read_legacy_refs(&self) -> Result<Option<BTreeMap<String, ObjectId>>, RemoteError> {
+        Ok(None)
+    }
+}
+
 /// A local directory used as a remote.
 pub struct DirRemote {
     root: PathBuf,
