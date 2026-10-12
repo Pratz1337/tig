@@ -4,6 +4,8 @@
 
 **Version control where the repo is public, but your secrets aren't.**
 
+Think Discord roles, but for your code: every path can have its own audience.
+
 `.env`, private packages and unreleased fixes live in the same repo as everything else, and only the people you allow can read them.
 
 ![Rust](https://img.shields.io/badge/rust-1.89%2B-orange) ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue) ![Status](https://img.shields.io/badge/status-alpha%2C%20unaudited-red)
@@ -84,6 +86,32 @@ sequenceDiagram
 - Signed publish manifest, so a server can't hide or swap packs
 
 **What outsiders can still see:** the `.private` file itself, change descriptions, author fields and bookmark names. Don't put secrets there; `tig publish` warns you if a private path shows up in them.
+
+## Two modes: simple and advanced
+
+**Simple mode** is just `.private`. List a path and it's private to everyone you grant access to. Most small projects never need more.
+
+**Advanced mode** adds Discord-style roles. Tag a rule with `@role` and only that role can read it:
+
+```gitignore
+.env                      # simple: private group
+packages/billing/ @billing
+security/fixes/   @security @maintainers
+```
+
+```mermaid
+flowchart LR
+    O[Owner] --> M["@maintainers"]
+    M --> S["@security"]
+    M --> B["@billing"]
+    S -.reads.-> F[security/fixes/]
+    B -.reads.-> P[packages/billing/]
+    X[Outsider] -.reads.-> PUB[everything public]
+```
+
+Owners rank roles, and roles carry permissions like editing private paths, managing roles or approving merges. Going from simple to advanced mode is just adding tags to the same file, with no migration and no new repo.
+
+> Roles are partly built: the `@role` syntax and per-role keys are in, and full end-to-end role grants are landing next.
 
 ## Architecture
 
