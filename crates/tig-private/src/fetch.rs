@@ -31,6 +31,7 @@ const MAX_STORED_REVISIONS: usize = 1_000_000;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_FETCH_REVISIONS: usize = 100_000;
+const MAX_FETCH_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -168,9 +169,18 @@ pub struct FetchReport {
 struct Budget {
     objects: usize,
     entries: usize,
+    bytes: usize,
 }
 
 impl Budget {
+    fn bytes(&mut self, amount: usize) -> Result<(), FetchError> {
+        self.bytes = self
+            .bytes
+            .checked_add(amount)
+            .filter(|used| *used <= MAX_FETCH_BYTES)
+            .ok_or(FetchError::TooLarge)?;
+        Ok(())
+    }
     fn object(&mut self) -> Result<(), FetchError> {
         bump(&mut self.objects, MAX_OBJECTS)
     }
@@ -207,6 +217,7 @@ pub fn fetch(
     let mut budget = Budget {
         objects: 0,
         entries: 0,
+        bytes: 0,
     };
     let order = copy_history(remote.public_store(), store, &tips, &mut budget)?;
     let records = open_member_packs(remote, store, &keyring, &verified, identity, &mut budget)?;
@@ -299,8 +310,10 @@ fn open_member_packs(
             Err(error) => return Err(error.into()),
         };
         for bytes in remote.list_packs(PRIVATE_GROUP, epoch)? {
+            budget.bytes(bytes.len())?;
             let opened = Pack::open(&bytes, &key)?;
             for (kind, id, body) in opened.objects {
+                budget.bytes(body.len())?;
                 if !matches!(kind, ObjectKind::Blob | ObjectKind::Tree) {
                     return Err(FetchError::Invalid(
                         "pack contains an object that is not a blob or a tree".into(),
@@ -436,6 +449,7 @@ fn copy_revision(
     }
     budget.object()?;
     let (kind, body) = must_get(remote, &id)?;
+    budget.bytes(body.len())?;
     if kind != ObjectKind::Revision {
         return Err(FetchError::Invalid(format!(
             "revision {id} is not a revision"
@@ -466,6 +480,7 @@ fn copy_tree(
         }
         budget.object()?;
         let (kind, body) = must_get(remote, &id)?;
+        budget.bytes(body.len())?;
         if kind != ObjectKind::Tree {
             return Err(FetchError::Invalid(format!("object {id} is not a tree")));
         }
@@ -502,6 +517,7 @@ fn copy_blob(
     }
     budget.object()?;
     let (kind, body) = must_get(remote, &id)?;
+    budget.bytes(body.len())?;
     if kind != ObjectKind::Blob {
         return Err(FetchError::Invalid(format!("object {id} is not a blob")));
     }
@@ -744,6 +760,7 @@ mod tests {
         let mut budget = Budget {
             objects: 0,
             entries: 0,
+            bytes: 0,
         };
         assert!(matches!(unseal(&store, public, &records, &mut budget),
             Err(FetchError::Invalid(ref reason)) if reason.contains("file target")));
@@ -773,6 +790,7 @@ mod tests {
         let mut budget = Budget {
             objects: 0,
             entries: 0,
+            bytes: 0,
         };
         let paths = sealed_leaves(&store, root, &mut budget).unwrap();
         assert_eq!(

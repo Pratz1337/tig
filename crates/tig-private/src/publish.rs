@@ -4,18 +4,16 @@
 //! then writes. A refusal leaves the remote and `state` unchanged. See
 //! DESIGN.md "Publish and fetch".
 //!
-//! The caller keeps [`PublishState`] and, on the first publish, the
-//! [`OwnerKeys`] in the report. The owner passes those keys back on later
+//! The caller keeps [`PublishState`] and prepares and saves [`OwnerKeys`]
+//! before the first publish. The owner passes those keys back on later
 //! publishes and never takes an epoch key from the remote.
 //!
 //! Empty remote, keys already saved: pass `Some(owner_keys)` when the
 //! keyring file is absent. Publish builds the keyring from that epoch
 //! secret and writes the file only after the refusal checks. The caller
-//! must save the keys before `publish` returns, so a crash cannot leave a
+//! must save the keys before calling `publish`, so a crash cannot leave a
 //! remote keyring whose secret existed only in a dead process. Passing
-//! `None` still mints the keys inside this call and returns them; that
-//! path writes the keyring before the caller can save, so the CLI does
-//! not use it.
+//! `None` to an empty remote is refused. Use `Keyring::create` to prepare keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -269,8 +267,8 @@ pub struct PublishReport {
     pub public_objects_written: usize,
     pub private_objects_sealed: usize,
     pub sealed_roots: usize,
-    /// Set when this call minted the epoch secret. The caller saves it.
-    /// Absent when the caller passed keys it had already saved.
+    /// Retained for callers of the original API. Always `None`: the first
+    /// epoch keys must now be prepared and saved before calling publish.
     pub new_owner_keys: Option<OwnerKeys>,
     pub warnings: Vec<String>,
 }
@@ -280,26 +278,19 @@ struct Plan {
     projection: Projection,
 }
 
-struct Fresh {
-    keyring: Keyring,
-    /// `None` when the caller already saved the epoch secret and passed it in.
-    new_keys: Option<OwnerKeys>,
-}
-
 struct Session {
     epoch_key: EpochKey,
     counter: u64,
     pin: [u8; 32],
     /// Keyring not yet written. Held until refusal checks have passed.
-    fresh: Option<Fresh>,
+    fresh: Option<Keyring>,
 }
 
 /// Publishes `rev` and its unpublished ancestors to `remote` under `bookmark`.
 ///
 /// The first call on an empty remote (no keyring) makes `identity` the owner
-/// and pins that signing key. With `owner_keys == None` it mints
-/// [`OwnerKeys`] and returns them. With `Some` keys whose remote id matches,
-/// it reuses that saved epoch secret instead (see the module docs). Later
+/// and pins that signing key. The caller must pass keys it already saved,
+/// whose remote id matches (see the module docs). Later
 /// calls check the pinned key and `state.counter`, then encrypt with the
 /// owner's local key or, for a member, with
 /// [`crate::keyring::VerifiedKeyring::current_key`].
@@ -341,7 +332,7 @@ pub fn publish(
 
     let mut written = 0usize;
     if let Some(fresh) = &session.fresh {
-        remote.write_keyring(&fresh.keyring.encode()?)?;
+        remote.write_keyring(&fresh.encode()?)?;
     }
     write_canonical(
         remote.public_store(),
@@ -401,13 +392,12 @@ pub fn publish(
             .or_default()
             .extend(new_wires);
     }
-    let new_owner_keys = session.fresh.and_then(|fresh| fresh.new_keys);
     Ok(PublishReport {
         revisions_published: plans.len(),
         public_objects_written: written,
         private_objects_sealed: sealed_objects,
         sealed_roots,
-        new_owner_keys,
+        new_owner_keys: None,
         warnings: checked.warnings,
     })
 }
@@ -430,39 +420,26 @@ fn open_session(
             // Saved keys win over minting a new epoch. The caller stored them
             // before this call; the keyring file is written only after the
             // refusal checks, from this same secret.
-            let (keyring, new_keys) = match owner_keys {
-                Some(saved) => {
-                    if saved.remote != remote_id {
-                        return Err(PublishError::Invalid(
-                            "owner keys are for a different remote".into(),
-                        ));
-                    }
-                    (Keyring::from_saved_owner(identity, saved)?, None)
-                }
-                None => {
-                    let (keyring, keys) = Keyring::create(remote_id, identity)?;
-                    (keyring, Some(keys))
-                }
-            };
+            let saved = owner_keys.ok_or_else(|| {
+                PublishError::Invalid(
+                    "save owner keys before the first publish (prepare them with Keyring::create)"
+                        .into(),
+                )
+            })?;
+            if saved.remote != remote_id {
+                return Err(PublishError::Invalid(
+                    "owner keys are for a different remote".into(),
+                ));
+            }
+            let keyring = Keyring::from_saved_owner(identity, saved)?;
             let pin = identity.public().signing;
             keyring.verify(&pin, 0)?;
-            let epoch_source = match &new_keys {
-                Some(keys) => keys,
-                None => match owner_keys {
-                    Some(saved) => saved,
-                    None => {
-                        return Err(PublishError::Invalid(
-                            "owner keys disappeared while opening the remote".into(),
-                        ))
-                    }
-                },
-            };
-            let epoch_key = owner_epoch_key(epoch_source, remote_id, 1)?;
+            let epoch_key = owner_epoch_key(saved, remote_id, 1)?;
             Ok(Session {
                 epoch_key,
                 counter: keyring.head.counter,
                 pin,
-                fresh: Some(Fresh { keyring, new_keys }),
+                fresh: Some(keyring),
             })
         }
         Err(error) => Err(error.into()),

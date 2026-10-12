@@ -2,9 +2,8 @@
 //!
 //! Revoke inserts a new epoch key into the owner store before the head moves.
 //! [`super::remote::commit_keyring`] writes those keys before the remote
-//! keyring. A crash in between leaves the new epoch only on disk; repeating
-//! the revoke then fails with "epoch key already stored" because the keyring
-//! on the remote is still the previous epoch.
+//! keyring. A crash in between is retried using the saved epoch secret;
+//! a pending signed head is completed before the next owner operation.
 
 use std::path::Path;
 

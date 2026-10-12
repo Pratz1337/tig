@@ -269,14 +269,18 @@ impl Keyring {
             .checked_add(1)
             .ok_or_else(|| KeyringError::Invalid("epoch overflow".into()))?;
         let map_key = (PRIVATE_GROUP.to_string(), new_epoch);
-        if owner_keys.keys.contains_key(&map_key) {
-            return Err(KeyringError::Invalid("epoch key already stored".into()));
-        }
-        let generated = EpochKey::generate(GroupEpoch {
-            remote: self.remote,
-            group: PRIVATE_GROUP.to_string(),
-            epoch: new_epoch,
-        })?;
+        // A previous attempt may have saved this key before its remote write
+        // failed. Reuse that locally generated secret, never overwrite it.
+        let generated = if owner_keys.keys.contains_key(&map_key) {
+            let saved = require_epoch_key(owner_keys, self.remote, new_epoch)?;
+            EpochKey::from_bytes(saved.context().clone(), *saved.to_bytes())
+        } else {
+            EpochKey::generate(GroupEpoch {
+                remote: self.remote,
+                group: PRIVATE_GROUP.to_string(),
+                epoch: new_epoch,
+            })?
+        };
         let mut fresh = Vec::with_capacity(remaining.len());
         for recipient in &remaining {
             fresh.push(grant(&generated, recipient, owner)?);

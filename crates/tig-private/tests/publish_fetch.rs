@@ -78,16 +78,24 @@ fn publish_at(
     rev: ObjectId,
     options: &PublishOptions,
 ) -> Result<PublishReport, PublishError> {
-    publish(
+    // This fixture is also the in-memory equivalent of saving owner keys
+    // before entering publish. Return prepared keys for existing scenarios.
+    let prepared = match keys {
+        None => Some(Keyring::create(remote.remote_id(), identity)?.1),
+        Some(_) => None,
+    };
+    let mut report = publish(
         repo.store().as_ref(),
         remote,
         identity,
-        keys,
+        keys.or(prepared.as_ref()),
         state,
         "main",
         rev,
         options,
-    )
+    )?;
+    report.new_owner_keys = prepared;
+    Ok(report)
 }
 
 fn fetch_new(
@@ -860,4 +868,446 @@ fn substituted_owner_is_refused_after_pinning() {
     }
     assert_eq!(bob_state, saved);
     assert_eq!(bob_state.owner_signing, Some(alice.public().signing));
+}
+
+#[test]
+fn first_publish_requires_keys_the_caller_can_save_before_remote_writes() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[(".env", ENV)], &[]);
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([21; 16]);
+    let before = files_of(dir.path());
+    let mut state = PublishState::new();
+    let result = publish(
+        repo.store().as_ref(),
+        &remote,
+        &owner,
+        None,
+        &mut state,
+        "main",
+        rev,
+        &PublishOptions::default(),
+    );
+    assert!(
+        result.is_err(),
+        "minting inside publish can lose the only epoch key on a crash"
+    );
+    assert_eq!(files_of(dir.path()), before);
+    assert_eq!(state, PublishState::new());
+}
+
+#[test]
+fn revoke_retries_after_only_owner_keys_reached_disk() {
+    let owner = Identity::generate().unwrap();
+    let member = Identity::generate().unwrap();
+    let (mut ring, mut keys) = Keyring::create([22; 16], &owner).unwrap();
+    ring.grant(&keys, &owner, &member.public()).unwrap();
+    let old_ring = ring.encode().unwrap();
+    ring.revoke(&mut keys, &owner, &member.public()).unwrap();
+    let saved_keys = keys.encode().unwrap();
+    // Crash after saving keys, before writing the new remote keyring.
+    let mut retried = Keyring::decode(&old_ring).unwrap();
+    let mut restored = OwnerKeys::decode(&saved_keys).unwrap();
+    retried
+        .revoke(&mut restored, &owner, &member.public())
+        .unwrap();
+    assert_eq!(
+        restored.encode().unwrap(),
+        saved_keys,
+        "never replace an existing epoch secret"
+    );
+    assert_eq!(retried.head.epochs["private"], 2);
+    assert!(matches!(
+        retried
+            .verify(&owner.public().signing, 0)
+            .unwrap()
+            .current_key("private", &member),
+        Err(KeyringError::NotMember)
+    ));
+}
+
+#[test]
+fn all_remote_bytes_hide_multi_branch_rename_delete_readd_history() {
+    let mut repo = repo();
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([23; 16]);
+    let (_, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    let mut state = PublishState::new();
+    let mut needles = vec![
+        ENV.to_vec(),
+        KEY.to_vec(),
+        ENV_V2.to_vec(),
+        b"hidden-first-name".to_vec(),
+        b"hidden-renamed-name".to_vec(),
+    ];
+    let first = save(
+        &mut repo,
+        &[
+            (".private", b"secrets/\n"),
+            (".env", ENV),
+            ("secrets/hidden-first-name", KEY),
+            ("public", MAIN),
+        ],
+        &[],
+    );
+    let renamed = save_child(
+        &mut repo,
+        &[("secrets/hidden-renamed-name", KEY)],
+        &["secrets/hidden-first-name"],
+    );
+    let deleted = save_child(&mut repo, &[], &["secrets/hidden-renamed-name", ".env"]);
+    let readded = save_child(
+        &mut repo,
+        &[(".env", ENV_V2), ("secrets/hidden-first-name", KEY)],
+        &[],
+    );
+    for rev in [first, renamed, deleted, readded] {
+        needles.extend(id_needles(rev));
+        let tree = repo.revision(&rev).unwrap().tree;
+        if lookup(repo.store().as_ref(), &tree, &p(".env"))
+            .unwrap()
+            .is_some()
+            || lookup(repo.store().as_ref(), &tree, &p("secrets"))
+                .unwrap()
+                .is_some()
+        {
+            needles.extend(id_needles(tree));
+        }
+        if let Some(leaf) = lookup(repo.store().as_ref(), &tree, &p("secrets")).unwrap() {
+            needles.extend(id_needles(leaf.id()));
+        }
+    }
+    needles.extend(id_needles(blob_of(&repo, first, ".env")));
+    needles.extend(id_needles(blob_of(
+        &repo,
+        first,
+        "secrets/hidden-first-name",
+    )));
+    needles.extend(id_needles(blob_of(&repo, readded, ".env")));
+    for (id, operation) in repo.op_log(100).unwrap() {
+        needles.extend(id_needles(id));
+        needles.extend(id_needles(operation.view));
+    }
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        readded,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let mut tx = repo.start("branch from first revision");
+    let branch = tx.new_change(&[first], "other branch").unwrap();
+    tx.set_working(DEFAULT_WORKSPACE, branch).unwrap();
+    repo.commit(tx).unwrap();
+    // A negation makes only a README public, so secret child names remain hidden.
+    let branch = save(
+        &mut repo,
+        &[
+            (".private", b"secrets/\n!notes/README\n"),
+            ("notes/README", b"public notes"),
+            (".env", ENV_V2),
+        ],
+        &[],
+    );
+    publish(
+        repo.store().as_ref(),
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        "other",
+        branch,
+        &PublishOptions {
+            confirm_negations: true,
+            ..PublishOptions::default()
+        },
+    )
+    .unwrap();
+    // Deleting .private cannot defeat the floor; secrets/ is absent here.
+    let floor = save_child(&mut repo, &[("public", MAIN_V2)], &[".private", "secrets"]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        floor,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let files = files_of(dir.path());
+    assert_hidden(&files, &needles);
+    // Also scan decompressed public bodies: compression cannot hide a leak
+    // from this assertion. Packs stay encrypted and get the raw-byte scan.
+    for path in files.keys().filter(|path| under(path, "objects")) {
+        let hex: String = path.components().skip(1)
+            .map(|part| part.as_os_str().to_string_lossy()).collect();
+        if let Ok(id) = hex.parse::<ObjectId>() {
+            let (_, body) = remote.public_store().get_raw(&id).unwrap().unwrap();
+            for needle in &needles {
+                assert!(!contains(&body, needle), "public object {id} contains a private needle");
+            }
+        }
+    }
+    let (outsider, report) = fetch_new(&remote, None, &mut FetchState::new()).unwrap();
+    let tree = outsider.get_revision(&tip(&report)).unwrap().tree;
+    assert_eq!(kind_at(&outsider, tree, ".env"), Some(EntryKind::Sealed));
+    assert_eq!(report.refs.len(), 2);
+}
+
+#[test]
+fn revoked_members_cannot_open_new_seals_even_when_blobs_deduplicate() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[(".env", ENV)], &[]);
+    let owner = Identity::generate().unwrap();
+    let member = Identity::generate().unwrap();
+    let (_dir, remote) = remote_at([24; 16]);
+    let (mut ring, mut keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    ring.grant(&keys, &owner, &member.public()).unwrap();
+    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    let mut state = PublishState::new();
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    ring.revoke(&mut keys, &owner, &member.public()).unwrap();
+    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    let next = save_child(&mut repo, &[("copy.key", ENV), ("public", MAIN)], &[]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        Some(&keys),
+        &mut state,
+        next,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let (store, report) = fetch_new(&remote, Some(&member), &mut FetchState::new()).unwrap();
+    let tree = store.get_revision(&tip(&report)).unwrap().tree;
+    for path in [".env", "copy.key"] {
+        assert_eq!(kind_at(&store, tree, path), Some(EntryKind::Sealed));
+    }
+    let old_key = ring
+        .verify(&owner.public().signing, 0)
+        .unwrap()
+        .key_for("private", 1, &member)
+        .unwrap();
+    for pack in remote.list_packs("private", 2).unwrap() {
+        assert!(tig_private::pack::Pack::open(&pack, &old_key).is_err());
+    }
+}
+
+#[test]
+fn malformed_keyrings_refs_and_portable_path_tricks_leave_fetch_state_unchanged() {
+    use tig_core::encode::Writer;
+    use tig_core::{Object, ObjectKind};
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([25; 16]);
+    let (ring, _) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    let good_ring = ring.encode().unwrap();
+    for bytes in [
+        vec![],
+        vec![255],
+        vec![1, 255, 255, 255],
+        good_ring[..80].to_vec(),
+    ] {
+        remote.write_keyring(&bytes).unwrap();
+        let mut state = FetchState::new();
+        assert!(fetch(&remote, &MemoryStore::new(), None, &mut state).is_err());
+        assert_eq!(state, FetchState::new());
+    }
+    remote.write_keyring(&good_ring).unwrap();
+    let mut huge = Writer::new();
+    huge.u8(1);
+    huge.varint(u64::MAX);
+    std::fs::write(dir.path().join("refs"), huge.finish()).unwrap();
+    assert!(fetch(&remote, &MemoryStore::new(), None, &mut FetchState::new()).is_err());
+    for name in ["../outside", ".TiG", "C:escape", "x\\escape", ".env."] {
+        let mut tree = Writer::new();
+        tree.u8(1);
+        tree.varint(1);
+        tree.u8(EntryKind::File as u8);
+        tree.str(name);
+        tree.id(&tig_core::object::hash_object(ObjectKind::Blob, MAIN));
+        let bytes = tree.finish();
+        let tree_id = tig_core::object::hash_object(ObjectKind::Tree, &bytes);
+        remote
+            .public_store()
+            .put_raw(&tree_id, ObjectKind::Tree, &bytes)
+            .unwrap();
+        let mut rev = tig_core::repo::root_revision();
+        rev.tree = tree_id;
+        let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
+        remote
+            .write_refs(&BTreeMap::from([("main".into(), id)]))
+            .unwrap();
+        let mut state = FetchState::new();
+        assert!(
+            fetch(&remote, &MemoryStore::new(), None, &mut state).is_err(),
+            "{name}"
+        );
+        assert_eq!(state, FetchState::new());
+    }
+}
+
+#[test]
+fn authenticated_seal_with_a_missing_target_is_refused() {
+    use tig_core::{Object, ObjectKind, Tree, TreeEntry};
+    use tig_private::pack::PackBuilder;
+    let owner = Identity::generate().unwrap();
+    let (_dir, remote) = remote_at([26; 16]);
+    let (ring, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    remote.write_keyring(&ring.encode().unwrap()).unwrap();
+    let key = &keys.keys[&("private".into(), 1)];
+    let missing = tig_core::object::hash_object(ObjectKind::Blob, ENV);
+    let sid = key.seal(&p(".env"), EntryKind::File, &missing);
+    let mut pack = PackBuilder::new(key);
+    pack.add_sealed(sid, p(".env"), EntryKind::File, missing)
+        .unwrap();
+    remote.put_pack(&pack.finish().unwrap()).unwrap();
+    let tree = Tree::new(vec![TreeEntry::sealed(".env", sid).unwrap()]).unwrap();
+    let tree_id = remote.public_store().put(&Object::Tree(tree)).unwrap();
+    let mut rev = tig_core::repo::root_revision();
+    rev.tree = tree_id;
+    let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
+    remote
+        .write_refs(&BTreeMap::from([("main".into(), id)]))
+        .unwrap();
+    let mut state = FetchState::new();
+    assert!(fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).is_err());
+    assert_eq!(state, FetchState::new());
+}
+
+#[test]
+fn public_rules_can_disclose_a_name_inside_a_sealed_root() {
+    let mut repo = repo();
+    let rev = save(
+        &mut repo,
+        &[
+            (".private", b"secrets/\nsecrets/named-in-rules\n"),
+            ("secrets/named-in-rules", ENV),
+        ],
+        &[],
+    );
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([27; 16]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        None,
+        &mut PublishState::new(),
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(public_kind(&remote, "secrets"), EntryKind::Sealed);
+    // Contract requires .private to be public. Name confidentiality therefore
+    // excludes names explicitly written in this public metadata.
+    assert!(files_of(dir.path())
+        .values()
+        .any(|bytes| contains(bytes, b"named-in-rules")));
+}
+
+#[test]
+fn withheld_packs_are_currently_indistinguishable_from_foreign_seals() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[(".env", ENV)], &[]);
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([28; 16]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        None,
+        &mut PublishState::new(),
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    for entry in std::fs::read_dir(dir.path().join("packs/private/1")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let (_store, report) = fetch_new(&remote, Some(&owner), &mut FetchState::new()).unwrap();
+    assert_eq!(report.unsealed, 0);
+    assert_eq!(report.still_sealed, 1);
+}
+
+#[test]
+fn hostile_pack_bytes_and_cross_remote_replay_fail_without_accepting_state() {
+    let mut repo = repo();
+    let rev = save(&mut repo, &[(".env", ENV)], &[]);
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([29; 16]);
+    publish_at(
+        &repo,
+        &remote,
+        &owner,
+        None,
+        &mut PublishState::new(),
+        rev,
+        &PublishOptions::default(),
+    )
+    .unwrap();
+    let pack_path = std::fs::read_dir(dir.path().join("packs/private/1"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let good = std::fs::read(&pack_path).unwrap();
+    let mut tampered = good.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    for bytes in [
+        b"TIGP\x01".to_vec(),
+        vec![255; 100],
+        tampered,
+        good[..good.len() / 2].to_vec(),
+    ] {
+        std::fs::write(&pack_path, bytes).unwrap();
+        let mut state = FetchState::new();
+        assert!(fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state).is_err());
+        assert_eq!(state, FetchState::new());
+    }
+    let (_other_dir, other) = remote_at([30; 16]);
+    other
+        .write_keyring(&remote.read_keyring().unwrap())
+        .unwrap();
+    assert!(fetch(
+        &other,
+        &MemoryStore::new(),
+        Some(&owner),
+        &mut FetchState::new()
+    )
+    .is_err());
+    assert!(other.put_pack(&good).is_err());
+}
+
+#[test]
+fn historical_paste_policy_currently_only_checks_the_same_revision() {
+    let mut repo = repo();
+    let owner = Identity::generate().unwrap();
+    let (dir, remote) = remote_at([31; 16]);
+    let mut state = PublishState::new();
+    let first = save(&mut repo, &[(".env", ENV)], &[]);
+    let keys = publish_at(&repo, &remote, &owner, None, &mut state, first,
+        &PublishOptions::default()).unwrap().new_owner_keys.unwrap();
+    // Renaming a historical secret out of the floor after deleting its old
+    // path bypasses same-revision equality checks. Requires a policy decision
+    // about historical paste detection versus explicit declassification.
+    let renamed = save_child(&mut repo, &[("public-copy", ENV)], &[".env"]);
+    publish_at(&repo, &remote, &owner, Some(&keys), &mut state, renamed,
+        &PublishOptions::default()).unwrap();
+    assert!(files_of(dir.path()).values().any(|bytes| contains(bytes, ENV)));
 }

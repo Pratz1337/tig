@@ -43,6 +43,12 @@ pub struct DiskStore {
 }
 
 impl DiskStore {
+    /// Refers to an existing layout without creating anything. Remote reads
+    /// must not create `tmp` through an attacker-controlled directory link.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Self {
+        DiskStore { root: root.into() }
+    }
+
     /// Opens a store at `root`, creating `root` and `root/tmp` when missing.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -53,6 +59,30 @@ impl DiskStore {
     /// Directory this store reads and writes.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Bounded read for untrusted remote storage. Local hot-path reads retain
+    /// their existing behavior; this cap also bounds a concurrently growing file.
+    pub fn get_raw_limited(&self, id: &ObjectId) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+        const MAX_FILE: u64 = MAX_OBJECT_BYTES as u64 + 1024;
+        let file = match File::open(self.object_path(id)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_FILE {
+            return Err(corrupt(*id, "file is too large or is not a regular file"));
+        }
+        let mut data = Vec::new();
+        file.take(MAX_FILE + 1).read_to_end(&mut data)?;
+        if data.len() as u64 > MAX_FILE {
+            return Err(corrupt(*id, "file is too large"));
+        }
+        let (kind, body) = decode_loose(id, &data)?;
+        if hash_object(kind, &body) != *id {
+            return Err(corrupt(*id, "content hash does not match id"));
+        }
+        Ok(Some((kind, body)))
     }
 
     fn object_path(&self, id: &ObjectId) -> PathBuf {

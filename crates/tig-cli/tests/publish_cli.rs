@@ -436,3 +436,37 @@ fn alice_publishes_bob_reads_carol_does_not() {
         "bob can see the new marker"
     );
 }
+
+#[test]
+fn outsider_edits_snapshots_and_republishes_without_deleting_seals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner_repo = tmp.path().join("owner");
+    let source = tmp.path().join("source");
+    let clone = tmp.path().join("clone");
+    let own_remote = tmp.path().join("own-remote");
+    let owner_id = tmp.path().join("owner.id");
+    let outsider_id = tmp.path().join("outsider.id");
+    fs::create_dir(&owner_repo).unwrap();
+    fs::write(owner_repo.join(".env"), OLD_MARKER).unwrap();
+    fs::write(owner_repo.join("public"), "original").unwrap();
+    let owner = |dir: &Path| tig(dir, "owner", "owner@x", &owner_id);
+    let outsider = |dir: &Path| tig(dir, "outsider", "outsider@x", &outsider_id);
+    expect_ok(owner(tmp.path()).args(["init"]).arg(&owner_repo));
+    expect_ok(owner(&owner_repo).args(["remote", "add", "origin"]).arg(&source));
+    expect_ok(owner(&owner_repo).args(["publish", "origin"]));
+    expect_ok(outsider(tmp.path()).arg("clone").arg(&source).arg(&clone));
+    expect_ok(outsider(&clone).args(["edit", "origin/main"]));
+    fs::write(clone.join("public"), "outsider edit").unwrap();
+    expect_ok(outsider(&clone).args(["snapshot", "--rehash"]));
+    for command in ["status", "diff", "log"] {
+        let output = expect_ok(outsider(&clone).arg(command));
+        assert!(!output.contains("D .env"), "{output}");
+        assert!(!output.contains(OLD_MARKER), "{output}");
+    }
+    expect_ok(outsider(&clone).args(["remote", "add", "mine"]).arg(&own_remote));
+    let published = expect_ok(outsider(&clone).args(["publish", "mine"]));
+    assert!(sealed_names(&published).contains(&".env".into()));
+    assert!(!tree_contains(&own_remote, OLD_MARKER.as_bytes()));
+    let cat = run(outsider(&clone).args(["cat", ".env"]));
+    assert!(cat.stderr.contains(".env is not a file"));
+}

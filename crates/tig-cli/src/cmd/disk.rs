@@ -105,40 +105,12 @@ fn place_replace(tmp: &Path, dest: &Path) -> Result<()> {
             }
         }
     }
-    if dest.try_exists()? {
-        return replace_via_backup(tmp, dest);
-    }
     match last {
         Some(err) => Err(CliError::msg(format!(
             "cannot replace {}: {err}",
             ui::show_path(dest)
         ))),
         None => Err(CliError::msg("rename failed")),
-    }
-}
-
-fn replace_via_backup(tmp: &Path, dest: &Path) -> Result<()> {
-    let bak_name = format!(
-        "{}.bak",
-        dest.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-    );
-    let bak = dest.with_file_name(bak_name);
-    let _ = fs::remove_file(&bak);
-    fs::rename(dest, &bak)?;
-    match fs::rename(tmp, dest) {
-        Ok(()) => {
-            let _ = fs::remove_file(&bak);
-            Ok(())
-        }
-        Err(err) => {
-            let _ = fs::rename(&bak, dest);
-            Err(CliError::msg(format!(
-                "cannot replace {}: {err}",
-                ui::show_path(dest)
-            )))
-        }
     }
 }
 
@@ -162,5 +134,22 @@ struct RemoveOnDrop(PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_replace_keeps_existing_keys_and_recovery_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("owner-keys");
+        let backup = dir.path().join("owner-keys.bak");
+        fs::write(&dest, b"keys").unwrap();
+        fs::write(&backup, b"recovery keys").unwrap();
+        assert!(place_replace(&dir.path().join("missing"), &dest).is_err());
+        assert_eq!(fs::read(dest).unwrap(), b"keys");
+        assert_eq!(fs::read(backup).unwrap(), b"recovery keys");
     }
 }

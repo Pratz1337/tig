@@ -31,6 +31,7 @@ pub(super) fn run(
     let identity = identity::load_or_create()?;
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
+    super::remote::finish_keyring_update(&cfg)?;
     let rev = publish_rev(&session, revision)?;
     let dir_remote = super::remote::open_or_create(&cfg.path)?;
     let missing_keyring = !cfg.path.join("keyring").try_exists()?;
@@ -59,13 +60,6 @@ pub(super) fn run(
         rev,
         &options,
     )?;
-    if let Some(keys) = &report.new_owner_keys {
-        // Only the minting path returns keys. Do not overwrite a keystore
-        // that was saved before this call.
-        if super::remote::load_owner_keys(&cfg.dir)?.is_none() {
-            super::remote::save_owner_keys_new(&cfg.dir, keys)?;
-        }
-    }
     super::remote::save_publish_state(&cfg.dir, &state)?;
     let mut tx = session
         .repo

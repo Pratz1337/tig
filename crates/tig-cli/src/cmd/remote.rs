@@ -185,7 +185,15 @@ fn load_states(dir: &Path) -> Result<(PublishState, FetchState)> {
         } else {
             fetched.remote_id
         };
-        let counter = published.counter.max(fetched.counter);
+        let mut counter = published.counter.max(fetched.counter);
+        if let Some(bytes) = read_optional(&dir.join("pending-keyring"))? {
+            let pending = Keyring::decode(&bytes)?;
+            if pending.remote != remote_id {
+                return Err(CliError::msg("pending keyring is for a different remote"));
+            }
+            pending.verify(&pin, 0)?;
+            counter = counter.max(pending.head.counter);
+        }
         published.remote_id = remote_id;
         fetched.remote_id = remote_id;
         published.owner_signing = Some(pin);
@@ -233,6 +241,7 @@ pub(super) fn load_owner(
     cfg: &RemoteCfg,
     identity: &tig_private::keys::Identity,
 ) -> Result<OwnerBundle> {
+    finish_keyring_update(cfg)?;
     let remote = open_existing(&cfg.path)?;
     let keys = load_owner_keys(&cfg.dir)?.ok_or_else(|| {
         CliError::msg("no owner keys for this remote; only the owner can grant or revoke")
@@ -271,14 +280,60 @@ pub(super) fn load_owner(
     })
 }
 
-/// Saves owner keys, then the remote keyring, then the publish-state counter.
-/// Revoke must keep this order: the new epoch secret has to be on disk before
-/// the remote keyring names it.
+/// Save keys, then a local signed pending head and rollback floor, before
+/// exposing the new head remotely. A retry completes a pending write first.
 pub(super) fn commit_keyring(cfg: &RemoteCfg, bundle: &mut OwnerBundle) -> Result<()> {
     save_owner_keys(&cfg.dir, &bundle.keys)?;
-    bundle.remote.write_keyring(&bundle.keyring.encode()?)?;
+    let bytes = bundle.keyring.encode()?;
+    super::disk::write_replace(&cfg.dir.join("pending-keyring"), &bytes, false)?;
     bundle.state.counter = bundle.keyring.head.counter;
-    save_publish_state(&cfg.dir, &bundle.state)
+    save_publish_state(&cfg.dir, &bundle.state)?;
+    bundle.remote.write_keyring(&bytes)?;
+    fs::remove_file(cfg.dir.join("pending-keyring"))?;
+    Ok(())
+}
+
+/// Completes an interrupted owner update using only locally saved, signed
+/// material. Never roll back a newer verified remote head.
+pub(super) fn finish_keyring_update(cfg: &RemoteCfg) -> Result<()> {
+    let path = cfg.dir.join("pending-keyring");
+    let Some(bytes) = read_optional(&path)? else {
+        return Ok(());
+    };
+    let pending = Keyring::decode(&bytes)?;
+    let mut state = load_publish_state(&cfg.dir)?;
+    let pin = state
+        .owner_signing
+        .ok_or_else(|| CliError::msg("pending keyring has no owner pin"))?;
+    let verified = pending.verify(&pin, 0)?;
+    let keys = load_owner_keys(&cfg.dir)?
+        .ok_or_else(|| CliError::msg("pending keyring has no saved owner keys"))?;
+    if keys.remote != pending.remote {
+        return Err(CliError::msg(
+            "pending keyring keys are for a different remote",
+        ));
+    }
+    for (group, epoch) in &pending.head.epochs {
+        if !keys.keys.contains_key(&(group.clone(), *epoch)) {
+            return Err(CliError::msg("pending keyring epoch key is missing"));
+        }
+    }
+    let remote = open_existing(&cfg.path)?;
+    if remote.remote_id() != pending.remote {
+        return Err(CliError::msg("pending keyring is for a different remote"));
+    }
+    let current = Keyring::decode(&remote.read_keyring()?)?;
+    if current.remote != pending.remote {
+        return Err(CliError::msg("remote keyring is for a different remote"));
+    }
+    current.verify(&pin, 0)?;
+    if current.head.counter <= verified.counter() {
+        remote.write_keyring(&bytes)?;
+    }
+    state.counter = state.counter.max(current.head.counter);
+    save_publish_state(&cfg.dir, &state)?;
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -330,6 +385,87 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_revoke_is_recovered_before_using_an_older_remote_head() {
+        use tig_private::keys::Identity;
+        for remote_updated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = RemoteCfg {
+                name: "origin".into(),
+                dir: dir.path().join("cfg"),
+                path: dir.path().join("remote"),
+            };
+            let owner = Identity::generate().unwrap();
+            let member = Identity::generate().unwrap();
+            let remote = DirRemote::create(&cfg.path, [41; 16]).unwrap();
+            let (mut ring, mut keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+            ring.grant(&keys, &owner, &member.public()).unwrap();
+            remote.write_keyring(&ring.encode().unwrap()).unwrap();
+            let mut state = PublishState::new();
+            state.remote_id = remote.remote_id();
+            state.owner_signing = Some(owner.public().signing);
+            state.counter = ring.head.counter;
+            save_publish_state(&cfg.dir, &state).unwrap();
+            ring.revoke(&mut keys, &owner, &member.public()).unwrap();
+            save_owner_keys(&cfg.dir, &keys).unwrap();
+            super::super::disk::write_replace(
+                &cfg.dir.join("pending-keyring"),
+                &ring.encode().unwrap(),
+                false,
+            )
+            .unwrap();
+            if remote_updated {
+                remote.write_keyring(&ring.encode().unwrap()).unwrap();
+            }
+            // Crash before persisting the new counter. Pending local state is
+            // already a rollback floor, even before a mutating command retries.
+            assert_eq!(
+                load_fetch_state(&cfg.dir).unwrap().counter,
+                ring.head.counter
+            );
+            let recovered = load_owner(&cfg, &owner).unwrap();
+            assert_eq!(recovered.keyring.head, ring.head);
+            assert_eq!(recovered.state.counter, ring.head.counter);
+            assert!(!cfg.dir.join("pending-keyring").exists());
+        }
+    }
+
+    #[test]
+    fn pending_update_never_overwrites_a_newer_verified_head() {
+        use tig_private::keys::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RemoteCfg {
+            name: "origin".into(),
+            dir: dir.path().join("cfg"),
+            path: dir.path().join("remote"),
+        };
+        let owner = Identity::generate().unwrap();
+        let remote = DirRemote::create(&cfg.path, [42; 16]).unwrap();
+        let (mut ring, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+        save_owner_keys(&cfg.dir, &keys).unwrap();
+        super::super::disk::write_replace(
+            &cfg.dir.join("pending-keyring"),
+            &ring.encode().unwrap(),
+            false,
+        )
+        .unwrap();
+        ring.grant(&keys, &owner, &Identity::generate().unwrap().public())
+            .unwrap();
+        let newest = ring.encode().unwrap();
+        remote.write_keyring(&newest).unwrap();
+        let mut state = PublishState::new();
+        state.remote_id = remote.remote_id();
+        state.owner_signing = Some(owner.public().signing);
+        state.counter = ring.head.counter;
+        save_publish_state(&cfg.dir, &state).unwrap();
+        finish_keyring_update(&cfg).unwrap();
+        assert_eq!(remote.read_keyring().unwrap(), newest);
+        assert_eq!(
+            load_fetch_state(&cfg.dir).unwrap().counter,
+            ring.head.counter
+        );
+    }
 
     #[test]
     fn fetch_and_publish_share_the_pin_and_highest_counter() {

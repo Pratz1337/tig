@@ -16,13 +16,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tig_core::encode::{Reader, Writer};
-use tig_core::store::DiskStore;
-use tig_core::ObjectId;
+use tig_core::store::{DiskStore, Store};
+use tig_core::{ObjectId, ObjectKind};
 
 use crate::pack::Pack;
 
@@ -54,7 +54,22 @@ pub enum RemoteError {
 pub struct DirRemote {
     root: PathBuf,
     remote_id: [u8; 16],
-    objects: DiskStore,
+    objects: PublicObjects,
+}
+
+/// Only remote reads pay for untrusted-file limits.
+struct PublicObjects(DiskStore);
+
+impl Store for PublicObjects {
+    fn get_raw(&self, id: &ObjectId) -> tig_core::Result<Option<(ObjectKind, Vec<u8>)>> {
+        self.0.get_raw_limited(id)
+    }
+    fn put_raw(&self, id: &ObjectId, kind: ObjectKind, body: &[u8]) -> tig_core::Result<()> {
+        self.0.put_raw(id, kind, body)
+    }
+    fn has(&self, id: &ObjectId) -> tig_core::Result<bool> {
+        self.0.has(id)
+    }
 }
 
 impl DirRemote {
@@ -83,18 +98,18 @@ impl DirRemote {
         Ok(DirRemote {
             root,
             remote_id,
-            objects,
+            objects: PublicObjects(objects),
         })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, RemoteError> {
         let root = path.into();
         let remote_id = read_remote_id(&root.join("remote-id"))?;
-        let objects = DiskStore::open(root.join("objects"))?;
+        let objects = DiskStore::open_existing(root.join("objects"));
         Ok(DirRemote {
             root,
             remote_id,
-            objects,
+            objects: PublicObjects(objects),
         })
     }
 
@@ -103,7 +118,7 @@ impl DirRemote {
     }
 
     /// Public objects only. Packs do not go through this store.
-    pub fn public_store(&self) -> &DiskStore {
+    pub fn public_store(&self) -> &dyn Store {
         &self.objects
     }
 
@@ -165,12 +180,15 @@ impl DirRemote {
         }
         paths.sort();
         let mut out = Vec::with_capacity(paths.len());
+        let mut remaining = MAX_PACK_FILE as u64;
         for path in paths {
             let meta = fs::metadata(&path)?;
             if !meta.is_file() {
                 continue;
             }
-            out.push(read_limited(&path, MAX_PACK_FILE as u64)?);
+            let bytes = read_limited(&path, remaining)?;
+            remaining -= bytes.len() as u64;
+            out.push(bytes);
         }
         Ok(out)
     }
@@ -224,12 +242,12 @@ fn check_group(group: &str) -> Result<(), RemoteError> {
 }
 
 fn read_remote_id(path: &Path) -> Result<[u8; 16], RemoteError> {
-    let bytes = match fs::read(path) {
+    let bytes = match read_limited(path, 16) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(RemoteError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             return Err(RemoteError::Invalid("remote-id is missing".into()));
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     if bytes.len() != 16 {
         return Err(RemoteError::Invalid(
@@ -242,14 +260,20 @@ fn read_remote_id(path: &Path) -> Result<[u8; 16], RemoteError> {
 }
 
 fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>, RemoteError> {
-    let meta = fs::metadata(path)?;
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(RemoteError::Invalid("expected a file".into()));
     }
     if meta.len() > max {
         return Err(RemoteError::Invalid("file is too large".into()));
     }
-    Ok(fs::read(path)?)
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(RemoteError::Invalid("file is too large".into()));
+    }
+    Ok(bytes)
 }
 
 fn encode_refs(refs: &BTreeMap<String, ObjectId>) -> Result<Vec<u8>, RemoteError> {
@@ -363,9 +387,6 @@ fn publish(tmp: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result<(), R
             }
         }
     }
-    if replace && dest.try_exists()? {
-        return replace_via_backup(tmp, dest);
-    }
     match last {
         Some(error) => Err(error.into()),
         None => Err(RemoteError::Invalid("rename failed".into())),
@@ -383,31 +404,64 @@ fn same_bytes(dest: &Path, bytes: &[u8]) -> Result<(), RemoteError> {
     }
 }
 
-fn replace_via_backup(tmp: &Path, dest: &Path) -> Result<(), RemoteError> {
-    let bak_name = format!(
-        "{}.bak",
-        dest.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-    );
-    let bak = dest.with_file_name(bak_name);
-    let _ = fs::remove_file(&bak);
-    fs::rename(dest, &bak)?;
-    match fs::rename(tmp, dest) {
-        Ok(()) => {
-            let _ = fs::remove_file(&bak);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&bak, dest);
-            Err(error.into())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_packs_have_an_aggregate_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = DirRemote::create(dir.path(), [3; 16]).unwrap();
+        let packs = dir.path().join("packs/private/1");
+        fs::create_dir_all(&packs).unwrap();
+        for name in ["a.pack", "b.pack"] {
+            let file = fs::File::create(packs.join(name)).unwrap();
+            file.set_len((MAX_PACK_FILE / 2 + 1) as u64).unwrap();
+        }
+        assert!(remote.list_packs("private", 1).is_err());
+    }
+
+    #[test]
+    fn oversized_public_objects_are_refused_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = DirRemote::create(dir.path(), [4; 16]).unwrap();
+        let shard = dir.path().join("objects/01");
+        fs::create_dir_all(&shard).unwrap();
+        let file = fs::File::create(shard.join("01".repeat(31))).unwrap();
+        file.set_len(256 * 1024 * 1024 + 1025).unwrap();
+        drop(file);
+        let error = remote
+            .public_store()
+            .get_raw(&ObjectId([1; 32]))
+            .unwrap_err();
+        assert!(error.to_string().contains("file is too large"), "{error}");
+    }
+
+    #[test]
+    fn opening_a_remote_does_not_create_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("remote-id"), [1; 16]).unwrap();
+        let _remote = DirRemote::open(dir.path()).unwrap();
+        assert!(
+            !dir.path().join("objects").exists(),
+            "fetch must not write to its source"
+        );
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keyring");
+        fs::write(&dest, b"old").unwrap();
+        fs::write(dir.path().join("keyring.bak"), b"recovery copy").unwrap();
+        // An absent temporary file must not move or delete recovery data.
+        assert!(publish(&dir.path().join("missing"), &dest, b"new", true).is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+        assert_eq!(
+            fs::read(dir.path().join("keyring.bak")).unwrap(),
+            b"recovery copy"
+        );
+    }
 
     #[test]
     fn refs_reject_unsorted_trailing_and_noncanonical_bytes() {
