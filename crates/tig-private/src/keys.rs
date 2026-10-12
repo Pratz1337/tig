@@ -206,6 +206,11 @@ impl EpochKey {
         &self.context
     }
 
+    pub(crate) fn matches_commitment(&self, commitment: &[u8; 32]) -> bool {
+        blake3::Hash::from(*self.subkey(domain::EPOCH_KEY_COMMITMENT))
+            == blake3::Hash::from(*commitment)
+    }
+
     fn subkey(&self, label: &str) -> Zeroizing<[u8; 32]> {
         let ctx = self.context.encoding();
         let mut material = Zeroizing::new(Vec::with_capacity(self.bytes.len() + ctx.len()));

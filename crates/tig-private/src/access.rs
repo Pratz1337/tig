@@ -2,9 +2,12 @@
 //!
 //! Both commands verify the pinned keyring, write the owner's local
 //! `pending-keyring` (and, for revoke, the new epoch secrets) before the
-//! remote changes, then `commit_head`. A stale head is verified again and
-//! the commit is rebuilt, at most eight times. Revoke puts the owner-resigned
-//! manifest and the new keyring in the same commit.
+//! remote changes, then `commit_head`. A stale head is verified again, never
+//! below the counter of the head the last attempt was built on, and the
+//! commit is rebuilt, at most eight times. Revoke puts the owner-resigned
+//! manifest and the new keyring in the same commit. The rollback floors in
+//! `publish-state` move only after a commit lands; until then the pending
+//! keyring is the crash record.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -44,6 +47,7 @@ struct Base {
     version: HeadVersion,
     keyring: Keyring,
     manifest: Option<Vec<u8>>,
+    sequence: u64,
 }
 
 /// Grants `member` the current private epoch. `local_dir` holds `owner-keys`,
@@ -60,17 +64,19 @@ pub fn grant(
     let mut base = loaded(remote, owner, state)?;
     for attempt in 0..ATTEMPTS {
         if attempt > 0 && is_current_member(&base.keyring, member) {
+            accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
         let mut next = base.keyring.clone();
         next.grant(keys, owner, member)?;
-        stage(local_dir, state, &next)?;
+        stage(local_dir, &next)?;
         if commit(remote, &base, &next, None)? {
+            accept(local_dir, state, &next, base.manifest.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
-        base = reloaded(remote, owner, state)?;
+        base = reloaded(remote, owner, base.keyring.head.counter, base.sequence)?;
     }
     Err(AccessError::Busy)
 }
@@ -91,6 +97,7 @@ pub fn revoke(
             if attempt == 0 {
                 return Err(KeyringError::NotMember.into());
             }
+            accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
@@ -104,15 +111,13 @@ pub fn revoke(
             &base.keyring,
             state.manifest_seq,
         )?;
-        if let Some(bytes) = &resigned {
-            state.manifest_seq = Manifest::decode(bytes)?.sequence;
-        }
-        stage(local_dir, state, &next)?;
+        stage(local_dir, &next)?;
         if commit(remote, &base, &next, resigned.as_deref())? {
+            accept(local_dir, state, &next, resigned.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
-        base = reloaded(remote, owner, state)?;
+        base = reloaded(remote, owner, base.keyring.head.counter, base.sequence)?;
     }
     Err(AccessError::Busy)
 }
@@ -158,55 +163,64 @@ pub fn finish_pending(
             "pending keyring belongs to a different owner".into(),
         ));
     }
-    // The pending counter is the new floor. The remote head may still be the
-    // older one this update is about to replace, so it is not judged against
-    // that floor.
-    let mut base = decode_base(remote.remote_id(), remote.read_head()?, pin, 0)?;
+    // The pending counter is not committed; only saved, committed floors apply.
+    let mut base = decode_base(
+        remote.remote_id(),
+        remote.read_head()?,
+        pin,
+        state.counter,
+        state.manifest_seq,
+    )?;
     if base.keyring.head.counter > verified.counter() {
-        state.counter = state.counter.max(base.keyring.head.counter);
-        save_state(local_dir, state)?;
-        clear_pending(local_dir)?;
-        return Ok(());
-    }
-    if base.keyring.head.counter == verified.counter()
-        && base.keyring.encode()? == bytes
-    {
-        state.counter = state.counter.max(verified.counter());
-        save_state(local_dir, state)?;
+        accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
         clear_pending(local_dir)?;
         return Ok(());
     }
     let moved = epochs_of(&base.keyring) != epochs_of(&pending);
     for _ in 0..ATTEMPTS {
         if base.keyring.head.counter > verified.counter() {
-            state.counter = state.counter.max(base.keyring.head.counter);
-            save_state(local_dir, state)?;
+            accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
+        if base.keyring.head.counter == verified.counter() {
+            // Either this update landed before the crash, or another owner
+            // process committed a different head on the same parent. Never
+            // replace a committed head with its sibling.
+            let landed = base.keyring.encode()? == bytes;
+            accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
+            clear_pending(local_dir)?;
+            if landed {
+                return Ok(());
+            }
+            return Err(AccessError::Invalid(
+                "an interrupted grant or revoke was superseded by another change to the remote; check its members and run it again"
+                    .into(),
+            ));
+        }
         let resigned = if moved {
-            let bytes = manifest::resign_as_owner(
+            manifest::resign_as_owner(
                 base.manifest.as_deref(),
                 remote.remote_id(),
                 owner,
                 &base.keyring,
                 state.manifest_seq,
-            )?;
-            if let Some(bytes) = &bytes {
-                state.manifest_seq = Manifest::decode(bytes)?.sequence;
-                save_state(local_dir, state)?;
-            }
-            bytes
+            )?
         } else {
             None
         };
         if commit(remote, &base, &pending, resigned.as_deref())? {
-            state.counter = state.counter.max(verified.counter());
-            save_state(local_dir, state)?;
+            accept(local_dir, state, &pending, resigned.as_deref())?;
             clear_pending(local_dir)?;
             return Ok(());
         }
-        base = decode_base(remote.remote_id(), remote.read_head()?, pin, 0)?;
+        base = decode_base(
+            remote.remote_id(),
+            remote.read_head()?,
+            pin,
+            base.keyring.head.counter,
+            base.sequence,
+        )?;
     }
     Err(AccessError::Busy)
 }
@@ -238,21 +252,25 @@ fn loaded_with_pin(
     state: &PublishState,
 ) -> Result<Base, AccessError> {
     let head = remote.read_head()?;
-    decode_base(remote.remote_id(), head, pin, state.counter)
-}
-
-fn reloaded(
-    remote: &dyn Remote,
-    owner: &Identity,
-    state: &PublishState,
-) -> Result<Base, AccessError> {
-    let head = remote.read_head()?;
     decode_base(
         remote.remote_id(),
         head,
-        owner.public().signing,
+        pin,
         state.counter,
+        state.manifest_seq,
     )
+}
+
+/// The head after a lost race, never older than `floor`, the counter of the
+/// head the previous attempt was built on.
+fn reloaded(
+    remote: &dyn Remote,
+    owner: &Identity,
+    floor: u64,
+    sequence: u64,
+) -> Result<Base, AccessError> {
+    let head = remote.read_head()?;
+    decode_base(remote.remote_id(), head, owner.public().signing, floor, sequence)
 }
 
 fn decode_base(
@@ -260,6 +278,7 @@ fn decode_base(
     head: RemoteHead,
     pin: [u8; 32],
     floor: u64,
+    sequence_floor: u64,
 ) -> Result<Base, AccessError> {
     let Some(bytes) = head.keyring.as_deref() else {
         return Err(AccessError::Invalid(
@@ -273,10 +292,24 @@ fn decode_base(
         ));
     }
     keyring.verify(&pin, floor)?;
+    let sequence = match head.manifest.as_deref() {
+        Some(bytes) => {
+            let manifest = Manifest::decode(bytes)?;
+            manifest.verify(remote_id, &keyring, sequence_floor)?;
+            manifest.sequence
+        }
+        None if sequence_floor > 0 => {
+            return Err(AccessError::Invalid(
+                "the remote's publish manifest is missing, but this state has seen one".into(),
+            ))
+        }
+        None => 0,
+    };
     Ok(Base {
         version: head.version(),
         keyring,
         manifest: head.manifest,
+        sequence,
     })
 }
 
@@ -294,10 +327,24 @@ fn commit(
     }
 }
 
-fn stage(local_dir: &Path, state: &mut PublishState, next: &Keyring) -> Result<(), AccessError> {
-    let bytes = next.encode()?;
-    write_file(&local_dir.join(PENDING_FILE), &bytes, false)?;
-    state.counter = state.counter.max(next.head.counter);
+/// Saves the signed head about to be committed, for crash recovery. It is
+/// not a rollback floor yet: the commit may lose a race.
+fn stage(local_dir: &Path, next: &Keyring) -> Result<(), AccessError> {
+    write_file(&local_dir.join(PENDING_FILE), &next.encode()?, false)
+}
+
+/// Raises the saved floors to a head that is now on the remote. `manifest`
+/// is the manifest bytes this call committed, if any.
+fn accept(
+    local_dir: &Path,
+    state: &mut PublishState,
+    keyring: &Keyring,
+    manifest: Option<&[u8]>,
+) -> Result<(), AccessError> {
+    state.counter = state.counter.max(keyring.head.counter);
+    if let Some(bytes) = manifest {
+        state.manifest_seq = state.manifest_seq.max(Manifest::decode(bytes)?.sequence);
+    }
     save_state(local_dir, state)
 }
 

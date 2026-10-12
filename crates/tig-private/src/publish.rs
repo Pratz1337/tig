@@ -15,7 +15,7 @@
 //! remote keyring whose secret existed only in a dead process. Passing
 //! `None` to an empty remote is refused. Use `Keyring::create` to prepare keys.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use tig_core::encode::{Reader, Writer};
 use tig_core::object::{hash_object, Object, ObjectKind, Tree};
@@ -55,7 +55,7 @@ pub enum PublishError {
     #[error(transparent)]
     Keyring(#[from] KeyringError),
     #[error(transparent)]
-    Remote(#[from] RemoteError),
+    Remote(RemoteError),
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error(transparent)]
@@ -91,6 +91,15 @@ pub enum PublishError {
     Busy,
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<RemoteError> for PublishError {
+    fn from(error: RemoteError) -> Self {
+        match error {
+            RemoteError::Busy(_) => Self::Busy,
+            other => Self::Remote(other),
+        }
+    }
 }
 
 /// A public file whose bytes match a private file in the same revision.
@@ -359,11 +368,17 @@ struct Session {
 /// owner's local key or, for a member, with
 /// [`crate::keyring::VerifiedKeyring::current_key`].
 ///
-/// On `Err`, `state` is unchanged and nothing has been uploaded: refusal
-/// checks and the fast-forward check run before the first `put_batch` or
-/// `put_pack`. A lost `commit_head` race can still leave content-addressed
-/// objects and a pack that no manifest names. The bookmark does not move
-/// until `commit_head` returns [`CommitOutcome::Committed`].
+/// On `Err`, `state` is unchanged. Refusal checks and the fast-forward check
+/// run before the first `put_batch` or `put_pack`, so a refusal on the first
+/// attempt uploads nothing. A lost `commit_head` race can leave
+/// content-addressed objects and a pack that no manifest names, even if a
+/// later attempt refuses. The bookmark does not move until `commit_head`
+/// returns [`CommitOutcome::Committed`]. Every attempt verifies the head
+/// against the highest keyring counter and manifest sequence seen so far, so
+/// a remote cannot roll back between attempts.
+///
+/// A move that is a fast-forward only through predecessors (a rewrite of
+/// published history) succeeds with a warning naming each replaced change.
 ///
 /// `fetched` is the other half of this remote's correspondence: an internal
 /// revision rebuilt by fetch is already published under that public id.
@@ -382,7 +397,23 @@ pub fn publish(
     if bookmark.is_empty() || bookmark.len() > MAX_BOOKMARK {
         return Err(PublishError::Invalid("invalid bookmark".into()));
     }
+    let mut pin = saved_pin(state, remote.remote_id())?;
+    if let Some(fetched_pin) = fetched.owner_signing {
+        if fetched.remote_id != remote.remote_id() || pin.is_some_and(|pin| pin != fetched_pin) {
+            return Err(PublishError::Invalid(
+                "fetch and publish state disagree about the remote owner".into(),
+            ));
+        }
+        pin = Some(fetched_pin);
+    } else if fetched.counter != 0 || fetched.manifest_seq != 0 || !fetched.revisions.is_empty() {
+        return Err(PublishError::Invalid(
+            "fetch state is missing its owner pin".into(),
+        ));
+    }
     let mut prep: Option<Prep> = None;
+    // Rollback floors for this call. Local state moves only after a commit.
+    let mut counter_floor = state.counter.max(fetched.counter);
+    let mut sequence_floor = state.manifest_seq.max(fetched.manifest_seq);
     for _ in 0..PUBLISH_ATTEMPTS {
         let head = remote.read_head()?;
         let session = open_session(
@@ -390,8 +421,13 @@ pub fn publish(
             head.keyring.as_deref(),
             identity,
             owner_keys,
-            state,
+            pin,
+            counter_floor,
         )?;
+        counter_floor = counter_floor.max(session.counter);
+        if session.fresh.is_none() {
+            pin = Some(session.pin);
+        }
         let epoch = session.epoch_key.context().epoch;
         let reuse = prep
             .as_ref()
@@ -403,8 +439,11 @@ pub fn publish(
             remote.remote_id(),
             head.manifest.as_deref(),
             &session.keyring,
-            state.manifest_seq,
+            sequence_floor,
         )?;
+        if let Some(manifest) = &previous {
+            sequence_floor = sequence_floor.max(manifest.sequence);
+        }
         let mut refs = match &previous {
             Some(manifest) => manifest.refs.clone(),
             None => remote.read_legacy_refs()?.unwrap_or_default(),
@@ -421,7 +460,7 @@ pub fn publish(
             &prep.as_ref().expect("projection was just built").public_ids,
             rev,
         )?;
-        ensure_fast_forward(
+        let rewrites = ensure_fast_forward(
             store,
             rev,
             bookmark,
@@ -430,10 +469,21 @@ pub fn publish(
             &local_of_public(state, fetched),
             options.force,
         )?;
+        let metadata_warnings = metadata_mentions(
+            store,
+            &prep.as_ref().expect("projection was just built").plans,
+        )?;
         {
             let prep = prep.as_mut().expect("projection was just built");
             if !prep.uploaded {
-                upload(remote, prep)?;
+                if let Err(error) = upload(remote, prep) {
+                    // The remote refuses a pack for an epoch a revoke just
+                    // replaced. Start over under the new keyring.
+                    if remote.read_head()?.keyring != head.keyring {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 prep.uploaded = true;
             }
         }
@@ -454,7 +504,7 @@ pub fn publish(
         let sequence = previous
             .as_ref()
             .map_or(0, |m| m.sequence)
-            .max(state.manifest_seq)
+            .max(sequence_floor)
             .checked_add(1)
             .ok_or_else(|| PublishError::Invalid("manifest sequence overflow".into()))?;
         let manifest =
@@ -498,8 +548,9 @@ pub fn publish(
                     sealed_roots: prep.sealed_roots,
                     new_owner_keys: None,
                     warnings: {
-                        let mut warnings = checked.warnings;
-                        warnings.extend(metadata_mentions(store, &prep.plans)?);
+                        let mut warnings = rewrites;
+                        warnings.extend(checked.warnings);
+                        warnings.extend(metadata_warnings);
                         let compatibility: BTreeSet<_> = prep
                             .plans
                             .iter()
@@ -607,7 +658,15 @@ fn upload(remote: &dyn Remote, prep: &mut Prep) -> Result<(), PublishError> {
         }
         let chunk = &prep.objects[start..end];
         let ids: Vec<ObjectId> = chunk.iter().map(|(id, _, _)| *id).collect();
-        let missing: BTreeSet<ObjectId> = remote.missing(&ids)?.into_iter().collect();
+        let asked: BTreeSet<ObjectId> = ids.iter().copied().collect();
+        let mut missing = BTreeSet::new();
+        for id in remote.missing(&ids)? {
+            if !asked.contains(&id) || !missing.insert(id) {
+                return Err(PublishError::Invalid(format!(
+                    "the remote listed {id} as missing, which was not asked or was listed twice"
+                )));
+            }
+        }
         let send: Vec<_> = chunk
             .iter()
             .filter(|(id, _, _)| missing.contains(id))
@@ -637,38 +696,22 @@ fn published_ids(state: &PublishState, fetched: &FetchState) -> BTreeMap<ObjectI
 fn local_of_public(state: &PublishState, fetched: &FetchState) -> BTreeMap<ObjectId, ObjectId> {
     let mut map = fetched.revisions.clone();
     for (internal, public) in &state.revisions {
-        map.insert(*public, *internal);
+        map.entry(*public).or_insert(*internal);
     }
     map
 }
 
-/// `ancestor` is reachable from `rev` through parents or predecessors.
-/// Predecessors count: editing a change writes a new revision whose parent
-/// is still the old base, and the previous snapshot is listed as a
-/// predecessor. A bookmark that already points at that snapshot is moving
-/// forward with the change.
-fn change_ancestor(store: &dyn Store, rev: ObjectId, ancestor: ObjectId) -> Result<bool, PublishError> {
-    let mut seen = BTreeSet::new();
-    let mut stack = vec![rev];
-    while let Some(id) = stack.pop() {
-        if id == ancestor {
-            return Ok(true);
-        }
-        if !seen.insert(id) {
-            continue;
-        }
-        let revision = store.get_revision(&id)?;
-        stack.extend(revision.parents.iter().copied());
-        stack.extend(revision.predecessors.iter().copied());
-        if seen.len() > MAX_HISTORY {
-            return Err(PublishError::Invalid(
-                "history is too long to publish".into(),
-            ));
-        }
-    }
-    Ok(false)
-}
-
+/// Checks the move of `bookmark` from the remote's `old` public target to
+/// `rev` (DESIGN.md "Collaboration", rule 2) and returns its warnings.
+///
+/// `old` must map to a local revision this machine published or fetched. A
+/// parent ancestor of `rev` is a plain fast-forward. Otherwise the move
+/// rewrites published history: every published revision it drops from the
+/// bookmark's history (`old` and its parents that `rev` does not reach) must
+/// be replaced, that is reachable from the new history through predecessor
+/// links only. Rewriting or squashing a published change passes with a
+/// warning naming it; dropping an unreplaced published parent, or abandoning
+/// anything published, is refused like any other non-fast-forward.
 fn ensure_fast_forward(
     store: &dyn Store,
     rev: ObjectId,
@@ -677,25 +720,144 @@ fn ensure_fast_forward(
     new_public: ObjectId,
     local_of_public: &BTreeMap<ObjectId, ObjectId>,
     force: bool,
-) -> Result<(), PublishError> {
+) -> Result<Vec<String>, PublishError> {
     let Some(old) = old else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    if old == new_public || force {
-        return Ok(());
+    if old == new_public || old == root_revision_id() || force {
+        return Ok(Vec::new());
     }
+    let refuse = || PublishError::NotFastForward {
+        bookmark: bookmark.to_string(),
+    };
     let Some(local) = local_of_public.get(&old).copied() else {
-        return Err(PublishError::NotFastForward {
-            bookmark: bookmark.to_string(),
-        });
+        return Err(refuse());
     };
-    if change_ancestor(store, rev, local)? {
-        Ok(())
-    } else {
-        Err(PublishError::NotFastForward {
-            bookmark: bookmark.to_string(),
-        })
+    let (kept, predecessors) = parent_ancestors(store, rev, local)?;
+    if kept.contains(&local) {
+        return Ok(Vec::new());
     }
+    let dropped = dropped_revisions(store, local, &kept)?;
+    if !all_replaced(store, predecessors, &dropped)? {
+        return Err(refuse());
+    }
+    let mut changes = BTreeSet::new();
+    for id in &dropped {
+        changes.insert(store.get_revision(id)?.change_id.short(8));
+    }
+    Ok(changes
+        .into_iter()
+        .map(|change| {
+            format!(
+                "rewrites published change `{change}`; collaborators who built on it must rebase"
+            )
+        })
+        .collect())
+}
+
+/// `rev` and its parent ancestors, nearest first, stopping early at `stop`,
+/// plus the predecessors those revisions name.
+fn parent_ancestors(
+    store: &dyn Store,
+    rev: ObjectId,
+    stop: ObjectId,
+) -> Result<(BTreeSet<ObjectId>, Vec<ObjectId>), PublishError> {
+    let mut seen = BTreeSet::from([rev]);
+    let mut queue = VecDeque::from([rev]);
+    let mut predecessors = Vec::new();
+    let mut edges = 0usize;
+    while let Some(id) = queue.pop_front() {
+        if id == stop {
+            break;
+        }
+        let revision = store.get_revision(&id)?;
+        edges = edges
+            .saturating_add(revision.parents.len())
+            .saturating_add(revision.predecessors.len());
+        if edges > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
+        predecessors.extend(revision.predecessors.iter().copied());
+        for parent in &revision.parents {
+            if seen.insert(*parent) {
+                queue.push_back(*parent);
+            }
+        }
+        if seen.len() > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
+    }
+    Ok((seen, predecessors))
+}
+
+/// `old` and its parent ancestors that are not in `kept`.
+fn dropped_revisions(
+    store: &dyn Store,
+    old: ObjectId,
+    kept: &BTreeSet<ObjectId>,
+) -> Result<BTreeSet<ObjectId>, PublishError> {
+    let mut dropped = BTreeSet::new();
+    let mut stack = vec![old];
+    let mut edges = 0usize;
+    while let Some(id) = stack.pop() {
+        if kept.contains(&id) || !dropped.insert(id) {
+            continue;
+        }
+        if dropped.len() > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
+        let parents = store.get_revision(&id)?.parents;
+        edges = edges.saturating_add(parents.len());
+        if edges > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
+        stack.extend(parents);
+    }
+    Ok(dropped)
+}
+
+/// Whether every revision in `dropped` is reached from `start` through
+/// predecessor links only. A walk past the history bound proves nothing, so
+/// it answers no.
+fn all_replaced(
+    store: &dyn Store,
+    start: Vec<ObjectId>,
+    dropped: &BTreeSet<ObjectId>,
+) -> Result<bool, PublishError> {
+    let mut left = dropped.clone();
+    let mut seen = BTreeSet::new();
+    // Nearest first: the usual edit replaces the tip's own earlier snapshot.
+    let mut stack: Vec<ObjectId> = start.into_iter().rev().collect();
+    let mut edges = stack.len();
+    while let Some(id) = stack.pop() {
+        if left.remove(&id) && left.is_empty() {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if seen.len() > MAX_HISTORY {
+            return Ok(false);
+        }
+        // A predecessor this store does not have ends that chain.
+        if store.has(&id)? {
+            let predecessors = store.get_revision(&id)?.predecessors;
+            edges = edges.saturating_add(predecessors.len());
+            if edges > MAX_HISTORY {
+                return Ok(false);
+            }
+            stack.extend(predecessors);
+        }
+    }
+    Ok(left.is_empty())
 }
 
 /// The metadata exception (DESIGN.md "Privacy"): `.private` and change
@@ -750,9 +912,9 @@ fn open_session(
     keyring_bytes: Option<&[u8]>,
     identity: &Identity,
     owner_keys: Option<&OwnerKeys>,
-    state: &PublishState,
+    saved_pin: Option<[u8; 32]>,
+    counter_floor: u64,
 ) -> Result<Session, PublishError> {
-    let saved_pin = saved_pin(state, remote_id)?;
     match keyring_bytes {
         None => {
             if saved_pin.is_some() {
@@ -802,7 +964,7 @@ fn open_session(
                             .into(),
                     )),
                 };
-            let verified = keyring.verify(&pin, state.counter)?;
+            let verified = keyring.verify(&pin, counter_floor)?;
             let epoch = keyring
                 .head
                 .epochs
@@ -816,7 +978,9 @@ fn open_session(
                             .into(),
                     )
                 })?;
-                owner_epoch_key(keys, remote_id, epoch)?
+                let key = owner_epoch_key(keys, remote_id, epoch)?;
+                keyring.check_owner_key(&key)?;
+                key
             } else {
                 verified.current_key(PRIVATE_GROUP, identity)?
             };
@@ -915,6 +1079,11 @@ fn parent_first(
             _ => {}
         }
         colors.insert(id, VISITING);
+        if colors.len() > MAX_HISTORY {
+            return Err(PublishError::Invalid(
+                "history is too long to publish".into(),
+            ));
+        }
         stack.push((id, true));
         let revision = store.get_revision(&id)?;
         for parent in revision.parents.iter().rev() {
@@ -1484,6 +1653,16 @@ fn join_pastes(pastes: &[Paste]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_forward_walk_refuses_excessive_edges() {
+        let store = tig_core::MemoryStore::new();
+        store.put(&Object::Revision(root_revision())).unwrap();
+        let mut revision = root_revision();
+        revision.parents = vec![root_revision_id(); MAX_HISTORY + 1];
+        let id = store.put(&Object::Revision(revision)).unwrap();
+        assert!(parent_ancestors(&store, id, ObjectId([99; 32])).is_err());
+    }
 
     #[test]
     fn state_roundtrip_rejects_unsorted_and_trailing_bytes() {

@@ -13,15 +13,15 @@
 //! The caller persists [`FetchState`] and turns [`FetchReport::refs`] into
 //! `remote/<bookmark>` bookmarks. On `Err`, `state` is unchanged.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use tig_core::encode::{Reader, Writer};
 use tig_core::object::{hash_object, Object, ObjectKind, Revision, Tree};
-use tig_core::repo::{root_revision, root_revision_id};
-use tig_core::seal::SealedId;
+use tig_core::repo::{rebase_revision, root_revision, root_revision_id, Transaction};
+use tig_core::seal::{SealSalt, SealedId};
 use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{apply_edits, Leaf, MAX_TREE_DEPTH};
-use tig_core::{EntryKind, ObjectId, RepoPath};
+use tig_core::{EntryKind, ObjectId, RepoPath, TreeEntry};
 
 use crate::keyring::{Keyring, KeyringError, VerifiedKeyring};
 use crate::keys::{Identity, KeyError};
@@ -37,6 +37,8 @@ const MAX_OBJECTS: usize = 1_000_000;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_FETCH_REVISIONS: usize = 100_000;
 const MAX_FETCH_BYTES: usize = 512 * 1024 * 1024;
+/// Ids per `get_batch` request.
+const BATCH_IDS: usize = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -184,6 +186,13 @@ pub struct FetchReport {
     pub newly_pinned: Option<String>,
     pub unsealed: usize,
     pub still_sealed: usize,
+    /// Internal revisions whose access upgrade did not preserve public bytes.
+    pub projection_mismatches: Vec<ObjectId>,
+}
+
+struct AuthenticatedSeal {
+    record: SealedRecord,
+    salt: SealSalt,
 }
 
 struct Budget {
@@ -220,14 +229,40 @@ impl Budget {
 /// a member is not an error.
 ///
 /// `published` is the other half of this remote's correspondence. A public
-/// revision this machine already published is mapped back to that internal
-/// revision instead of being rebuilt.
+/// revision this machine already published reuses that internal revision unless
+/// newly available access requires a successor. An access successor retains the
+/// public id, metadata and predecessor relationship; its correspondence wins
+/// over an older publish entry on later fetches and publishes.
 pub fn fetch(
     remote: &dyn Remote,
     store: &dyn Store,
     identity: Option<&Identity>,
     state: &mut FetchState,
     published: &PublishState,
+) -> Result<FetchReport, FetchError> {
+    fetch_inner(remote, store, identity, state, published, None)
+}
+
+/// Fetch into a local transaction so bookmarks, workspaces and unpublished
+/// descendants follow access upgrades. The caller commits and saves state.
+pub fn fetch_into(
+    remote: &dyn Remote,
+    tx: &mut Transaction,
+    identity: Option<&Identity>,
+    state: &mut FetchState,
+    published: &PublishState,
+) -> Result<FetchReport, FetchError> {
+    let store = tx.store().clone();
+    fetch_inner(remote, store.as_ref(), identity, state, published, Some(tx))
+}
+
+fn fetch_inner(
+    remote: &dyn Remote,
+    store: &dyn Store,
+    identity: Option<&Identity>,
+    state: &mut FetchState,
+    published: &PublishState,
+    tx: Option<&mut Transaction>,
 ) -> Result<FetchReport, FetchError> {
     let head = remote.read_head()?;
     let keyring_bytes = head.keyring.ok_or_else(|| {
@@ -239,8 +274,23 @@ pub fn fetch(
             "keyring is for a different remote".into(),
         ));
     }
-    let (pin, newly_pinned) = resolve_pin(state, remote.remote_id(), &keyring)?;
-    let verified = keyring.verify(&pin, state.counter)?;
+    let (mut pin, mut newly_pinned) = resolve_pin(state, remote.remote_id(), &keyring)?;
+    if let Some(published_pin) = published.owner_signing {
+        if published.remote_id != remote.remote_id()
+            || state.owner_signing.is_some_and(|pin| pin != published_pin)
+        {
+            return Err(FetchError::Invalid(
+                "fetch and publish state disagree about the remote owner".into(),
+            ));
+        }
+        pin = published_pin;
+        newly_pinned = None;
+    } else if published.counter != 0 || published.manifest_seq != 0 || !published.revisions.is_empty() {
+        return Err(FetchError::Invalid(
+            "publish state is missing its owner pin".into(),
+        ));
+    }
+    let verified = keyring.verify(&pin, state.counter.max(published.counter))?;
     let manifest = match head.manifest {
         Some(bytes) => Manifest::decode(&bytes)?,
         None => {
@@ -249,7 +299,11 @@ pub fn fetch(
             ))
         }
     };
-    manifest.verify(remote.remote_id(), &keyring, state.manifest_seq)?;
+    manifest.verify(
+        remote.remote_id(),
+        &keyring,
+        state.manifest_seq.max(published.manifest_seq),
+    )?;
 
     let refs = manifest.refs.clone();
     let tips: Vec<ObjectId> = refs.values().copied().collect();
@@ -271,18 +325,55 @@ pub fn fetch(
 
     let mut mapped = state.revisions.clone();
     let ours = local_of_published(published);
-    let mut built = BTreeMap::new();
+    // Fetch's upgraded correspondence takes precedence over an older publish
+    // entry. Publish must also reuse this same public twin.
+    for (public, internal) in ours {
+        mapped.entry(public).or_insert(internal);
+    }
+    let original_mapped = mapped.clone();
+    let mut rewritten = HashMap::new();
+    let mut projection_mismatches = Vec::new();
     let mut unsealed = 0usize;
     let mut still_sealed = 0usize;
-    for public_id in order {
-        if let Some(internal) = ours.get(&public_id) {
-            if store.has(internal)? {
-                if mapped.get(&public_id) != Some(internal) {
-                    mapped.insert(public_id, *internal);
-                    built.insert(public_id, *internal);
-                }
+    for public_id in order.iter().copied() {
+        let previous = mapped.get(&public_id).copied();
+        if let Some(old) = previous {
+            let before = store.get_revision(&old)?;
+            let (tree, opened, closed) = unseal(store, before.tree, &records, &mut budget)?;
+            let parents: Vec<_> = before
+                .parents
+                .iter()
+                .map(|p| *rewritten.get(p).unwrap_or(p))
+                .collect();
+            if tree == before.tree && parents == before.parents {
                 continue;
             }
+            let mut next = if parents == before.parents {
+                let mut next = before.clone();
+                next.tree = tree;
+                next
+            } else {
+                rebase_revision(store, &before, parents)?
+            };
+            // A conflicting rebase is a projection mismatch, not malformed
+            // remote content. Check it before scanning for unopened seals.
+            if !same_public_revision(store, &next, public_id, &mapped, &records, &mut budget)? {
+                projection_mismatches.push(old);
+                continue;
+            }
+            // Replay the local delta first, then open any inherited seals.
+            next.tree = unseal(store, next.tree, &records, &mut budget)?.0;
+            next.predecessors = vec![old];
+            if !same_public_revision(store, &next, public_id, &mapped, &records, &mut budget)? {
+                projection_mismatches.push(old);
+                continue;
+            }
+            let new = store.put(&Object::Revision(next))?;
+            rewritten.insert(old, new);
+            mapped.insert(public_id, new);
+            unsealed += opened;
+            still_sealed += closed;
+            continue;
         }
         let (internal, opened, closed) =
             rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
@@ -292,7 +383,66 @@ pub fn fetch(
         unsealed += opened;
         still_sealed += closed;
         mapped.insert(public_id, internal);
-        built.insert(public_id, internal);
+    }
+    if let Some(tx) = tx.filter(|_| !rewritten.is_empty() && projection_mismatches.is_empty()) {
+        let public_of: BTreeMap<_, _> = mapped.iter().map(|(p, i)| (*i, *p)).collect();
+        let upgrades = tx.apply_access_upgrades(rewritten, |old, next| {
+            // Unmapped local descendants retain ordinary local conflicts.
+            // Their inherited access changes already come from core rebasing.
+            if let Some(public) = public_of.get(&old) {
+                // A locally published descendant may no longer be reachable
+                // from a remote bookmark. Its public twin was uploaded, not
+                // necessarily stored locally; retrieve it only for this check.
+                if !store.has(public)? {
+                    copy_history(remote, store, &[*public], &mut budget)
+                        .map_err(|error| tig_core::Error::Invalid(error.to_string()))?;
+                }
+                if !same_public_revision(store, next, *public, &mapped, &records, &mut budget)
+                    .map_err(|error| tig_core::Error::Invalid(error.to_string()))?
+                {
+                    projection_mismatches.push(old);
+                    return Ok(false);
+                }
+                let (tree, opened, closed) = unseal(store, next.tree, &records, &mut budget)
+                    .map_err(|error| tig_core::Error::Invalid(error.to_string()))?;
+                next.tree = tree;
+                if !same_public_revision(store, next, *public, &mapped, &records, &mut budget)
+                    .map_err(|error| tig_core::Error::Invalid(error.to_string()))?
+                {
+                    projection_mismatches.push(old);
+                    return Ok(false);
+                }
+                mapped.insert(*public, Object::Revision(next.clone()).id());
+                unsealed += opened;
+                still_sealed += closed;
+            }
+            Ok(true)
+        })?;
+        if let Some(upgrades) = upgrades {
+            for internal in mapped.values_mut() {
+                if let Some(new) = upgrades.get(internal) {
+                    *internal = *new;
+                }
+            }
+        }
+    }
+    if !projection_mismatches.is_empty() {
+        // Keeping a rejected descendant on an old parent while moving that
+        // parent would show two versions of one change. Defer the upgrade
+        // batch, but still fetch new history and advance verified remote floors.
+        mapped = original_mapped;
+        unsealed = 0;
+        still_sealed = 0;
+        for public_id in order {
+            if mapped.contains_key(&public_id) {
+                continue;
+            }
+            let (internal, opened, closed) =
+                rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
+            mapped.insert(public_id, internal);
+            unsealed += opened;
+            still_sealed += closed;
+        }
     }
     let reported = map_refs(&refs, &mapped)?;
 
@@ -300,12 +450,13 @@ pub fn fetch(
     state.owner_signing = Some(pin);
     state.counter = verified.counter();
     state.manifest_seq = manifest.sequence;
-    state.revisions.extend(built);
+    state.revisions = mapped;
     Ok(FetchReport {
         refs: reported,
         newly_pinned,
         unsealed,
         still_sealed,
+        projection_mismatches,
     })
 }
 
@@ -364,7 +515,7 @@ fn open_member_packs(
     manifest: &Manifest,
     identity: Option<&Identity>,
     budget: &mut Budget,
-) -> Result<BTreeMap<SealedId, SealedRecord>, FetchError> {
+) -> Result<BTreeMap<SealedId, AuthenticatedSeal>, FetchError> {
     let Some(identity) = identity else {
         return Ok(BTreeMap::new());
     };
@@ -415,7 +566,8 @@ fn open_member_packs(
                 }
             }
             for record in opened.sealed {
-                remember(budget, &mut records, record)?;
+                let salt = key.seal_salt(&record.path, record.kind, &record.target);
+                remember(budget, &mut records, AuthenticatedSeal { record, salt })?;
             }
         }
         if !expected.is_empty() {
@@ -427,17 +579,18 @@ fn open_member_packs(
 
 fn remember(
     budget: &mut Budget,
-    records: &mut BTreeMap<SealedId, SealedRecord>,
-    record: SealedRecord,
+    records: &mut BTreeMap<SealedId, AuthenticatedSeal>,
+    seal: AuthenticatedSeal,
 ) -> Result<(), FetchError> {
+    let record = &seal.record;
     match records.get(&record.sealed_id) {
-        Some(existing) if existing == &record => Ok(()),
+        Some(existing) if existing.record == *record => Ok(()),
         Some(_) => Err(FetchError::Invalid(
             "packs disagree about a sealed record".into(),
         )),
         None => {
             budget.entry()?;
-            records.insert(record.sealed_id, record);
+            records.insert(record.sealed_id, seal);
             Ok(())
         }
     }
@@ -558,13 +711,34 @@ fn topo_parents_first(
     Ok(order)
 }
 
+/// Requests `ids` in batches of [`BATCH_IDS`]. The remote is not trusted:
+/// an object that was not asked for, arrives twice, or does not hash to its
+/// id is refused, and one level may not exceed [`MAX_FETCH_BYTES`].
 fn fetch_objects(
     remote: &dyn Remote,
     ids: &[ObjectId],
 ) -> Result<BTreeMap<ObjectId, (ObjectKind, Vec<u8>)>, FetchError> {
     let mut out = BTreeMap::new();
-    for (id, kind, body) in remote.get_batch(ids)? {
-        out.insert(id, (kind, body));
+    let mut bytes = 0usize;
+    for chunk in ids.chunks(BATCH_IDS) {
+        let asked: BTreeSet<ObjectId> = chunk.iter().copied().collect();
+        for (id, kind, body) in remote.get_batch(chunk)? {
+            if !asked.contains(&id) || out.contains_key(&id) {
+                return Err(FetchError::Invalid(format!(
+                    "the remote sent object {id}, which was not requested or was sent twice"
+                )));
+            }
+            bytes = bytes
+                .checked_add(body.len())
+                .filter(|used| *used <= MAX_FETCH_BYTES)
+                .ok_or(FetchError::TooLarge)?;
+            if hash_object(kind, &body) != id {
+                return Err(FetchError::Invalid(format!(
+                    "object {id} does not match its id"
+                )));
+            }
+            out.insert(id, (kind, body));
+        }
     }
     Ok(out)
 }
@@ -681,7 +855,7 @@ fn rebuild_one(
     store: &dyn Store,
     public_id: ObjectId,
     mapped: &BTreeMap<ObjectId, ObjectId>,
-    records: &BTreeMap<SealedId, SealedRecord>,
+    records: &BTreeMap<SealedId, AuthenticatedSeal>,
     budget: &mut Budget,
 ) -> Result<(ObjectId, usize, usize), FetchError> {
     let public = store.get_revision(&public_id)?;
@@ -709,39 +883,161 @@ fn rebuild_one(
     Ok((id, unsealed, still_sealed))
 }
 
+fn same_public_revision(
+    store: &dyn Store,
+    internal: &Revision,
+    public_id: ObjectId,
+    mapped: &BTreeMap<ObjectId, ObjectId>,
+    records: &BTreeMap<SealedId, AuthenticatedSeal>,
+    budget: &mut Budget,
+) -> Result<bool, FetchError> {
+    let public = store.get_revision(&public_id)?;
+    let Some(tree) = project_original_seals(store, internal.tree, public.tree, records, budget)?
+    else {
+        return Ok(false);
+    };
+    let public_of: BTreeMap<_, _> = mapped.iter().map(|(p, i)| (*i, *p)).collect();
+    let mut projected = internal.clone();
+    projected.tree = tree;
+    projected.predecessors.clear();
+    for parent in &mut projected.parents {
+        if *parent != root_revision_id() {
+            let Some(public_parent) = public_of.get(parent) else {
+                return Ok(false);
+            };
+            *parent = *public_parent;
+        }
+    }
+    Ok(projected.encode() == public.encode())
+}
+
+/// Re-seal at the original public boundaries, including opaque entries inside
+/// a decrypted folder. Each record supplies its own original epoch salt.
+/// An explicit stack keeps deeply nested remote trees off the call stack.
+fn project_original_seals(
+    store: &dyn Store,
+    internal: ObjectId,
+    public: ObjectId,
+    records: &BTreeMap<SealedId, AuthenticatedSeal>,
+    budget: &mut Budget,
+) -> Result<Option<ObjectId>, FetchError> {
+    let mut stack = vec![(internal, public, RepoPath::root(), 0usize, false)];
+    let mut projected = BTreeMap::new();
+    while let Some((internal, template, prefix, depth, finish)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            return Err(too_deep());
+        }
+        if internal == template {
+            projected.insert(prefix, internal);
+            continue;
+        }
+        let original = store.get_tree(&template)?;
+        let tree = store.get_tree(&internal)?;
+        if !finish {
+            stack.push((internal, template, prefix.clone(), depth, true));
+            for expected in original.entries() {
+                budget.entry()?;
+                let Some(entry) = tree.get(expected.name()) else {
+                    return Ok(None);
+                };
+                let path = prefix.join(entry.name())?;
+                match expected.kind() {
+                    EntryKind::Tree if entry.kind() == EntryKind::Tree => {
+                        stack.push((entry.id(), expected.id(), path, depth + 1, false));
+                    }
+                    EntryKind::Sealed if entry != expected => {
+                        let Some(seal) = expected.sealed_id().and_then(|sid| records.get(&sid))
+                        else {
+                            return Ok(None);
+                        };
+                        if seal.record.path != path || seal.record.kind != entry.kind() {
+                            return Ok(None);
+                        }
+                        if entry.kind() == EntryKind::Tree {
+                            stack.push((entry.id(), seal.record.target, path, depth + 1, false));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let mut entries = Vec::with_capacity(tree.entries().len());
+        for entry in tree.entries() {
+            let path = prefix.join(entry.name())?;
+            let mut next = entry.clone();
+            if let Some(expected) = original.get(entry.name()) {
+                match expected.kind() {
+                    EntryKind::Tree if entry.kind() == EntryKind::Tree => {
+                        let Some(id) = projected.get(&path) else {
+                            return Ok(None);
+                        };
+                        next = TreeEntry::new(entry.name(), EntryKind::Tree, *id)?;
+                    }
+                    EntryKind::Sealed if entry != expected => {
+                        let Some(seal) = expected.sealed_id().and_then(|sid| records.get(&sid))
+                        else {
+                            return Ok(None);
+                        };
+                        let target = if entry.kind() == EntryKind::Tree {
+                            let Some(id) = projected.get(&path) else {
+                                return Ok(None);
+                            };
+                            *id
+                        } else {
+                            entry.id()
+                        };
+                        // Salt is content-bound: only the authenticated target
+                        // may be recomputed under this original salt.
+                        if target != seal.record.target {
+                            return Ok(None);
+                        }
+                        let sid = SealedId::compute(&seal.salt, entry.kind(), &target);
+                        next = TreeEntry::sealed(entry.name(), sid)?;
+                    }
+                    _ => {}
+                }
+            }
+            entries.push(next);
+        }
+        let id = store.put(&Object::Tree(Tree::new(entries)?))?;
+        projected.insert(prefix, id);
+    }
+    Ok(projected.get(&RepoPath::root()).copied())
+}
+
 fn unseal(
     store: &dyn Store,
-    public_tree: ObjectId,
-    records: &BTreeMap<SealedId, SealedRecord>,
+    mut tree: ObjectId,
+    records: &BTreeMap<SealedId, AuthenticatedSeal>,
     budget: &mut Budget,
 ) -> Result<(ObjectId, usize, usize), FetchError> {
-    let mut edits = BTreeMap::new();
     let mut unsealed = 0usize;
-    let mut still_sealed = 0usize;
-    for (path, sid) in sealed_leaves(store, public_tree, budget)? {
-        let Some(record) = records.get(&sid) else {
-            still_sealed += 1;
-            continue;
-        };
-        if record.path != path {
-            return Err(FetchError::Invalid(format!(
-                "sealed record path {} does not match tree path {path}",
-                record.path
-            )));
+    loop {
+        let mut edits = BTreeMap::new();
+        let mut still_sealed = 0usize;
+        for (path, sid) in sealed_leaves(store, tree, budget)? {
+            let Some(seal) = records.get(&sid) else {
+                still_sealed += 1;
+                continue;
+            };
+            let record = &seal.record;
+            if record.path != path {
+                return Err(FetchError::Invalid(format!(
+                    "sealed record path {} does not match tree path {path}",
+                    record.path
+                )));
+            }
+            edits.insert(path, Some(checked_leaf(store, record)?));
+            unsealed += 1;
         }
-        edits.insert(path, Some(checked_leaf(store, record)?));
-        unsealed += 1;
+        if edits.is_empty() {
+            return Ok((tree, unsealed, still_sealed));
+        }
+        tree = apply_edits(store, &tree, &edits)?;
+        // The next pass opens inherited seals inside decrypted subtrees and
+        // checks their expansion/depth limits before returning the tree.
     }
-    let tree = if edits.is_empty() {
-        public_tree
-    } else {
-        apply_edits(store, &public_tree, &edits)?
-    };
-    if tree != public_tree {
-        // Decrypted subtrees are subject to the same expansion/depth limits.
-        sealed_leaves(store, tree, budget)?;
-    }
-    Ok((tree, unsealed, still_sealed))
 }
 
 fn sealed_leaves(
@@ -894,11 +1190,14 @@ mod tests {
             .unwrap();
         let records = BTreeMap::from([(
             sid,
-            SealedRecord {
-                sealed_id: sid,
-                path: RepoPath::new("secrets").unwrap(),
-                kind: EntryKind::Tree,
-                target: tree,
+            AuthenticatedSeal {
+                record: SealedRecord {
+                    sealed_id: sid,
+                    path: RepoPath::new("secrets").unwrap(),
+                    kind: EntryKind::Tree,
+                    target: tree,
+                },
+                salt: SealSalt::from_bytes([0; 32]),
             },
         )]);
         let mut budget = Budget {

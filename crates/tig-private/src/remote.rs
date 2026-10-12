@@ -6,7 +6,7 @@
 //!   keyring           } the head, updated together (see `commit_head`)
 //!   manifest          }
 //!   head.pending      crash journal for one head commit
-//!   head.lock
+//!   head.lock         OS-locked while the head is read or committed
 //!   refs              unsigned copy; only remotes that predate manifests
 //!   objects/          public objects only (a DiskStore)
 //!   packs/<group>/<epoch>/<pack-id>.pack
@@ -16,6 +16,11 @@
 //! as directories must match `[a-z0-9_-]+`, so `..` and `/` cannot escape
 //! `packs/`. Writes go to a unique temp file created with `create_new`, then
 //! a rename.
+//!
+//! A pack is renamed into place under the head lock, and only if its epoch is
+//! still the group's current epoch in the keyring. A publish that lost a race
+//! with a revoke cannot leave new content, under the epoch the removed member
+//! holds, readable on the remote (see DESIGN.md "Collaboration", rule 4).
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -30,6 +35,7 @@ use tig_core::object::hash_object;
 use tig_core::store::{DiskStore, Store};
 use tig_core::{ObjectId, ObjectKind};
 
+use crate::keyring::Keyring;
 use crate::pack::Pack;
 
 const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
@@ -39,6 +45,8 @@ const MAX_MANIFEST_FILE: u64 = 256 * 1024 * 1024;
 const MAX_LISTED_PACKS: usize = 100_000;
 const MAX_REFS: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
+const MAX_BATCH_OBJECTS: usize = 1000;
+const MAX_BATCH_BYTES: usize = 512 * 1024 * 1024;
 const REFS_VERSION: u8 = 1;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_NAME: &str = "head.lock";
@@ -56,6 +64,10 @@ pub enum RemoteError {
     BadGroup(String),
     #[error("pack is for a different remote")]
     RemoteMismatch,
+    #[error("remote is busy: {0}")]
+    Busy(String),
+    #[error("{0}")]
+    Denied(String),
     #[error("{0}")]
     Invalid(String),
 }
@@ -182,6 +194,13 @@ impl DirRemote {
         let root = path.into();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join("packs"))?;
+        // Part of the layout, so a refused publish does not create a new file.
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(LOCK_NAME))?;
         let id_path = root.join("remote-id");
         if id_path.try_exists()? {
             let existing = read_remote_id(&id_path)?;
@@ -222,7 +241,8 @@ impl DirRemote {
     }
 
     /// Stores a pack under `packs/<group>/<epoch>/<blake3>.pack`.
-    /// Writing the same bytes again is a no-op.
+    /// Writing the same bytes again is a no-op. A pack for an epoch older
+    /// than the keyring's current epoch for its group is refused.
     pub fn put_pack(&self, bytes: &[u8]) -> Result<(), RemoteError> {
         if bytes.len() > MAX_PACK_FILE {
             return Err(RemoteError::Invalid("pack is too large".into()));
@@ -249,7 +269,16 @@ impl DirRemote {
                 "pack path exists with different bytes".into(),
             ));
         }
-        atomic_write(&self.root, &dest, bytes, false)
+        // Write and sync outside the lock; only the rename waits for it.
+        let tmp = write_temp(&self.root, bytes)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.with_lock(|guard| {
+            let head = guard.roll_forward_and_read()?;
+            check_pack_epoch(head.keyring.as_deref(), &header.group, header.epoch)?;
+            publish(&tmp.0, &dest, bytes, false)
+        })
     }
 
     /// Pack bytes for one group and epoch, ordered by pack id. An unknown
@@ -361,6 +390,7 @@ impl DirRemote {
     }
 
     pub fn missing(&self, ids: &[ObjectId]) -> Result<Vec<ObjectId>, RemoteError> {
+        check_batch_count(ids.len())?;
         let mut out = Vec::new();
         for id in ids {
             if !self.objects.has(id)? {
@@ -374,6 +404,11 @@ impl DirRemote {
         &self,
         objects: &[(ObjectId, ObjectKind, Vec<u8>)],
     ) -> Result<(), RemoteError> {
+        check_batch_count(objects.len())?;
+        let mut bytes = 0usize;
+        for (_, _, body) in objects {
+            bytes = batch_bytes(bytes, body.len())?;
+        }
         for (id, kind, body) in objects {
             if hash_object(*kind, body) != *id {
                 return Err(RemoteError::Invalid(
@@ -389,11 +424,14 @@ impl DirRemote {
         &self,
         ids: &[ObjectId],
     ) -> Result<Vec<(ObjectId, ObjectKind, Vec<u8>)>, RemoteError> {
+        check_batch_count(ids.len())?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for id in ids {
             let Some((kind, body)) = self.objects.get_raw(id)? else {
                 continue;
             };
+            bytes = batch_bytes(bytes, body.len())?;
             if hash_object(kind, &body) != *id {
                 return Err(RemoteError::Invalid(
                     "public object does not match its id".into(),
@@ -416,25 +454,35 @@ impl DirRemote {
         Ok(Some(decode_refs(&bytes)?))
     }
 
+    /// Runs `body` holding an OS lock on `head.lock`. The OS releases it when
+    /// the process dies, so a crashed publisher or a killed server never
+    /// leaves the remote locked. The file is never deleted: a waiter may
+    /// already hold it open.
     fn with_lock<T>(
         &self,
         body: impl FnOnce(&HeadLock<'_>) -> Result<T, RemoteError>,
     ) -> Result<T, RemoteError> {
         let lock = self.root.join(LOCK_NAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)?;
         let start = Instant::now();
         let guard = loop {
-            match OpenOptions::new().write(true).create_new(true).open(&lock) {
-                Ok(_) => break LockGuard(lock),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            match file.try_lock() {
+                Ok(()) => break LockGuard(file),
+                Err(fs::TryLockError::WouldBlock) => {
                     if start.elapsed() > LOCK_TIMEOUT {
                         return Err(RemoteError::Invalid(format!(
-                            "timed out waiting for {}; if no other tig process is running, delete it",
-                            self.root.join(LOCK_NAME).display()
+                            "timed out waiting for {}; another tig process is using this remote",
+                            lock.display()
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(error) => return Err(error.into()),
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         };
         body(&HeadLock {
@@ -444,11 +492,44 @@ impl DirRemote {
     }
 }
 
-struct LockGuard(PathBuf);
+struct LockGuard(fs::File);
+
+fn check_batch_count(count: usize) -> Result<(), RemoteError> {
+    if count > MAX_BATCH_OBJECTS {
+        return Err(RemoteError::Invalid("too many objects in a batch".into()));
+    }
+    Ok(())
+}
+
+fn batch_bytes(used: usize, amount: usize) -> Result<usize, RemoteError> {
+    used.checked_add(amount)
+        .filter(|bytes| *bytes <= MAX_BATCH_BYTES)
+        .ok_or_else(|| RemoteError::Invalid("object batch is too large".into()))
+}
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.0.unlock();
+    }
+}
+
+/// A pack may only be added under its group's current epoch. Without a
+/// keyring (the first publish) any epoch is accepted. The keyring is not
+/// verified here; it only orders this upload against a revoke.
+fn check_pack_epoch(keyring: Option<&[u8]>, group: &str, epoch: u64) -> Result<(), RemoteError> {
+    let Some(bytes) = keyring else {
+        return Ok(());
+    };
+    let keyring = Keyring::decode(bytes)
+        .map_err(|error| RemoteError::Invalid(format!("keyring is invalid: {error}")))?;
+    match keyring.head.epochs.get(group) {
+        Some(current) if *current == epoch => Ok(()),
+        Some(current) => Err(RemoteError::Invalid(format!(
+            "pack is for epoch {epoch} of {group}, but the remote is at epoch {current}; publish again"
+        ))),
+        None => Err(RemoteError::Invalid(format!(
+            "the remote keyring has no group {group}"
+        ))),
     }
 }
 
@@ -745,11 +826,17 @@ impl Drop for RemoveOnDrop {
 }
 
 fn atomic_write(root: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result<(), RemoteError> {
-    let tmp_dir = root.join("tmp");
-    fs::create_dir_all(&tmp_dir)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+    let tmp = write_temp(root, bytes)?;
+    publish(&tmp.0, dest, bytes, replace)
+}
+
+/// A synced temp file under `tmp/`, removed on drop unless renamed away.
+fn write_temp(root: &Path, bytes: &[u8]) -> Result<RemoveOnDrop, RemoteError> {
+    let tmp_dir = root.join("tmp");
+    fs::create_dir_all(&tmp_dir)?;
     let mut rnd = [0u8; 16];
     for _ in 0..8 {
         getrandom::getrandom(&mut rnd)
@@ -767,8 +854,7 @@ fn atomic_write(root: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        publish(&tmp.0, dest, bytes, replace)?;
-        return Ok(());
+        return Ok(tmp);
     }
     Err(RemoteError::Invalid("could not create a temp file".into()))
 }

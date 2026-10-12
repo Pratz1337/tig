@@ -849,31 +849,45 @@ impl Transaction {
         }
     }
 
+    /// Installs fetch access upgrades, preserving metadata and rebasing local
+    /// descendants with the same machinery as ordinary rewrites. If any check
+    /// rejects a descendant, leaves the view unchanged and returns `None`.
+    pub fn apply_access_upgrades(
+        &mut self,
+        mut rewritten: HashMap<ObjectId, ObjectId>,
+        mut check: impl FnMut(ObjectId, &mut Revision) -> Result<bool>,
+    ) -> Result<Option<HashMap<ObjectId, ObjectId>>> {
+        self.atomically(|tx| {
+            let visible = visible_revisions(&*tx.store, &tx.view)?;
+            let mut rejected = false;
+            rebase_revisions(&*tx.store, visible, &mut rewritten, &mut |old, next| {
+                let accepted = check(old, next)?;
+                rejected |= !accepted;
+                Ok(accepted)
+            })?;
+            if rejected {
+                return Ok(None);
+            }
+            for (old, new) in &rewritten {
+                tx.view.heads.insert(*new);
+                tx.replace(*old, *new);
+            }
+            tx.normalize_heads()?;
+            Ok(Some(rewritten))
+        })
+    }
+
     /// Rebases every visible descendant of the rewritten revisions.
     fn rebase_descendants(&mut self, mut rewritten: HashMap<ObjectId, ObjectId>) -> Result<()> {
         // Children of rewritten revisions, processed parents-first.
         let visible = visible_revisions(&*self.store, &self.view)?;
-        for (id, rev) in visible.into_iter().rev() {
-            if rewritten.contains_key(&id) || !rev.parents.iter().any(|p| rewritten.contains_key(p))
-            {
-                continue;
-            }
-            let new_parents: Vec<ObjectId> = rev
-                .parents
-                .iter()
-                .map(|p| *rewritten.get(p).unwrap_or(p))
-                .collect();
-            let old_base = self.merged_tree(&rev.parents)?;
-            let new_base = self.merged_tree(&new_parents)?;
-            let tree = merge_trees(&*self.store, &old_base, &new_base, &rev.tree)?.tree();
-            let mut next = rev.clone();
-            next.parents = new_parents;
-            next.tree = tree;
-            next.predecessors = vec![id];
+        rebase_revisions(&*self.store, visible, &mut rewritten, &mut |_, next| {
             next.committer = self.settings.signature();
-            let new = self.write_revision(next)?;
-            self.replace(id, new);
-            rewritten.insert(id, new);
+            Ok(true)
+        })?;
+        for (old, new) in rewritten {
+            self.view.heads.insert(new);
+            self.replace(old, new);
         }
         self.normalize_heads()
     }
@@ -940,6 +954,54 @@ impl Transaction {
         }
         Ok(())
     }
+}
+
+/// Replays a revision's tree delta on new parents, retaining its metadata.
+/// Fetch uses this only for access upgrades; ordinary rewrites set a new
+/// committer after rebasing.
+pub fn rebase_revision(
+    store: &dyn Store,
+    rev: &Revision,
+    parents: Vec<ObjectId>,
+) -> Result<Revision> {
+    fn base(store: &dyn Store, parents: &[ObjectId]) -> Result<ObjectId> {
+        match parents {
+            [] => Err(Error::Invalid("a change needs at least one parent".into())),
+            [parent] => Ok(store.get_revision(parent)?.tree),
+            _ => Ok(merge_revisions(store, parents)?.tree()),
+        }
+    }
+    let old_base = base(store, &rev.parents)?;
+    let new_base = base(store, &parents)?;
+    let mut next = rev.clone();
+    next.parents = parents;
+    next.tree = merge_trees(store, &old_base, &new_base, &rev.tree)?.tree();
+    Ok(next)
+}
+
+fn rebase_revisions(
+    store: &dyn Store,
+    visible: Vec<(ObjectId, Revision)>,
+    rewritten: &mut HashMap<ObjectId, ObjectId>,
+    check: &mut impl FnMut(ObjectId, &mut Revision) -> Result<bool>,
+) -> Result<()> {
+    for (id, rev) in visible.into_iter().rev() {
+        if rewritten.contains_key(&id) || !rev.parents.iter().any(|p| rewritten.contains_key(p)) {
+            continue;
+        }
+        let parents = rev
+            .parents
+            .iter()
+            .map(|p| *rewritten.get(p).unwrap_or(p))
+            .collect();
+        let mut next = rebase_revision(store, &rev, parents)?;
+        next.predecessors = vec![id];
+        if check(id, &mut next)? {
+            let new = store.put(&Object::Revision(next))?;
+            rewritten.insert(id, new);
+        }
+    }
+    Ok(())
 }
 
 /// Validates a bookmark name without changing repository state.
