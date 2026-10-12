@@ -1,0 +1,271 @@
+"""Run tig Cargo commands on Modal and return the cargo exit code.
+
+Heavy builds stay off this machine. The Debian image (rustup + mingw) is
+cached by Modal. Each run uploads the working tree as it is now, including
+uncommitted edits, and reuses the ``tig-cargo-cache`` volume for the registry,
+git checkout, and ``CARGO_TARGET_DIR``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import modal
+
+REPO = Path(__file__).resolve().parents[1]
+REMOTE_REPO = "/repo"
+CACHE_ROOT = "/cargo-cache"
+CARGO_HOME = f"{CACHE_ROOT}/cargo-home"
+TARGET_DIR = f"{CACHE_ROOT}/target"
+RELEASE_DIR = f"{TARGET_DIR}/x86_64-pc-windows-gnu/release"
+
+# Dockerignore-style. A name without a slash matches that path segment anywhere,
+# and Modal prunes those directories instead of walking them.
+UPLOAD_IGNORE = [
+    "target",
+    "bin",
+    ".git",
+    ".tig",
+    "pending",
+    "__pycache__",
+    ".claude",
+    ".grok",
+]
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "build-essential",
+        "ca-certificates",
+        "cmake",
+        "curl",
+        "gcc-mingw-w64-x86-64",
+        "git",
+        "pkg-config",
+    )
+    .run_commands(
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
+        "sh -s -- -y --default-toolchain stable --profile minimal "
+        "--component clippy,rustfmt",
+        ". /root/.cargo/env && rustup target add x86_64-pc-windows-gnu",
+    )
+    .env(
+        {
+            "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "CARGO_TERM_COLOR": "always",
+        }
+    )
+    .add_local_dir(str(REPO), remote_path=REMOTE_REPO, ignore=UPLOAD_IGNORE)
+)
+
+volume = modal.Volume.from_name("tig-cargo-cache", create_if_missing=True)
+app = modal.App("tig-build")
+
+RUN_ENV = {
+    "CARGO_HOME": CARGO_HOME,
+    "CARGO_TARGET_DIR": TARGET_DIR,
+    "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER": "x86_64-w64-mingw32-gcc",
+    "CC_x86_64_pc_windows_gnu": "x86_64-w64-mingw32-gcc",
+    "CXX_x86_64_pc_windows_gnu": "x86_64-w64-mingw32-g++",
+}
+
+
+def _strip_ddash(args: list[str]) -> list[str]:
+    if args and args[0] == "--":
+        return args[1:]
+    return args
+
+
+SRC_HASHES = f"{CACHE_ROOT}/src-hashes.json"
+OLD_MTIME = 1_000_000_000  # 2001: older than any cached build artifact
+
+
+def _sync_mtimes() -> None:
+    """Make cargo's mtime-based freshness check match the source content.
+
+    Uploaded files do not carry trustworthy mtimes, so cargo could reuse
+    artifacts on the cache volume that were built from different sources.
+    Every file whose content changed since the last run gets "now"; every
+    unchanged file gets a fixed old time.
+    """
+    import hashlib
+    import json
+
+    try:
+        with open(SRC_HASHES, encoding="utf-8") as f:
+            previous = json.load(f)
+    except (OSError, ValueError):
+        previous = {}
+    current = {}
+    now = time.time()
+    changed = 0
+    for root, _dirs, files in os.walk(REMOTE_REPO):
+        for name in files:
+            path = os.path.join(root, name)
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            rel = os.path.relpath(path, REMOTE_REPO)
+            current[rel] = digest
+            if previous.get(rel) == digest:
+                os.utime(path, (OLD_MTIME, OLD_MTIME))
+            else:
+                os.utime(path, (now, now))
+                changed += 1
+    with open(SRC_HASHES, "w", encoding="utf-8") as f:
+        json.dump(current, f)
+    print(f"sources: {len(current)} files, {changed} changed since last run", flush=True)
+
+
+def _stream(cmd: list[str]) -> int:
+    print("+ " + " ".join(cmd), flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REMOTE_REPO,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    return proc.wait()
+
+
+@app.function(
+    image=image,
+    cpu=16,
+    memory=32 * 1024,
+    timeout=60 * 60,
+    volumes={CACHE_ROOT: volume},
+    env=RUN_ENV,
+)
+def cargo_exec(cmd: list[str]) -> int:
+    os.makedirs(CARGO_HOME, exist_ok=True)
+    os.makedirs(TARGET_DIR, exist_ok=True)
+    _sync_mtimes()
+    try:
+        return _stream(cmd)
+    finally:
+        volume.commit()
+
+
+@app.function(
+    image=image,
+    cpu=16,
+    memory=32 * 1024,
+    timeout=60 * 60,
+    volumes={CACHE_ROOT: volume},
+    env=RUN_ENV,
+)
+def cargo_release() -> dict:
+    """Build Windows GNU bins and return their bytes. ``code`` is cargo's status."""
+    os.makedirs(CARGO_HOME, exist_ok=True)
+    os.makedirs(TARGET_DIR, exist_ok=True)
+    _sync_mtimes()
+    try:
+        code = _stream(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--locked",
+                "--target",
+                "x86_64-pc-windows-gnu",
+                "--bins",
+            ]
+        )
+        if code != 0:
+            return {"code": code, "bins": []}
+        bins = []
+        release = Path(RELEASE_DIR)
+        for path in sorted(release.glob("*.exe")):
+            data = path.read_bytes()
+            bins.append({"name": path.name, "size": len(data), "data": data})
+        return {"code": 0, "bins": bins}
+    finally:
+        volume.commit()
+
+
+def _run_remote(cmd: list[str]) -> int:
+    started = time.perf_counter()
+    with modal.enable_output():
+        with app.run():
+            code = cargo_exec.remote(cmd)
+    elapsed = time.perf_counter() - started
+    print(f"modal exit {code} in {elapsed:.1f}s", flush=True)
+    return int(code)
+
+
+def _scope(rest: list[str]) -> list[str]:
+    """`--workspace` unless the caller picked packages with -p/--package."""
+    picked = any(a in ("-p", "--package") or a.startswith(("--package=", "-p")) for a in rest)
+    return [] if picked else ["--workspace"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Modal and cargo print Unicode; the Windows console default (cp1252)
+    # would crash on it.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    # Cargo flags such as -p must not be parsed as flags of this script.
+    if argv is None:
+        argv = sys.argv[1:]
+    parser = argparse.ArgumentParser(description="Build and test tig on Modal.")
+    parser.add_argument("cmd", choices=("test", "clippy", "run", "release"))
+    # Only the subcommand is ours; everything after it goes to cargo (or to
+    # the shell for `run`) untouched, so argparse never sees `-p`.
+    args = parser.parse_args(argv[:1])
+    rest = _strip_ddash(argv[1:])
+
+    if args.cmd == "test":
+        return _run_remote(["cargo", "test", *_scope(rest), "--locked", *rest])
+
+    if args.cmd == "clippy":
+        return _run_remote(
+            [
+                "cargo",
+                "clippy",
+                *_scope(rest),
+                "--all-targets",
+                "--locked",
+                *rest,
+                "--",
+                "-D",
+                "warnings",
+            ]
+        )
+
+    if args.cmd == "run":
+        if not rest:
+            parser.error("run requires a command after --")
+        return _run_remote(rest)
+
+    started = time.perf_counter()
+    with modal.enable_output():
+        with app.run():
+            result = cargo_release.remote()
+    elapsed = time.perf_counter() - started
+    code = int(result["code"])
+    print(f"modal exit {code} in {elapsed:.1f}s", flush=True)
+    if code != 0:
+        return code
+    dest = REPO / "bin"
+    dest.mkdir(parents=True, exist_ok=True)
+    if not result["bins"]:
+        print("no .exe files were produced", flush=True)
+        return 1
+    for item in result["bins"]:
+        path = dest / item["name"]
+        path.write_bytes(item["data"])
+        print(f"{path} {item['size']} bytes", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
