@@ -70,6 +70,10 @@ pub trait StoreExt: Store {
         self.get_kind(id, ObjectKind::Blob)
     }
 
+    fn get_conflict(&self, id: &ObjectId) -> Result<crate::conflict::Conflict> {
+        crate::conflict::Conflict::decode(&self.get_kind(id, ObjectKind::Conflict)?)
+    }
+
     fn get_tree(&self, id: &ObjectId) -> Result<Tree> {
         Tree::decode(&self.get_kind(id, ObjectKind::Tree)?)
     }

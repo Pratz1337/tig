@@ -10,6 +10,7 @@ mod describe;
 mod diff;
 mod disk;
 mod edit;
+mod export_git;
 mod fetch;
 mod grant;
 mod identity;
@@ -21,6 +22,7 @@ mod new_change;
 mod op;
 mod publish;
 mod remote;
+mod resolve;
 mod revoke;
 mod settings;
 mod show;
@@ -137,6 +139,12 @@ impl From<tig_private::keys::KeyError> for CliError {
 
 impl From<tig_private::import_git::ImportError> for CliError {
     fn from(err: tig_private::import_git::ImportError) -> Self {
+        CliError::msg(err.to_string())
+    }
+}
+
+impl From<tig_private::export_git::ExportError> for CliError {
+    fn from(err: tig_private::export_git::ExportError) -> Self {
         CliError::msg(err.to_string())
     }
 }
@@ -275,6 +283,13 @@ pub fn run() -> Result<()> {
             path,
             strip_private,
         } => import_git::run(repository, &path, strip_private)?,
+        Cmd::ExportGit {
+            path,
+            bookmark,
+            declassify,
+            force,
+            verbose,
+        } => export_git::run(repository, &path, bookmark, declassify, force, verbose)?,
         Cmd::Status => status::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
@@ -291,6 +306,7 @@ pub fn run() -> Result<()> {
         Cmd::Workspace { action } => workspace::run(repository, action)?,
         Cmd::Bookmark { action } => bookmark::run(repository, action)?,
         Cmd::Cat { path, revision } => cat::run(repository, &path, revision.as_deref())?,
+        Cmd::Resolve { path, side, base } => resolve::run(repository, &path, side, base)?,
         Cmd::Why { path } => why::run(repository, &path)?,
         Cmd::Identity { show } => identity::run(show)?,
         Cmd::Remote { action } => remote::run(repository, action)?,
@@ -345,6 +361,24 @@ enum Cmd {
         /// Remove private paths from every imported revision (never-public Git repos)
         #[arg(long)]
         strip_private: bool,
+    },
+    /// Write bookmarks to a Git repository. Private paths are omitted.
+    ExportGit {
+        /// Destination Git repository. Created when missing or empty.
+        /// A path ending in `.git` is bare; the worktree is never checked out.
+        path: PathBuf,
+        /// Bookmark to export. Repeat to export several. Defaults to every bookmark.
+        #[arg(long, value_name = "NAME")]
+        bookmark: Vec<String>,
+        /// Export this public path even though its bytes also appear in a private file
+        #[arg(long, value_name = "PATH")]
+        declassify: Vec<String>,
+        /// Overwrite a Git branch that is not a fast-forward of the last export
+        #[arg(long)]
+        force: bool,
+        /// List omitted private paths. The default summary is only a count.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Record the disk in the working change
     Snapshot {
@@ -431,6 +465,17 @@ enum Cmd {
         /// Revision to read. Defaults to `@`.
         #[arg(short = 'r', long = "revision", value_name = "REV")]
         revision: Option<String>,
+    },
+    /// Resolve a conflict by selecting one of its stored alternatives
+    Resolve {
+        /// Conflicted path. Text files can also be resolved by ordinary editing.
+        path: String,
+        /// Select a positive alternative (1-based, as shown in conflict markers).
+        #[arg(long, required_unless_present = "base", conflicts_with = "base")]
+        side: Option<usize>,
+        /// Select a base alternative (1-based).
+        #[arg(long)]
+        base: Option<usize>,
     },
     /// Explain why a path is private or public
     Why {

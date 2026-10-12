@@ -609,10 +609,7 @@ impl Transaction {
     }
 
     fn merged_tree(&self, parents: &[ObjectId]) -> Result<ObjectId> {
-        match self.merge_parents(parents)? {
-            MergeOutcome::Clean(tree) => Ok(tree),
-            MergeOutcome::Conflict(paths) => Err(conflict_error("merge", &paths)),
-        }
+        Ok(self.merge_parents(parents)?.tree())
     }
 
     fn merge_parents(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
@@ -867,27 +864,8 @@ impl Transaction {
                 .map(|p| *rewritten.get(p).unwrap_or(p))
                 .collect();
             let old_base = self.merged_tree(&rev.parents)?;
-            let rebased = match self.merge_parents(&new_parents)? {
-                MergeOutcome::Clean(new_base) => {
-                    merge_trees(&*self.store, &old_base, &new_base, &rev.tree)?
-                }
-                conflict => conflict,
-            };
-            let tree = match rebased {
-                MergeOutcome::Clean(t) => t,
-                MergeOutcome::Conflict(paths) => {
-                    // Refusing here would make every command fail (each one
-                    // snapshots first), stranding the user. Until conflicts
-                    // are objects, the descendant stays on the previous
-                    // version of its parent, which stays visible: nothing is
-                    // lost, and the caller reports it.
-                    self.skipped.push(SkippedRebase {
-                        change: rev.change_id,
-                        paths,
-                    });
-                    continue;
-                }
-            };
+            let new_base = self.merged_tree(&new_parents)?;
+            let tree = merge_trees(&*self.store, &old_base, &new_base, &rev.tree)?.tree();
             let mut next = rev.clone();
             next.parents = new_parents;
             next.tree = tree;
@@ -921,10 +899,7 @@ impl Transaction {
             new_parents.retain(|p| seen.insert(*p));
             let old_base = self.merged_tree(&child.parents)?;
             let new_base = self.merged_tree(&new_parents)?;
-            let tree = match merge_trees(&*self.store, &old_base, &new_base, &child.tree)? {
-                MergeOutcome::Clean(t) => t,
-                MergeOutcome::Conflict(paths) => return Err(conflict_error("abandon", &paths)),
-            };
+            let tree = merge_trees(&*self.store, &old_base, &new_base, &child.tree)?.tree();
             let mut next = child.clone();
             next.parents = new_parents;
             next.tree = tree;
@@ -965,19 +940,6 @@ impl Transaction {
         }
         Ok(())
     }
-}
-
-fn conflict_error(what: &str, paths: &[crate::path::RepoPath]) -> Error {
-    let list: Vec<String> = paths.iter().take(10).map(|p| p.to_string()).collect();
-    let more = if paths.len() > 10 {
-        format!(" and {} more", paths.len() - 10)
-    } else {
-        String::new()
-    };
-    Error::Invalid(format!(
-        "{what} would conflict in {}{more}. Conflicts as first-class objects are not built yet, so tig made no changes",
-        list.join(", ")
-    ))
 }
 
 /// Validates a bookmark name without changing repository state.

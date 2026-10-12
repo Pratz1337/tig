@@ -3,7 +3,6 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use tig_core::store::StoreExt;
 use tig_core::treeops::lookup;
 
 use super::{CliError, Result};
@@ -15,8 +14,8 @@ pub(super) fn run(repository: Option<&Path>, path: &str, revision: Option<&str>)
     let path = super::parse_path(path)?;
     let leaf = lookup(session.repo.store().as_ref(), &rev.tree, &path)?;
     match leaf {
-        Some(leaf) if leaf.is_file_like() => {
-            let bytes = session.repo.store().get_blob(&leaf.id())?;
+        Some(leaf) if leaf.is_file_like() || leaf.kind() == tig_core::EntryKind::Conflict => {
+            let bytes = tig_core::conflict::materialize(session.repo.store().as_ref(), leaf)?;
             let mut stdout = io::stdout().lock();
             stdout.write_all(&bytes)?;
             stdout.flush()?;

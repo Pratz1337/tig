@@ -131,11 +131,25 @@ fn verify_view(store: &dyn Store, view: &View) -> Result<()> {
                             ObjectKind::Blob
                         }
                         EntryKind::Sealed => continue,
+                        EntryKind::Conflict => ObjectKind::Conflict,
                     };
                     pending.push((entry.id(), kind));
                 }
             }
             ObjectKind::Blob => {}
+            ObjectKind::Conflict => {
+                let conflict = crate::conflict::Conflict::decode(&body)?;
+                if let Some(draft) = conflict.draft() { pending.push((draft, ObjectKind::Blob)); }
+                for leaf in conflict.adds().iter().chain(conflict.removes()).flatten() {
+                    let kind = match leaf.kind() {
+                        EntryKind::Tree => ObjectKind::Tree,
+                        EntryKind::Conflict => ObjectKind::Conflict,
+                        EntryKind::Sealed => continue,
+                        _ => ObjectKind::Blob,
+                    };
+                    pending.push((leaf.id(), kind));
+                }
+            }
             ObjectKind::Operation | ObjectKind::View => unreachable!(),
         }
     }

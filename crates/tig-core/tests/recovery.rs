@@ -54,6 +54,37 @@ impl Fixture {
 }
 
 #[test]
+fn recovery_checks_conflict_objects_sides_trees_and_drafts() {
+    for missing in ["conflict", "side", "tree child", "draft"] {
+        let mut f = Fixture::new();
+        let before = f.repo.op_id();
+        let blob = f.store.put_blob(b"only in a conflict side").unwrap();
+        let side_tree = f.store.put(&Object::Tree(Tree::new(vec![TreeEntry::new("child", EntryKind::File, blob).unwrap()]).unwrap())).unwrap();
+        let other = f.store.put_blob(b"competing file").unwrap();
+        let original = tig_core::conflict::merge(f.store.as_ref(), None,
+            Some(tig_core::treeops::Leaf::tree(side_tree)), Some(tig_core::treeops::Leaf::file(other))).unwrap().unwrap();
+        let mut leaf = original;
+        if missing == "draft" {
+            let mut draft = tig_core::conflict::materialize(f.store.as_ref(), original).unwrap();
+            draft.extend_from_slice(b"resolution progress");
+            leaf = tig_core::conflict::snapshot_file(f.store.as_ref(), original, &draft, EntryKind::File).unwrap();
+        }
+        let root = f.store.put(&Object::Tree(Tree::new(vec![TreeEntry::new("conflicted", EntryKind::Conflict, leaf.id()).unwrap()]).unwrap())).unwrap();
+        let working = f.repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+        let mut tx = f.repo.start("stored conflict");
+        tx.rewrite(working, |rev| rev.tree = root).unwrap(); f.repo.commit(tx).unwrap();
+        assert!(!f.repo.recover().unwrap(), "valid conflict must be recoverable");
+        let id = match missing {
+            "conflict" => leaf.id(), "side" => other, "tree child" => blob,
+            "draft" => f.store.get_conflict(&leaf.id()).unwrap().draft().unwrap(), _ => unreachable!(),
+        };
+        f.remove(id);
+        assert!(f.repo.recover().unwrap(), "missing {missing} must invalidate the view");
+        assert_eq!(f.repo.op_id(), before);
+    }
+}
+
+#[test]
 fn missing_or_corrupt_current_metadata_recovers_the_previous_head() {
     for view in [false, true] {
         for corrupt in [false, true] {

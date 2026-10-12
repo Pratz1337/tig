@@ -5,7 +5,7 @@ use tig_core::repo::{root_revision, root_revision_id, Repo, Settings};
 use tig_core::store::{empty_tree_id, StoreExt};
 use tig_core::treeops::{apply_edits, lookup, Leaf};
 use tig_core::workspace::Workspace;
-use tig_core::{MemoryStore, Object, ObjectId, RepoPath, Store};
+use tig_core::{EntryKind, MemoryStore, Object, ObjectId, RepoPath, Store};
 
 fn p(s: &str) -> RepoPath {
     RepoPath::new(s).unwrap()
@@ -59,7 +59,7 @@ fn imported_history_rejects_bad_bookmarks_without_partly_changing_the_view() {
 }
 
 #[test]
-fn snapshot_skips_a_merge_when_its_rewritten_parents_conflict() {
+fn snapshot_stores_a_merge_when_its_rewritten_parents_conflict() {
     let mut r = repo();
     let mut w = Workspace::open(&r, "default").unwrap();
     let old_parent = w.working_revision();
@@ -80,20 +80,17 @@ fn snapshot_skips_a_merge_when_its_rewritten_parents_conflict() {
     assert_ne!(w.working_revision(), old_parent);
     assert!(!w.is_dirty());
     assert_eq!(w.read(&r, &p("x")).unwrap().unwrap(), b"parent edit");
-    assert_eq!(r.view().bookmarks["merged"], merged);
-    assert_eq!(r.revision(&merged).unwrap(), merged_before);
-    assert_eq!(r.last_skipped_rebases().len(), 1);
-    assert_eq!(r.last_skipped_rebases()[0].change, merged_before.change_id);
-    assert_eq!(r.last_skipped_rebases()[0].paths, vec![p("x")]);
+    let merged_now = r.view().bookmarks["merged"];
+    assert_ne!(merged_now, merged);
+    assert_eq!(r.revision(&merged_now).unwrap().change_id, merged_before.change_id);
+    assert_eq!(lookup(&**r.store(), &r.revision(&merged_now).unwrap().tree, &p("x")).unwrap().unwrap().kind(), EntryKind::Conflict);
+    assert!(r.last_skipped_rebases().is_empty());
     let visible = r.visible_revisions().unwrap();
-    assert!(visible.iter().any(|(id, _)| *id == old_parent));
     assert!(visible.iter().any(|(id, _)| *id == w.working_revision()));
 
-    // The same conflict remains a refusal for an explicit merge.
+    // The same conflict is also stored by an explicit merge.
     let mut tx = r.start("explicit merge");
-    let before = tx.view().clone();
-    assert!(tx.new_change(&[w.working_revision(), other], "").is_err());
-    assert_eq!(tx.view(), &before);
+    assert!(tx.new_change(&[w.working_revision(), other], "").is_ok());
 }
 
 #[test]
@@ -295,7 +292,7 @@ fn workspace_overlay_matches_sequential_tree_edits() {
 }
 
 #[test]
-fn conflicting_virtual_base_refuses_even_identical_outer_trees() {
+fn conflicting_virtual_base_preserves_identical_outer_resolutions() {
     let r = repo();
     let s = &**r.store();
     let root = root_revision_id();
@@ -308,13 +305,10 @@ fn conflicting_virtual_base_refuses_even_identical_outer_trees() {
     want.sort();
     assert_eq!(merge_base(s, &m1, &m2).unwrap(), want);
     let mut tx = r.start("merge");
-    let before = tx.view().clone();
-    assert!(tx
-        .new_change(&[m1, m2], "merge")
-        .unwrap_err()
-        .to_string()
-        .contains("conflict in x"));
-    assert_eq!(*tx.view(), before);
+    let merged = tx.new_change(&[m1, m2], "merge").unwrap();
+    let mut r = r;
+    r.commit(tx).unwrap();
+    assert_eq!(r.revision(&merged).unwrap().tree, resolved);
 }
 
 #[test]
@@ -374,7 +368,7 @@ fn different_file_directory_replacements_still_conflict() {
         for (ours, theirs) in [(ours, theirs), (theirs, ours)] {
             assert!(matches!(
                 merge_trees(&s, &base, &ours, &theirs).unwrap(),
-                MergeOutcome::Conflict(_)
+                MergeOutcome::Conflict { .. }
             ));
         }
     }
@@ -384,7 +378,7 @@ fn different_file_directory_replacements_still_conflict() {
 /// command, since each one snapshots first). It stays on the previous
 /// version of its parent, and the commit reports it.
 #[test]
-fn conflicting_descendant_stays_on_previous_parent() {
+fn conflicting_descendant_moves_to_new_parent_with_stored_sides() {
     let mut r = repo();
     let mut w = Workspace::open(&r, "default").unwrap();
     w.write(&r, &p("x"), b"base").unwrap();
@@ -402,19 +396,18 @@ fn conflicting_descendant_stays_on_previous_parent() {
     let mut tx = r.start("rewrite");
     let a2 = tx.rewrite(a, |r| r.tree = changed).unwrap();
     r.commit(tx).unwrap();
-    let skipped = r.last_skipped_rebases();
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(skipped[0].paths, vec![p("x")]);
-    // The child kept its old parent, and both stay visible.
-    assert_eq!(r.working_revision("default").unwrap(), child);
-    assert_eq!(r.revision(&child).unwrap().parents, vec![a]);
+    assert!(r.last_skipped_rebases().is_empty());
+    let child_now = r.working_revision("default").unwrap();
+    assert_ne!(child_now, child);
+    assert_eq!(r.revision(&child_now).unwrap().parents, vec![a2]);
+    assert_eq!(lookup(&**r.store(), &r.revision(&child_now).unwrap().tree, &p("x")).unwrap().unwrap().kind(), EntryKind::Conflict);
     let visible: Vec<_> = r
         .visible_revisions()
         .unwrap()
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    assert!(visible.contains(&a) && visible.contains(&a2) && visible.contains(&child));
+    assert!(visible.contains(&a2) && visible.contains(&child_now));
 }
 
 #[test]
@@ -901,7 +894,7 @@ fn merge_basic_delete_modify_same_change_and_executable_cases() {
     let modified = tree(&s, &[("a", b"1"), ("d/x", b"2")]);
     assert!(matches!(
         merge_trees(&s, &base, &deleted, &modified).unwrap(),
-        MergeOutcome::Conflict(_)
+        MergeOutcome::Conflict { .. }
     ));
     let added = tree(&s, &[("a", b"1"), ("d/x", b"1"), ("d/y", b"y")]);
     let want = tree(&s, &[("a", b"1"), ("d/y", b"y")]);

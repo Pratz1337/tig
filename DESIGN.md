@@ -46,8 +46,9 @@ All objects are content-addressed by **BLAKE3**: `id = blake3::derive_key("tig o
 | `Revision` | tree, parents, change_id, predecessors, author, timestamp, description |
 | `Operation` | parents, view id, timestamp, user, description |
 | `View` | workspaces → working revision, bookmarks → revision, heads |
+| `Conflict` | sorted positive and negative optional leaves, plus an optional partial-resolution blob |
 
-`EntryKind` = `File`, `Executable`, `Symlink`, `Tree`, `Sealed`. A `Sealed` entry stands in for a private subtree in public views (see tig-private).
+`EntryKind` = `File`, `Executable`, `Symlink`, `Tree`, `Sealed`, `Conflict`. A `Sealed` entry stands in for a private subtree in public views (see tig-private). A local `Conflict` entry points at a stored merge expression. Existing kind bytes and hash labels remain frozen; the two conflict kinds append byte 6. Trees with direct conflict entries use version 2, and ordinary trees retain their exact version-1 encoding. Workspace cache rows containing conflicts use version 3; ordinary rows retain version 2.
 
 Encodings are hand-written, versioned, and varint-based (`tig-core::encode`). They are stable: once an encoding ships, changing it requires a new version byte.
 
@@ -56,9 +57,10 @@ Encodings are hand-written, versioned, and varint-based (`tig-core::encode`). Th
 - A **change** has a stable random `ChangeId` (16 bytes). Each time its content changes, a new `Revision` is written with the same change_id, and the old revision is listed in `predecessors`.
 - The working copy is always a revision (the workspace's "working revision"). Every command first snapshots the working copy (jj-style). There is no staging area.
 - `tig new` starts a fresh empty change on top of the current one. `tig describe` sets the message. Branches are optional **bookmarks**.
-- Conflicts become objects later (phase 1.5). A rebase never stops halfway. Until then:
-  - **Explicit actions** that would conflict (abandon, a merge in `new`) are refused, and nothing changes.
-  - **Automatic rebases of descendants** never fail the operation. Every command snapshots first, so a failure there would strand the user. A descendant whose rebase would conflict stays on the previous version of its parent, which stays visible (`log` marks it "(previous version)"), and the command prints a warning naming the paths. Nothing is lost, and nothing changes silently.
+- Conflicts are stored locally as merge expressions (`adds - removes`), with one more positive term than negative terms. Missing leaves represent deletion; leaves retain file modes, symlinks, trees and opaque seals. Repeated merges flatten expressions and cancel identical terms. There is no two-parent limit. A file/directory clash stores the alternatives at their common structural root.
+- Explicit merges, abandon and automatic descendant rebases complete with conflicted revisions. The conflict remains part of the tree until resolved; every side remains reachable for recovery and undo.
+- Checkout materializes a conflict as a regular marker file, without internal object IDs. Markers are longer than literal marker runs in the alternatives, so source examples cannot be mistaken for generated markers. Unchanged markers, including after reopening, rehash or stat-cache loss, preserve the conflict. Partially edited markers are stored as a draft and remain unresolved; later merges retain that draft as an alternative rather than discarding it. Removing all generated marker lines resolves to ordinary file bytes. Status reports `C`, and diff/show/cat display competing versions. `tig resolve PATH --side N` or `--base N` selects an exact stored alternative (1-based), including deletion, directory, symlink and executable modes. See `CONFLICTS.md`.
+- Unresolved conflicts are local-only in this phase. Publish and Git export refuse an unresolved revision anywhere in the selected ancestry, including private paths, before copying revision content. Fetch and sealed-pack decoding reject incoming conflict kinds. Resolve the original change before publishing descendants; storing conflicts across remotes is deferred.
 - The root revision can never be a working change: it can't be rewritten, so edits on it could never be recorded. `tig new root` starts a change on top of it.
 
 ### Operation log
@@ -115,6 +117,7 @@ internal/billing/**   @billing
 - **Built-in floor.** The default rules always apply *underneath* the repo's `.private`, even if that file is deleted or rewritten. `.private` can add private paths. It can make a default-private path public only with an explicit negation (`!.env`), which publish asks to confirm the first time. So forgetting a line, or deleting the file, can never publish a `.env`. `tig init` also writes the defaults into `.private`, so people can see them.
 - `tig why <path>` prints the effective rule and group, including when the built-in floor decided it.
 - **Metadata exception.** `.private` itself, change descriptions, author and committer fields, and bookmark names are public. If you write the name of a file that lives inside a sealed folder into one of them, that name is public. Publish warns when `.private` or a description mentions such a name, but does not refuse: these fields have to be public for outsiders to understand and build the repo.
+- **Git-version ambiguity.** Embedded double stars before a slash (`a**/b`) have matched differently across Git versions. Positive private rules use the broader reading; negations use the narrower reading, so disagreement keeps a path private. Publish and Git export warn when a path hits this difference, naming the rule and line without revealing the private path. Use whole-component `**` or an explicit path to remove the ambiguity. Matching and warnings stay at trust boundaries. Older local publish/export revision caches are invalidated while exposure evidence, owner pins, rollback floors and ref protection are retained; content already published still requires rotation.
 - **Declassification.** Every non-empty blob ever sealed to a remote is remembered. Publishing the same bytes in a public file — after a rename, a delete, or within one unpublished batch — is refused unless that path is passed with `--declassify <path>`. Confirming a negation makes a path public from now on; it never declassifies bytes that were sealed.
 - **Publishing** builds a public view: every private path is replaced by a sealed entry, and private content is encrypted into one sealed pack per access group and push window (X25519 key wrapping per member, content keys per epoch). The exact rules are in "Crypto and wire rules" below.
 - **The leak rule:** if a path was public in an earlier published snapshot and later becomes private, tig refuses to pretend it is hidden. It says the content already leaked and tells you to rotate it.
@@ -196,10 +199,15 @@ Imports classify each revision with its own `.private` plus the built-in floor. 
 
 ChangeIds are derived deterministically from Git commit IDs under a random local import secret saved in `.tig/git-import` before use. The frozen `GIT_IMPORT_CHANGE_ID` label derives that subkey; its keyed hash covers the strip flag, Git ID byte length and Git ID bytes, taking the first 16 output bytes. Re-import with the same secret and mode is idempotent; independent destination secrets give different identities. The secret prevents importing a private Git hash as an unsalted public guessing oracle. Changing strip mode requires a separate destination. Object encodings and ordinary hot paths do not change. See `IMPORT_GIT.md` for the complete behavior and `bench/IMPORT.md` for measured bulk-storage costs.
 
+## Git export
+
+`tig export-git <path>` writes bookmarks into a Git repository via gitoxide. Git is a public channel: each revision is classified with its own `.private` plus the built-in floor, and private paths and existing sealed entries are omitted rather than sealed. `.private` itself stays public. A public file whose bytes match a non-empty private blob in the exported history is refused unless that path is passed with `--declassify`. The same tig revision always produces the same Git commit id. Refs move only after the objects exist, and only as a fast-forward of the last export unless `--force` is given. The worktree is not checked out, and hooks and filters are not run. See `EXPORT_GIT.md`.
+
 ## Phases
 
 - **Phase 1 (now):** core objects + stores, path index, trees/diff, revisions/changes, op log + undo, in-memory and filesystem workspaces, CLI (`init status diff log show new describe edit undo op-log workspace bookmark cat why`), `.private` rules plus local publish/fetch with sealing in simple mode, benchmarks against git.
-- **Phase 2:** git import is implemented (via gitoxide, MIT/Apache); git export, network remotes and a server, roles/hierarchy, conflicts as objects, filesystem watcher and storage packs remain.
+- **Phase 1.5:** local stored conflicts, multi-parent merges, descendant rebases, marker editing and exact-side resolution are implemented. Conflicted history cannot be published or exported yet.
+- **Phase 2:** git import and git export are implemented (via gitoxide, MIT/Apache); network remotes and a server, roles/hierarchy, sharing conflicted revisions, filesystem watcher and storage packs remain.
 
 ## Licensing
 

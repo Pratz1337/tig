@@ -32,7 +32,7 @@ use crate::pack::{PackBuilder, PackError};
 use crate::project::{project_tree, public_revision, Projection, SealedRoot, PRIVATE_GROUP};
 use crate::remote::{DirRemote, RemoteError};
 
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_PATHS: usize = 1_000_000;
 const MAX_WIRES: usize = 1_000_000;
@@ -286,6 +286,11 @@ impl PublishState {
         // Version 3 adds the manifest floor.
         let manifest_seq = if version >= 3 { r.varint()? } else { 0 };
         r.finish()?;
+        // Earlier projections used the narrower embedded-** privacy policy.
+        // Keep exposure evidence and rollback floors, but reclassify history.
+        if version < 4 {
+            revisions.clear();
+        }
         Ok(PublishState {
             remote_id,
             owner_signing,
@@ -473,6 +478,9 @@ pub fn publish(
         warnings: {
             let mut warnings = checked.warnings;
             warnings.extend(metadata_mentions(store, &plans)?);
+            let compatibility: BTreeSet<_> = plans.iter()
+                .flat_map(|plan| plan.projection.warnings.iter().cloned()).collect();
+            warnings.extend(compatibility);
             warnings
         },
     })
@@ -483,17 +491,13 @@ pub fn publish(
 /// Warns (never refuses) when they mention a name found only inside a
 /// sealed root. Names under 4 characters are skipped as noise.
 fn metadata_mentions(store: &dyn Store, plans: &[Plan]) -> Result<Vec<String>, PublishError> {
-    let mut hidden: BTreeSet<String> = BTreeSet::new();
+    let mut hidden = BTreeSet::new();
     let mut public_text = String::new();
     for plan in plans {
-        for root in &plan.projection.sealed {
-            for (path, _) in &plan.projection.private_files {
-                if path.starts_with(&root.path) && *path != root.path {
-                    let below = &path.as_str()[root.path.as_str().len() + 1..];
-                    hidden.extend(below.split('/').filter(|name| name.len() >= 4).map(str::to_string));
-                }
-            }
-        }
+        hidden.extend(crate::project::names_hidden_inside(
+            plan.projection.sealed.iter().map(|root| &root.path),
+            &plan.projection.private_files,
+        ));
         public_text.push_str(&plan.description);
         public_text.push('\n');
         for (path, leaf) in &plan.projection.public_files {
@@ -503,15 +507,9 @@ fn metadata_mentions(store: &dyn Store, plans: &[Plan]) -> Result<Vec<String>, P
             }
         }
     }
-    let named: Vec<&str> = hidden.iter().map(String::as_str).filter(|name| public_text.contains(name)).collect();
-    Ok(if named.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
-            "public text (.private or a change description) mentions names hidden inside a sealed folder: {}; that text is published as-is",
-            named.join(", ")
-        )]
-    })
+    Ok(crate::project::metadata_mention_warning(&hidden, &public_text, "published")
+        .into_iter()
+        .collect())
 }
 
 /// The remote's manifest, verified against `keyring`. Missing is fine only
@@ -1009,6 +1007,7 @@ fn write_public_tree(
                     put_missing(remote, &blob_id, ObjectKind::Blob, &blob, written)?;
                 }
                 EntryKind::Sealed => {}
+                EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in public tree".into())),
             }
         }
         if stack.len() > MAX_STACK || children.len() > MAX_STACK - stack.len() {
@@ -1136,6 +1135,7 @@ fn seal_root(
                 )?;
             }
             EntryKind::Sealed => {}
+            EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in private tree".into())),
         }
     }
     Ok(sealed_id)
@@ -1265,6 +1265,7 @@ mod tests {
         state.remote_id = [1; 16];
         state.owner_signing = Some([2; 32]);
         state.counter = 4;
+        state.manifest_seq = 7;
         state.revisions.insert(ObjectId([1; 32]), ObjectId([9; 32]));
         state.revisions.insert(ObjectId([2; 32]), ObjectId([8; 32]));
         state.ever_public.insert(RepoPath::new(".env").unwrap());
@@ -1277,6 +1278,12 @@ mod tests {
         );
         let bytes = state.encode().unwrap();
         assert_eq!(PublishState::decode(&bytes).unwrap(), state);
+
+        let mut legacy = bytes.clone();
+        legacy[0] = 3;
+        let mut migrated = state.clone();
+        migrated.revisions.clear();
+        assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
 
         let mut trailing = bytes.clone();
         trailing.push(0);

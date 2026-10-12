@@ -556,6 +556,7 @@ fn copy_tree(
                     copy_blob(remote, local, entry.id(), budget, seen)?;
                 }
                 EntryKind::Sealed => {}
+                EntryKind::Conflict => return Err(FetchError::Invalid("remote contains an unresolved conflict".into())),
             }
         }
     }
@@ -686,6 +687,7 @@ fn sealed_leaves(
                         )));
                     }
                 }
+                EntryKind::Conflict => return Err(FetchError::Invalid("remote contains an unresolved conflict".into())),
             }
         }
         for item in nested.into_iter().rev() {

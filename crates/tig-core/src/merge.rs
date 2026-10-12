@@ -1,8 +1,7 @@
 //! Three-way tree merge at the file level, and merge-base search.
 //!
-//! Phase 1 has no conflict objects yet: a merge that would conflict returns
-//! `MergeOutcome::Conflict` with the paths, and the caller refuses the operation
-//! instead of writing a half-merged tree.
+//! Overlapping edits become local conflict objects. Every successful merge
+//! returns a tree, including when resolving the competing versions is deferred.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -15,8 +14,15 @@ use crate::treeops::{apply_edits, diff_trees, lookup, Leaf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
+    /// No newly created conflict; inputs may already contain stored conflicts.
     Clean(ObjectId),
-    Conflict(Vec<RepoPath>),
+    Conflict { tree: ObjectId, paths: Vec<RepoPath> },
+}
+
+impl MergeOutcome {
+    pub fn tree(&self) -> ObjectId {
+        match self { Self::Clean(tree) | Self::Conflict { tree, .. } => *tree }
+    }
 }
 
 /// Applies the changes `base -> theirs` on top of `ours`.
@@ -65,9 +71,9 @@ pub fn merge_trees(
                     }
                     parent = at.parent();
                 }
-                let incompatible = if let Some(at) = overlap {
-                    let ours = lookup(store, ours, &at)?;
-                    let theirs = lookup(store, theirs, &at)?;
+                let incompatible = if let Some(ref at) = overlap {
+                    let ours = lookup(store, ours, at)?;
+                    let theirs = lookup(store, theirs, at)?;
                     ours != theirs
                         && !(ours.is_some_and(|leaf| leaf.kind() == EntryKind::Tree)
                             && theirs.is_some_and(|leaf| leaf.kind() == EntryKind::Tree))
@@ -75,7 +81,7 @@ pub fn merge_trees(
                     false
                 };
                 if incompatible {
-                    conflicts.push(d.path);
+                    conflicts.push(overlap.expect("incompatible overlap has a path"));
                 } else if !our_changes.contains_key(&d.path) {
                     edits.insert(d.path, d.new);
                 }
@@ -83,7 +89,37 @@ pub fn merge_trees(
         }
     }
     if !conflicts.is_empty() {
-        return Ok(MergeOutcome::Conflict(conflicts));
+        // A collision below a replaced/deleted directory belongs at the
+        // structural root, otherwise putting a child conflict loses the
+        // competing file (and makes the merge depend on parent order).
+        for path in &mut conflicts {
+            let mut parent = path.parent();
+            while let Some(at) = parent.filter(|at| !at.is_root()) {
+                let left = lookup(store, ours, &at)?;
+                let right = lookup(store, theirs, &at)?;
+                if left.is_some_and(|leaf| leaf.kind() == EntryKind::Tree)
+                    && right.is_some_and(|leaf| leaf.kind() == EntryKind::Tree) { break; }
+                if left != right { *path = at.clone(); }
+                parent = at.parent();
+            }
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        let mut roots = BTreeMap::new();
+        for path in conflicts {
+            if !has_ancestor(&roots, &path) { roots.insert(path, ()); }
+        }
+        edits.retain(|path, _| !roots.contains_key(path) && !has_ancestor(&roots, path) && !has_inside(&roots, path));
+        for path in roots.keys() {
+            let leaf = crate::conflict::merge(store, lookup(store, base, path)?, lookup(store, ours, path)?, lookup(store, theirs, path)?)?;
+            edits.insert(path.clone(), leaf);
+        }
+        let tree = apply_edits(store, ours, &edits)?;
+        let mut paths = Vec::new();
+        for path in roots.into_keys() {
+            if lookup(store, &tree, &path)?.is_some_and(|leaf| leaf.kind() == EntryKind::Conflict) { paths.push(path); }
+        }
+        return Ok(if paths.is_empty() { MergeOutcome::Clean(tree) } else { MergeOutcome::Conflict { tree, paths } });
     }
     // A file<->directory change diffs as a delete plus puts at a related path
     // (`a` removed, `a/x` added). `apply_edits` rejects that pair as ambiguous,
@@ -173,6 +209,7 @@ impl MergeGraph {
             heads: Vec<ObjectId>,
             tree: ObjectId,
             next: usize,
+            conflicts: BTreeMap<RepoPath, ()>,
         }
         let first = heads
             .first()
@@ -181,6 +218,7 @@ impl MergeGraph {
             heads: heads.to_vec(),
             tree: self.revision(first)?.0,
             next: 1,
+            conflicts: BTreeMap::new(),
         }];
         let mut virtual_trees = BTreeMap::new();
         // Explicit frames keep nested criss-cross histories off the call stack.
@@ -188,9 +226,13 @@ impl MergeGraph {
             if frame.next == frame.heads.len() {
                 let tree = frame.tree;
                 virtual_trees.insert(frame.heads.clone(), tree);
-                stack.pop();
+                let completed = stack.pop().expect("frame exists");
                 if stack.is_empty() {
-                    return Ok(MergeOutcome::Clean(tree));
+                    let mut paths = Vec::new();
+                    for path in completed.conflicts.into_keys() {
+                        if lookup(store, &tree, &path)?.is_some_and(|leaf| leaf.kind() == EntryKind::Conflict) { paths.push(path); }
+                    }
+                    return Ok(if paths.is_empty() { MergeOutcome::Clean(tree) } else { MergeOutcome::Conflict { tree, paths } });
                 }
                 continue;
             }
@@ -207,14 +249,16 @@ impl MergeGraph {
                             heads: bases,
                             tree,
                             next: 1,
+                            conflicts: BTreeMap::new(),
                         });
                         continue;
                     }
                 },
             };
-            match merge_trees(store, &base, &frame.tree, &self.revision(&parent)?.0)? {
-                MergeOutcome::Clean(tree) => frame.tree = tree,
-                conflict => return Ok(conflict),
+            let result = merge_trees(store, &base, &frame.tree, &self.revision(&parent)?.0)?;
+            frame.tree = result.tree();
+            if let MergeOutcome::Conflict { paths, .. } = result {
+                frame.conflicts.extend(paths.into_iter().map(|path| (path, ())));
             }
             frame.next += 1;
         }
@@ -282,10 +326,9 @@ mod tests {
         let base = tree(&s, &[("a", b"1")]);
         let ours = tree(&s, &[("a", b"2")]);
         let theirs = tree(&s, &[("a", b"3")]);
-        assert_eq!(
-            merge_trees(&s, &base, &ours, &theirs).unwrap(),
-            MergeOutcome::Conflict(vec![RepoPath::new("a").unwrap()])
-        );
+        let MergeOutcome::Conflict { tree, paths } = merge_trees(&s, &base, &ours, &theirs).unwrap() else { panic!("expected conflict"); };
+        assert_eq!(paths, vec![RepoPath::new("a").unwrap()]);
+        assert_eq!(lookup(&s, &tree, &paths[0]).unwrap().unwrap().kind(), EntryKind::Conflict);
     }
 
     #[test]
@@ -316,7 +359,7 @@ mod tests {
         let theirs = tree(&s, &[("a/x", b"2")]);
         assert!(matches!(
             merge_trees(&s, &base, &ours, &theirs).unwrap(),
-            MergeOutcome::Conflict(_)
+            MergeOutcome::Conflict { .. }
         ));
     }
 

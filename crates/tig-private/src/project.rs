@@ -56,6 +56,7 @@ pub struct Projection {
     pub private_files: Vec<(RepoPath, Leaf)>,
     /// Public files that are public only because a `!` rule said so.
     pub negated: Vec<RepoPath>,
+    pub warnings: Vec<String>,
 }
 
 /// Reads the `.private` file of `root` and layers it on the built-in floor.
@@ -82,29 +83,42 @@ pub fn rules_of(store: &dyn Store, root: &ObjectId) -> Result<Rules, ProjectErro
     }
 }
 
-/// Projects `root` for publishing under the `private` group's `key`.
-pub fn project_tree(
-    store: &dyn Store,
-    root: &ObjectId,
-    key: &EpochKey,
-) -> Result<Projection, ProjectError> {
+/// Every file of one tree, classified with that tree's own rules.
+///
+/// Sealed entries are listed with the public files: they are already opaque.
+/// Publish may absorb them into a surrounding private directory; Git export
+/// drops them instead.
+pub struct ClassifiedTree {
+    pub public_files: Vec<(RepoPath, Leaf)>,
+    pub private_files: Vec<(RepoPath, Leaf)>,
+    pub negated: Vec<RepoPath>,
+    pub readers_of: HashMap<RepoPath, BTreeSet<String>>,
+    pub warnings: Vec<String>,
+}
+
+/// Classifies `root` with [`rules_of`]. Shared by publish and Git export so
+/// both use one matcher and the same built-in floor.
+pub fn classify_tree(store: &dyn Store, root: &ObjectId) -> Result<ClassifiedTree, ProjectError> {
     let rules = rules_of(store, root)?;
     if !rules.is_simple_mode() {
         let roles: Vec<String> = rules.roles().into_iter().map(|r| format!("@{r}")).collect();
         return Err(ProjectError::RolesNotSupported(roles.join(", ")));
     }
 
-    // 1. Classify files. Already-sealed entries (from a public clone) are
-    //    opaque and public-safe; a surrounding private seal may absorb them.
     let mut public_files = Vec::new();
     let mut private_files = Vec::new();
     let mut negated = Vec::new();
+    let mut warnings = BTreeSet::new();
     let mut readers_of: HashMap<RepoPath, BTreeSet<String>> = HashMap::new();
     for (path, leaf) in walk(store, root, &RepoPath::root())? {
+        if leaf.kind() == EntryKind::Conflict {
+            return Err(tig_core::Error::Invalid(format!("unresolved conflict at {path}; resolve it before publish or Git export")).into());
+        }
         if leaf.kind() == EntryKind::Sealed {
             public_files.push((path, leaf));
             continue;
         }
+        warnings.extend(rules.compatibility_warnings(&path));
         match rules.classify(&path) {
             Verdict::Public { rule } => {
                 // A built-in `!` (`.env.example` and friends) is the floor's
@@ -128,9 +142,22 @@ pub fn project_tree(
             }
         }
     }
+    Ok(ClassifiedTree {
+        public_files,
+        private_files,
+        negated,
+        readers_of,
+        warnings: warnings.into_iter().collect(),
+    })
+}
 
-    // 2. Aggregate per directory: Some(readers) if every file below is
-    //    private to exactly those readers, None if mixed or public.
+/// Highest directory whose files are all private to the same readers, or the
+/// private file itself. Foreign seals do not make a directory mixed.
+pub fn uniform_private_roots(
+    public_files: &[(RepoPath, Leaf)],
+    private_files: &[(RepoPath, Leaf)],
+    readers_of: &HashMap<RepoPath, BTreeSet<String>>,
+) -> BTreeMap<RepoPath, BTreeSet<String>> {
     let mut dirs: HashMap<RepoPath, Option<BTreeSet<String>>> = HashMap::new();
     let mut fold = |path: &RepoPath, class: Option<&BTreeSet<String>>| {
         let mut cur = path.parent();
@@ -144,19 +171,17 @@ pub fn project_tree(
             cur = dir.parent();
         }
     };
-    for (path, leaf) in &public_files {
+    for (path, leaf) in public_files {
         if leaf.kind() != EntryKind::Sealed {
             fold(path, None);
         }
     }
-    for (path, _) in &private_files {
+    for (path, _) in private_files {
         fold(path, readers_of.get(path));
     }
 
-    // The sealed root of a private file is its highest uniformly private
-    // ancestor directory, or the file itself.
     let mut roots: BTreeMap<RepoPath, BTreeSet<String>> = BTreeMap::new();
-    for (path, _) in &private_files {
+    for (path, _) in private_files {
         let readers = &readers_of[path];
         let mut top = path.clone();
         let mut cur = path.parent();
@@ -168,8 +193,65 @@ pub fn project_tree(
         }
         roots.insert(top, readers.clone());
     }
+    roots
+}
 
-    // 3. Build the public tree with one batch of edits.
+/// File-name components that sit strictly inside a uniformly private directory.
+/// Names shorter than 4 characters are noise and are left out.
+pub fn names_hidden_inside<'a>(
+    roots: impl IntoIterator<Item = &'a RepoPath>,
+    private_files: &[(RepoPath, Leaf)],
+) -> BTreeSet<String> {
+    let roots: Vec<&RepoPath> = roots.into_iter().collect();
+    let mut hidden = BTreeSet::new();
+    for root in &roots {
+        for (path, _) in private_files {
+            if path.starts_with(root) && path != *root {
+                let below = &path.as_str()[root.as_str().len() + 1..];
+                hidden.extend(
+                    below
+                        .split('/')
+                        .filter(|name| name.len() >= 4)
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+    hidden
+}
+
+/// Warns when public metadata names a file hidden inside a private directory.
+/// `verb` is `published` or `exported`: the fields stay public either way.
+pub fn metadata_mention_warning(hidden: &BTreeSet<String>, public_text: &str, verb: &str) -> Option<String> {
+    let named: Vec<&str> = hidden
+        .iter()
+        .map(String::as_str)
+        .filter(|name| public_text.contains(name))
+        .collect();
+    if named.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "public text (.private or a change description) mentions names hidden inside a sealed folder: {}; that text is {verb} as-is",
+            named.join(", ")
+        ))
+    }
+}
+
+/// Projects `root` for publishing under the `private` group's `key`.
+pub fn project_tree(
+    store: &dyn Store,
+    root: &ObjectId,
+    key: &EpochKey,
+) -> Result<Projection, ProjectError> {
+    let classified = classify_tree(store, root)?;
+    let roots = uniform_private_roots(
+        &classified.public_files,
+        &classified.private_files,
+        &classified.readers_of,
+    );
+
+    // Build the public tree with one batch of edits.
     let mut sealed = Vec::with_capacity(roots.len());
     let mut edits = BTreeMap::new();
     for (path, readers) in roots {
@@ -185,13 +267,15 @@ pub fn project_tree(
     }
     let public_tree = apply_edits(store, root, &edits)?;
     // Foreign seals absorbed into a private folder are no longer public leaves.
+    let mut public_files = classified.public_files;
     public_files.retain(|(path, _)| !tig_core::path::has_ancestor(&edits, path));
     Ok(Projection {
         public_tree,
         sealed,
         public_files,
-        private_files,
-        negated,
+        private_files: classified.private_files,
+        negated: classified.negated,
+        warnings: classified.warnings,
     })
 }
 

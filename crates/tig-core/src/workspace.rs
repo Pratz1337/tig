@@ -70,6 +70,14 @@ impl Workspace {
     }
 
     pub fn read(&self, repo: &Repo, path: &RepoPath) -> Result<Option<Vec<u8>>> {
+        match self.leaf(repo, path)? {
+            Some(found) if found.is_file_like() => Ok(Some(repo.store().get_blob(&found.id())?)),
+            Some(found) if found.kind() == EntryKind::Conflict => Ok(Some(crate::conflict::materialize(repo.store().as_ref(), found)?)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn leaf(&self, repo: &Repo, path: &RepoPath) -> Result<Option<Leaf>> {
         let leaf = match self.covering_edit(path) {
             Some((at, edit)) if at == path => edit,
             Some((at, Some(graft))) if graft.kind() == EntryKind::Tree => {
@@ -78,10 +86,23 @@ impl Workspace {
             Some(_) => None,
             None => lookup(&**repo.store(), &self.base_tree, path)?,
         };
-        match leaf {
-            Some(found) if found.is_file_like() => Ok(Some(repo.store().get_blob(&found.id())?)),
-            _ => Ok(None),
+        Ok(leaf)
+    }
+
+    /// Selects a stored alternative, including a directory, deletion or seal.
+    pub fn resolve(&mut self, repo: &Repo, path: &RepoPath, choice: Option<Leaf>) -> Result<()> {
+        let previous = self.leaf(repo, path)?.filter(|leaf| leaf.kind() == EntryKind::Conflict)
+            .ok_or_else(|| Error::Invalid(format!("{path} is not conflicted")))?;
+        let conflict = repo.store().get_conflict(&previous.id())?;
+        if !conflict.adds().contains(&choice) && !conflict.removes().contains(&choice) {
+            return Err(Error::Invalid("resolution must select a stored alternative".into()));
         }
+        if let Some((at, edit)) = self.covering_edit(path) {
+            if at != path { return self.edit_graft(repo, at.clone(), edit, path, choice); }
+        }
+        let base = lookup(repo.store().as_ref(), &self.base_tree, path)?;
+        self.record(path.clone(), choice, base);
+        Ok(())
     }
 
     pub fn write(&mut self, repo: &Repo, path: &RepoPath, data: &[u8]) -> Result<()> {
@@ -108,10 +129,10 @@ impl Workspace {
 
     /// Records an edit. An edit that restores the base state cancels out, so
     /// save/revert loops leave the overlay empty.
-    /// `leaf` must be a file, executable, or symlink (or None to delete the
+    /// `leaf` must be a file, executable, symlink or local conflict (or None to delete the
     /// path, including a whole directory).
     pub fn set(&mut self, repo: &Repo, path: RepoPath, leaf: Option<Leaf>) -> Result<()> {
-        if path.is_root() || leaf.is_some_and(|found| !found.is_file_like()) {
+        if path.is_root() || leaf.is_some_and(|found| !found.is_file_like() && found.kind() != EntryKind::Conflict) {
             return Err(Error::Invalid(format!(
                 "workspace edits must be files; got {leaf:?} at {path}"
             )));
@@ -141,6 +162,8 @@ impl Workspace {
             }
         }
         let base = lookup(&**repo.store(), &self.base_tree, &path)?;
+        let previous = self.overlay.get(&path).copied().unwrap_or(base);
+        let leaf = snapshot_leaf(repo.store().as_ref(), previous, leaf)?;
         self.record(path, leaf, base);
         Ok(())
     }
@@ -171,7 +194,10 @@ impl Workspace {
             _ if leaf.is_none() => return Ok(()), // removing below a non-directory is a no-op
             _ => empty_tree_id(),
         };
-        let edits = BTreeMap::from([(relative_path(path, &at)?, leaf)]);
+        let relative = relative_path(path, &at)?;
+        let previous = lookup(repo.store().as_ref(), &tree, &relative)?;
+        let leaf = snapshot_leaf(repo.store().as_ref(), previous, leaf)?;
+        let edits = BTreeMap::from([(relative, leaf)]);
         let tree = apply_edits(&**repo.store(), &tree, &edits)?;
         let graft = (tree != empty_tree_id()).then(|| Leaf::tree(tree));
         let base = lookup(&**repo.store(), &self.base_tree, &at)?;
@@ -269,6 +295,15 @@ fn relative_path(path: &RepoPath, ancestor: &RepoPath) -> Result<RepoPath> {
         return Ok(path.clone());
     }
     RepoPath::new(&path.as_str()[ancestor.as_str().len() + 1..])
+}
+
+fn snapshot_leaf(store: &dyn crate::store::Store, previous: Option<Leaf>, leaf: Option<Leaf>) -> Result<Option<Leaf>> {
+    if let (Some(previous), Some(leaf)) = (previous, leaf) {
+        if previous.kind() == EntryKind::Conflict && leaf.is_file_like() {
+            return Ok(Some(crate::conflict::snapshot_file(store, previous, &store.get_blob(&leaf.id())?, leaf.kind())?));
+        }
+    }
+    Ok(leaf)
 }
 
 fn graft_files(

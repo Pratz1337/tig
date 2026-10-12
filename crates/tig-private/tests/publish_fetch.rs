@@ -26,6 +26,55 @@ const MAIN: &[u8] = b"fn main() {}\n";
 const MAIN_V2: &[u8] = b"fn main() { println!(\"hi\"); }\n";
 const RULES: &[u8] = b"secrets/\n";
 
+#[test]
+fn signed_remote_conflict_entries_are_refused_without_advancing_fetch_state() {
+    let (_dir, remote) = remote_at([97; 16]);
+    let owner = Identity::generate().unwrap();
+    let (keyring, _) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    remote.write_keyring(&keyring.encode().unwrap()).unwrap();
+    let store = remote.public_store();
+    store.put(&tig_core::Object::Tree(tig_core::Tree::empty())).unwrap();
+    store.put(&tig_core::Object::Revision(tig_core::repo::root_revision())).unwrap();
+    let a = tig_core::treeops::Leaf::file(store.put_blob(b"A").unwrap());
+    let b = tig_core::treeops::Leaf::file(store.put_blob(b"B").unwrap());
+    let leaf = tig_core::conflict::merge(store, None, Some(a), Some(b)).unwrap().unwrap();
+    let tree = store.put(&tig_core::Object::Tree(tig_core::Tree::new(vec![tig_core::TreeEntry::new("file", EntryKind::Conflict, leaf.id()).unwrap()]).unwrap())).unwrap();
+    let source = repo();
+    let mut revision = source.revision(&source.working_revision(DEFAULT_WORKSPACE).unwrap()).unwrap();
+    revision.tree = tree;
+    let tip = store.put(&tig_core::Object::Revision(revision)).unwrap();
+    sign_main(&remote, &owner, tip);
+    let mut state = FetchState::new();
+    let before = state.clone();
+    let error = fetch(&remote, &MemoryStore::new(), None, &mut state).unwrap_err();
+    assert!(error.to_string().contains("unresolved conflict"), "{error}");
+    assert_eq!(state, before);
+}
+
+#[test]
+fn ambiguous_double_star_rules_seal_and_warn_without_disclosing_paths() {
+    for rules in [b"a**/b\n".as_slice(), b"ax/\n!a**/b\n".as_slice()] {
+        let mut repo = repo();
+        let rev = save(&mut repo, &[(".private", rules), ("ax/y/b", ENV)], &[]);
+        let (dir, remote) = remote_at([98; 16]);
+        let identity = Identity::generate().unwrap();
+        let report = publish_at(
+            &repo, &remote, &identity, None, &mut PublishState::new(), rev,
+            &PublishOptions::default(),
+        ).unwrap();
+        assert!(report.private_objects_sealed > 0);
+        let warning = report.warnings.iter()
+            .find(|warning| warning.contains("Git versions"))
+            .expect("compatibility warning");
+        assert!(warning.contains(".private line"));
+        assert!(!warning.contains("ax/y/b"));
+        assert_hidden(&files_of(dir.path()), &[ENV.to_vec()]);
+        let (store, fetched) = fetch_new(&remote, None, &mut FetchState::new()).unwrap();
+        let tree = store.get_revision(&tip(&fetched)).unwrap().tree;
+        assert_eq!(kind_at(&store, tree, "ax"), Some(EntryKind::Sealed));
+    }
+}
+
 fn p(path: &str) -> RepoPath {
     RepoPath::new(path).unwrap()
 }
