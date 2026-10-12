@@ -12,7 +12,7 @@ Think Discord roles, but for your code: every path can have its own audience.
 
 </div>
 
-> Not the [tig terminal UI for git](https://github.com/jonas/tig). This is a separate version control system, written from scratch in Rust.
+> Not the [tig terminal UI for git](https://github.com/jonas/tig). This is a separate version control system, I am bad at names so for now this is tig.
 
 ---
 
