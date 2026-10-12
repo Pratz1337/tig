@@ -10,9 +10,9 @@ mod mem;
 mod server;
 mod wire;
 
-pub use client::HttpRemote;
+pub use client::{check_url, HttpRemote};
 pub use mem::MemRemote;
-pub use server::{init_server_dir, read_server_owner, serve, Server, TlsConfig};
+pub use server::{init_server_dir, read_server_owner, serve, serve_dir, Server, TlsConfig};
 
 #[cfg(test)]
 mod tests;

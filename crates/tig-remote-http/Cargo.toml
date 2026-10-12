@@ -16,6 +16,7 @@ hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 clap = { workspace = true }
 ureq = { workspace = true }
+httpdate = "1"
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 
