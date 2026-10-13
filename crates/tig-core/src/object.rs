@@ -17,6 +17,7 @@ pub enum ObjectKind {
     Revision = 3,
     Operation = 4,
     View = 5,
+    Conflict = 6,
 }
 
 impl ObjectKind {
@@ -27,6 +28,7 @@ impl ObjectKind {
             3 => ObjectKind::Revision,
             4 => ObjectKind::Operation,
             5 => ObjectKind::View,
+            6 => ObjectKind::Conflict,
             _ => return Err(Error::decode("object kind", format!("unknown kind {b}"))),
         })
     }
@@ -38,6 +40,7 @@ impl ObjectKind {
             ObjectKind::Revision => "revision",
             ObjectKind::Operation => "operation",
             ObjectKind::View => "view",
+            ObjectKind::Conflict => "conflict",
         }
     }
 }
@@ -57,6 +60,7 @@ pub enum Object {
     Revision(Revision),
     Operation(Operation),
     View(View),
+    Conflict(crate::conflict::Conflict),
 }
 
 impl Object {
@@ -67,6 +71,7 @@ impl Object {
             Object::Revision(_) => ObjectKind::Revision,
             Object::Operation(_) => ObjectKind::Operation,
             Object::View(_) => ObjectKind::View,
+            Object::Conflict(_) => ObjectKind::Conflict,
         }
     }
 
@@ -78,6 +83,7 @@ impl Object {
             Object::Revision(r) => r.encode(),
             Object::Operation(o) => o.encode(),
             Object::View(v) => v.encode(),
+            Object::Conflict(c) => c.encode(),
         }
     }
 
@@ -88,6 +94,7 @@ impl Object {
             ObjectKind::Revision => Object::Revision(Revision::decode(body)?),
             ObjectKind::Operation => Object::Operation(Operation::decode(body)?),
             ObjectKind::View => Object::View(View::decode(body)?),
+            ObjectKind::Conflict => Object::Conflict(crate::conflict::Conflict::decode(body)?),
         })
     }
 
@@ -119,6 +126,7 @@ pub enum EntryKind {
     Tree = 4,
     /// Placeholder for a private subtree in a public view. `id` is the sealed hash.
     Sealed = 5,
+    Conflict = 6,
 }
 
 impl EntryKind {
@@ -129,6 +137,7 @@ impl EntryKind {
             3 => EntryKind::Symlink,
             4 => EntryKind::Tree,
             5 => EntryKind::Sealed,
+            6 => EntryKind::Conflict,
             _ => return Err(Error::decode("tree", format!("unknown entry kind {b}"))),
         })
     }
@@ -202,6 +211,7 @@ impl TreeEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tree {
     entries: Vec<TreeEntry>,
+    has_conflicts: bool,
 }
 
 /// True if `name` would be treated as the `.tig` metadata directory by some
@@ -268,8 +278,10 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 impl Tree {
     pub fn new(mut entries: Vec<TreeEntry>) -> Result<Self> {
+        let mut has_conflicts = false;
         for e in &entries {
             validate_name(&e.name)?;
+            has_conflicts |= e.kind == EntryKind::Conflict;
         }
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         if let Some(w) = entries.windows(2).find(|w| w[0].name == w[1].name) {
@@ -278,7 +290,7 @@ impl Tree {
                 w[0].name
             )));
         }
-        Ok(Tree { entries })
+        Ok(Tree { entries, has_conflicts })
     }
 
     pub fn empty() -> Self {
@@ -302,7 +314,7 @@ impl Tree {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.u8(FORMAT_V1);
+        w.u8(if self.has_conflicts { 2 } else { FORMAT_V1 });
         w.varint(self.entries.len() as u64);
         for e in &self.entries {
             w.u8(e.kind as u8);
@@ -314,7 +326,8 @@ impl Tree {
 
     pub fn decode(body: &[u8]) -> Result<Self> {
         let mut r = Reader::new(body, "tree");
-        check_version(&mut r, "tree")?;
+        let version = r.u8()?;
+        if !matches!(version, 1 | 2) { return Err(Error::decode("tree", "unsupported version")); }
         let n = r.count(1 + 1 + 1 + 32)?;
         let mut entries = Vec::with_capacity(n);
         for _ in 0..n {
@@ -329,6 +342,9 @@ impl Tree {
         let tree = Tree::new(entries.clone())?;
         if tree.entries != entries {
             return Err(Error::decode("tree", "entries not in canonical order"));
+        }
+        if (version == 2) != tree.has_conflicts {
+            return Err(Error::decode("tree", "non-canonical conflict tree version"));
         }
         Ok(tree)
     }

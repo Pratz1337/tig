@@ -1,0 +1,24 @@
+[package]
+name = "tig-remote-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP remote and dumb tig-server for tig"
+
+[dependencies]
+tig-core = { workspace = true }
+tig-private = { workspace = true }
+blake3 = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+clap = { workspace = true }
+ureq = { workspace = true }
+httpdate = "1"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

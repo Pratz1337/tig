@@ -120,7 +120,7 @@ fn file_directory_merges_are_symmetric() {
                     (MergeOutcome::Clean(a), MergeOutcome::Clean(b)) => {
                         assert_eq!(a, b, "base={bi}, ours={oi}, theirs={ti}")
                     }
-                    (MergeOutcome::Conflict(_), MergeOutcome::Conflict(_)) => {}
+                    (MergeOutcome::Conflict { tree: a, .. }, MergeOutcome::Conflict { tree: b, .. }) => assert_eq!(a, b, "conflict expressions must also be symmetric: base={bi}, ours={oi}, theirs={ti}"),
                     pair => panic!("asymmetric base={bi}, ours={oi}, theirs={ti}: {pair:?}"),
                 }
             }

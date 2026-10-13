@@ -232,8 +232,22 @@ impl Keyring {
             ));
         }
         let epoch_key = require_epoch_key(owner_keys, self.remote, epoch)?;
+        self.check_owner_key(epoch_key)?;
         let issued = grant(epoch_key, member, owner)?;
         self.push_grant_and_sign(owner, issued)
+    }
+
+    /// A losing revoke can save a different secret at the winning epoch.
+    /// Compare local provenance with signed commitments before using it.
+    pub(crate) fn check_owner_key(&self, key: &EpochKey) -> Result<(), KeyringError> {
+        if self.grants.iter().any(|issued| {
+            issued.context == *key.context() && !key.matches_commitment(&issued.commitment)
+        }) {
+            return Err(KeyringError::Invalid(
+                "the saved owner key differs from the remote's signed epoch commitments; sync owner keys from the owner client that committed the revoke".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Starts a new random epoch for the members who remain. History is kept.

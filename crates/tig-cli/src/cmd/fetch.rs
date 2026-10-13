@@ -15,18 +15,26 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String) -> Result<()> 
     let identity = identity::load_if_present()?;
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
-    let dir_remote = super::remote::open_existing(&cfg.path)?;
+    let remote = super::remote::connect(&cfg, identity.as_ref(), false)?;
     let mut state = super::remote::load_fetch_state(&cfg.dir)?;
-    let report = fetch::fetch(
-        &dir_remote,
-        session.repo.store().as_ref(),
+    let published = super::remote::load_publish_state(&cfg.dir)?;
+    let mut tx = session.repo.start(format!("fetch {remote_name}"));
+    let report = fetch::fetch_into(
+        remote.as_ref(),
+        &mut tx,
         identity.as_ref(),
         &mut state,
+        &published,
     )?;
     if let Some(fingerprint) = &report.newly_pinned {
         println!("pinned owner of {remote_name}: {fingerprint} (verify it with them)");
     }
-    let mut tx = session.repo.start(format!("fetch {remote_name}"));
+    for id in &report.projection_mismatches {
+        eprintln!(
+            "access upgrade for {} kept its old mapping: public projection mismatch",
+            id.short(12)
+        );
+    }
     let mut bookmarks = Vec::new();
     for (name, id) in &report.refs {
         let bookmark = format!("{remote_name}/{name}");

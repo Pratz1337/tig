@@ -32,11 +32,14 @@ pub(super) fn run(repository: Option<&Path>) -> Result<()> {
     };
     let mut entries = diff_trees(session.repo.store().as_ref(), &parent_tree, &rev.tree)?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    if entries.is_empty() {
+    let conflicts: std::collections::BTreeSet<_> = session.wc.conflict_paths().into_iter().collect();
+    for path in &conflicts { println!("C {path} (unresolved conflict)"); }
+    if entries.is_empty() && conflicts.is_empty() {
         println!("No changes.");
         return Ok(());
     }
     for entry in entries {
+        if conflicts.contains(&entry.path) { continue; }
         let letter = match (&entry.old, &entry.new) {
             (None, Some(_)) => "A",
             (Some(_), None) => "D",

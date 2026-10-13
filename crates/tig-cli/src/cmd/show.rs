@@ -15,5 +15,5 @@ pub(super) fn run(repository: Option<&Path>, revision: Option<&str>) -> Result<(
     let all = session.repo.visible_revisions()?;
     log::print_entry(&session, working, id, &rev, &all, true)?;
     println!();
-    diff::print_revision_diff(&session.repo, id, false)
+    diff::print_revision_diff(&session.repo, id, false, &if id == session.working()? { session.wc.conflict_paths() } else { Vec::new() })
 }
