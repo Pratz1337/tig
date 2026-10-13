@@ -1,5 +1,7 @@
 //! .private rules, roles, keys, sealing, publish and fetch. See DESIGN.md "Privacy".
 
+pub mod access;
+pub mod export_git;
 pub mod fetch;
 pub mod import_git;
 pub mod keyring;

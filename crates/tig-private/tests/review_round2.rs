@@ -76,7 +76,6 @@ fn gitignore_globs_escapes_and_classes_match_git() {
         ("a/**", &["a", "a/b", "a/b/c", "x/a/b"]),
         ("a/**/", &["a", "a/b", "a/b/c", "x/a/b"]),
         ("a/**/b", &["a/b", "a/x/b", "a/x/y/b", "a/xb", "x/a/b"]),
-        ("a**/b", &["a/b", "ax/b", "ax/y/b", "x/a/b"]),
         ("**a/b", &["a/b", "xa/b", "x/ya/b"]),
         ("a/**b/c", &["a/b/c", "a/xb/c", "a/x/yb/c"]),
         ("**\\/secret", &["secret", "x/secret", "x/y/secret"]),
@@ -129,6 +128,27 @@ fn gitignore_globs_escapes_and_classes_match_git() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn embedded_double_stars_keep_the_more_private_reading() {
+    // Git 2.39.5 crosses '/' here; Git 2.56 does not. Protect both readings.
+    for (path, want) in [
+        ("a/b", true), ("ax/b", true), ("ax/y/b", true), ("x/a/b", false),
+    ] {
+        assert_eq!(private("a**/b", path), want, "{path}");
+    }
+    assert!(private("**\n!a**/b", "ax/y/b"));
+    assert!(!private("**\n!a**/b", "ax/b"));
+    assert!(!private("a**/b\n!ax/y/b", "ax/y/b"));
+    for pattern in ["a***/b", "a**/", "a**\\/b", "dir/a**/b"] {
+        let path = if pattern.starts_with("dir/") {
+            "dir/ax/y/b"
+        } else {
+            "ax/y/b"
+        };
+        assert!(private(pattern, path), "{pattern}");
+    }
 }
 
 #[test]

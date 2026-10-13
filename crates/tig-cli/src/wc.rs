@@ -112,6 +112,7 @@ struct WcState {
     working: ObjectId,
     tree: ObjectId,
     cache: PathIndex<FileState>,
+    has_conflicts: bool,
 }
 
 impl WcState {
@@ -120,6 +121,7 @@ impl WcState {
             working: ObjectId([0; 32]),
             tree: empty_tree_id(),
             cache: PathIndex::new(),
+            has_conflicts: false,
         }
     }
 }
@@ -190,6 +192,7 @@ impl WorkingCopy {
                 working,
                 tree,
                 cache: PathIndex::new(),
+                has_conflicts: false,
             },
             trusted: true,
             load_warning: None,
@@ -286,6 +289,12 @@ impl WorkingCopy {
     /// error telling you to run `tig workspace update-stale`.
     pub fn snapshot(&mut self, repo: &mut Repo) -> Result<SnapshotStats> {
         self.snapshot_with_rehash(repo, false)
+    }
+
+    pub fn conflict_paths(&self) -> Vec<RepoPath> {
+        if !self.state.has_conflicts { return Vec::new(); }
+        self.state.cache.iter().filter(|(_, row)| row.kind == EntryKind::Conflict)
+            .map(|(path, _)| path.clone()).collect()
     }
 
     /// `rehash` bypasses stat cache hits without invalidating checkout state.
@@ -487,7 +496,7 @@ impl WorkingCopy {
             .map(|change| &change.path)
             .collect();
         for change in &diff {
-            ensure_clean(&self.root, &self.state.cache, change, &deleted)?;
+            ensure_clean(repo.store().as_ref(), &self.root, &self.state.cache, change, &deleted)?;
         }
 
         let mut stats = CheckoutStats {
@@ -500,7 +509,7 @@ impl WorkingCopy {
         let (deletes, writes) = split_diff(&diff);
         for change in &deletes {
             ensure_ancestors_safe(&self.root, &change.path, &BTreeSet::new())?;
-            ensure_clean(&self.root, &self.state.cache, change, &BTreeSet::new())?;
+            ensure_clean(repo.store().as_ref(), &self.root, &self.state.cache, change, &BTreeSet::new())?;
             let disk = disk_path(&self.root, &change.path);
             remove_leaf(&disk)?;
             cache.remove(&change.path);
@@ -511,9 +520,9 @@ impl WorkingCopy {
         for change in &writes {
             let leaf = change.new.expect("writes have a new leaf");
             // Sealed and directory leaves are rejected in preflight.
-            let bytes = repo.store().get_blob(&leaf.id())?;
+            let bytes = tig_core::conflict::materialize(repo.store().as_ref(), leaf)?;
             ensure_ancestors_safe(&self.root, &change.path, &BTreeSet::new())?;
-            ensure_clean(&self.root, &self.state.cache, change, &BTreeSet::new())?;
+            ensure_clean(repo.store().as_ref(), &self.root, &self.state.cache, change, &BTreeSet::new())?;
             let dest = disk_path(&self.root, &change.path);
             if symlink_metadata_kind(&dest)? == Some(Shape::Dir) {
                 // Preflight allowed only an empty directory. remove_dir
@@ -543,6 +552,9 @@ impl WorkingCopy {
         self.state.working = current;
         self.state.tree = new_tree;
         self.state.cache = cache;
+        self.state.has_conflicts = self.state.has_conflicts
+            || writes.iter().any(|change| change.new.is_some_and(|leaf| leaf.kind() == EntryKind::Conflict));
+        if self.state.has_conflicts { self.state.has_conflicts = self.state.cache.iter().any(|(_, row)| row.kind == EntryKind::Conflict); }
         let now = self.now();
         mark_racy(&mut self.state.cache, now);
         self.save_state(true)?;
@@ -593,6 +605,7 @@ impl WorkingCopy {
                 working: created.working_revision(),
                 tree: empty_tree_id(),
                 cache: PathIndex::new(),
+                has_conflicts: false,
             },
             trusted: true,
             load_warning: None,
@@ -636,6 +649,9 @@ impl WorkingCopy {
         {
             self.load_warning = None;
             return Ok(());
+        }
+        if !self.trusted || self.state.has_conflicts {
+            self.state.has_conflicts = cache.iter().any(|(_, row)| row.kind == EntryKind::Conflict);
         }
         self.state.working = working;
         self.state.tree = tree;
@@ -686,6 +702,7 @@ impl WorkingCopy {
                 && prev.ctime == ctime_parts(meta)
                 && shape_agrees(prev, shape)
             {
+                if prev.kind == EntryKind::Conflict { return Outcome::Unchanged(repo_path); }
                 let (kind, stand_in) = desired_kind(meta, shape, Some(prev), None);
                 if kind == prev.kind && stand_in == prev.symlink_stand_in {
                     return Outcome::Unchanged(repo_path);
@@ -697,6 +714,9 @@ impl WorkingCopy {
             }
         }
         let (kind, stand_in) = desired_kind(meta, shape, prev, baseline.get(&repo_path).copied());
+        let conflict = prev.filter(|row| row.kind == EntryKind::Conflict)
+            .map(|row| row.id)
+            .or_else(|| baseline.get(&repo_path).filter(|leaf| leaf.kind() == EntryKind::Conflict).map(|leaf| leaf.id()));
         let item = ToHash {
             disk: found.disk,
             shape,
@@ -704,12 +724,13 @@ impl WorkingCopy {
                 size,
                 mtime,
                 ctime: ctime_parts(meta),
-                kind,
-                id: ObjectId([0; 32]), // filled in after hashing
+                kind: if conflict.is_some() && shape == Shape::File { EntryKind::Conflict } else { kind },
+                id: conflict.unwrap_or(ObjectId([0; 32])), // replaced after hashing
                 racy: !mtime_known,
                 symlink_stand_in: stand_in,
             },
             prev: prev.cloned(),
+            resolved_kind: kind,
             repo_path,
         };
         // Read and store right here, on the walk thread. Reading is the slow
@@ -747,7 +768,7 @@ impl WorkingCopy {
             let tree = repo.revision(&ws.working_revision())?.tree;
             walk(repo.store().as_ref(), &tree, &RepoPath::root())?
                 .into_iter()
-                .filter(|(_, leaf)| leaf.is_file_like())
+                .filter(|(_, leaf)| leaf.is_file_like() || leaf.kind() == EntryKind::Conflict)
                 .collect()
         };
         // Every path the walk accounted for, and how many of them have a row
@@ -797,7 +818,8 @@ impl WorkingCopy {
                     seen.push(path);
                 }
                 Outcome::Hashed(item, id) => {
-                    let id = id?;
+                    let leaf = id?;
+                    let id = leaf.id();
                     stats.scanned += 1;
                     stats.hashed += 1;
                     let ToHash {
@@ -807,6 +829,7 @@ impl WorkingCopy {
                         ..
                     } = item;
                     row.id = id;
+                    row.kind = leaf.kind();
                     let unchanged = self.trusted
                         && prev
                             .as_ref()
@@ -868,6 +891,13 @@ impl WorkingCopy {
                     ws.remove(repo, &path)?;
                     cache.remove(&path);
                 }
+                Some(Shape::Dir) if !include_tracked
+                    && self.state.cache.get(&path).is_some_and(|row| row.kind == EntryKind::Conflict) => {
+                    // Replacing a marker file with a directory resolves the
+                    // conflict through child writes; its old cache row must go.
+                    if !seen.iter().any(|seen| seen.starts_with(&path)) { ws.remove(repo, &path)?; }
+                    cache.remove(&path);
+                }
                 Some(_) => {
                     if include_tracked {
                         ensure_ancestors_safe(&self.root, &path, &BTreeSet::new())?;
@@ -889,7 +919,14 @@ impl WorkingCopy {
                         let prev = self.state.cache.get(&path);
                         let (kind, stand_in) =
                             desired_kind(&meta, shape, prev, baseline.get(&path).copied());
-                        let id = repo.store().put_blob(&read_shape(&disk, shape)?)?;
+                        let previous = prev.filter(|row| row.kind == EntryKind::Conflict)
+                            .map(|row| leaf_of(row.kind, row.id)).transpose()?
+                            .or_else(|| baseline.get(&path).copied().filter(|leaf| leaf.kind() == EntryKind::Conflict));
+                        let bytes = read_shape(&disk, shape)?;
+                        let leaf = if let Some(previous) = previous.filter(|_| shape == Shape::File) {
+                            tig_core::conflict::snapshot_file(repo.store().as_ref(), previous, &bytes, kind)?
+                        } else { leaf_of(kind, repo.store().put_blob(&bytes)?)? };
+                        let (kind, id) = (leaf.kind(), leaf.id());
                         stats.scanned += 1;
                         stats.hashed += 1;
                         ws.set(repo, path.clone(), Some(leaf_of(kind, id)?))?;
@@ -944,7 +981,7 @@ fn load_state_file(path: &Path) -> Result<(WcState, bool, Option<String>)> {
 
 fn encode_state(state: &WcState) -> Vec<u8> {
     let mut body = Writer::new();
-    body.u8(STATE_VERSION);
+    body.u8(if state.has_conflicts { 3 } else { STATE_VERSION });
     body.id(&state.working);
     body.id(&state.tree);
     body.varint(state.cache.len() as u64);
@@ -991,7 +1028,7 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         return Err("bad magic; delete the state file and let tig re-scan".into());
     }
     let version = bytes[4];
-    if version != STATE_VERSION {
+    if !matches!(version, 2 | 3) {
         return Err(format!(
             "unsupported version {version}; delete the state file and let tig re-scan"
         ));
@@ -1009,6 +1046,7 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
     // Each row carries a 32-byte id, so a huge count cannot allocate forever.
     let n = r.count(32).map_err(|e| e.to_string())?;
     let mut rows = Vec::with_capacity(n);
+    let mut has_conflicts = false;
     for _ in 0..n {
         // Stored paths are already normalized; validate strictly, without
         // the OS-separator rewrite.
@@ -1035,6 +1073,8 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
             other => return Err(format!("invalid ctime marker {other}")),
         };
         let kind = kind_from_byte(r.u8().map_err(|e| e.to_string())?)?;
+        has_conflicts |= kind == EntryKind::Conflict;
+        if kind == EntryKind::Conflict && version != 3 { return Err("conflict row requires state version 3".into()); }
         let id = r.id().map_err(|e| e.to_string())?;
         let flags = r.u8().map_err(|e| e.to_string())?;
         if flags & !(FLAG_RACY | FLAG_STAND_IN) != 0 {
@@ -1057,11 +1097,13 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         ));
     }
     r.finish().map_err(|e| e.to_string())?;
+    if (version == 3) != has_conflicts { return Err("non-canonical conflict state version".into()); }
     let cache = PathIndex::from_sorted(rows).map_err(|e| e.to_string())?;
     Ok(WcState {
         working,
         tree,
         cache,
+        has_conflicts,
     })
 }
 
@@ -1070,6 +1112,7 @@ fn kind_byte(kind: EntryKind) -> u8 {
         EntryKind::File => 1,
         EntryKind::Executable => 2,
         EntryKind::Symlink => 3,
+        EntryKind::Conflict => 6,
         // The cache only stores file-like rows. A tree or seal here is a bug.
         EntryKind::Tree | EntryKind::Sealed => 0,
     }
@@ -1080,6 +1123,7 @@ fn kind_from_byte(b: u8) -> std::result::Result<EntryKind, String> {
         1 => Ok(EntryKind::File),
         2 => Ok(EntryKind::Executable),
         3 => Ok(EntryKind::Symlink),
+        6 => Ok(EntryKind::Conflict),
         _ => Err(format!("unknown file kind {b}")),
     }
 }
@@ -1089,6 +1133,7 @@ fn leaf_of(kind: EntryKind, id: ObjectId) -> Result<Leaf> {
         EntryKind::File => Ok(Leaf::file(id)),
         EntryKind::Executable => Ok(Leaf::executable(id)),
         EntryKind::Symlink => Ok(Leaf::symlink(id)),
+        EntryKind::Conflict => Ok(Leaf::new(kind, id)?),
         EntryKind::Tree | EntryKind::Sealed => Err(Error::Msg(format!(
             "internal error: cache row has kind {kind:?}"
         ))),
@@ -1129,7 +1174,7 @@ fn mark_racy(cache: &mut PathIndex<FileState>, now: SystemTime) {
 /// "nothing": sealed -> sealed changes vanish, file -> sealed is a delete,
 /// sealed -> file is a write.
 fn on_disk(diff: Vec<DiffEntry>) -> Vec<DiffEntry> {
-    let visible = |leaf: Option<Leaf>| leaf.filter(|l| l.is_file_like());
+    let visible = |leaf: Option<Leaf>| leaf.filter(|l| l.is_file_like() || l.kind() == EntryKind::Conflict);
     diff.into_iter()
         .map(|d| DiffEntry {
             path: d.path,
@@ -1211,7 +1256,7 @@ fn ensure_file_leaf(leaf: Option<&Leaf>, path: &RepoPath) -> Result<()> {
     if let Some(leaf) = leaf {
         if !matches!(
             leaf.kind(),
-            EntryKind::File | EntryKind::Executable | EntryKind::Symlink
+            EntryKind::File | EntryKind::Executable | EntryKind::Symlink | EntryKind::Conflict
         ) {
             return Err(Error::Msg(format!(
                 "refusing to check out {path}: {:?} entries are not files",
@@ -1397,6 +1442,7 @@ fn ensure_ancestors_safe(root: &Path, rel: &RepoPath, deleted: &BTreeSet<&RepoPa
 /// contents are safe to destroy. Content that already equals the blob we
 /// would write is allowed, so a checkout that stopped halfway can be retried.
 fn ensure_clean(
+    store: &dyn tig_core::Store,
     root: &Path,
     cache: &PathIndex<FileState>,
     change: &DiffEntry,
@@ -1405,6 +1451,13 @@ fn ensure_clean(
     let disk = disk_path(root, &change.path);
     let meta = match fs::symlink_metadata(&disk) {
         Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotADirectory
+            && change.old.is_none()
+            && deleted.iter().any(|path| change.path != **path && change.path.starts_with(path)) => {
+            // Unix reports ENOTDIR for a new child below the marker file
+            // being replaced by a directory. Its deletion is checked first.
+            return Ok(());
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if change.old.is_some() && change.new.is_some() {
                 return Err(dirty(
@@ -1436,6 +1489,11 @@ fn ensure_clean(
         ));
     }
     let bytes = read_shape(&disk, shape)?;
+    if shape == Shape::File {
+        for leaf in [change.old, change.new].into_iter().flatten().filter(|leaf| leaf.kind() == EntryKind::Conflict) {
+            if bytes == tig_core::conflict::materialize(store, leaf)? { return Ok(()); }
+        }
+    }
     let id = hash_object(ObjectKind::Blob, &bytes);
     if let Some(leaf) = change.old {
         let (kind, _) = desired_kind(&meta, shape, cache.get(&change.path), None);
@@ -1529,7 +1587,7 @@ fn shape_agrees(row: &FileState, shape: Shape) -> bool {
             if row.symlink_stand_in {
                 row.kind == EntryKind::Symlink
             } else {
-                matches!(row.kind, EntryKind::File | EntryKind::Executable)
+                matches!(row.kind, EntryKind::File | EntryKind::Executable | EntryKind::Conflict)
             }
         }
         Shape::Dir | Shape::Other => false,
@@ -1621,7 +1679,7 @@ enum Outcome {
     /// Same content, different kind (executable bit, symlink stand-in).
     Retyped(RepoPath, FileState),
     /// The stat cache could not vouch for it, so it was read and stored.
-    Hashed(ToHash, Result<ObjectId>),
+    Hashed(ToHash, Result<Leaf>),
 }
 
 /// A file the stat cache could not vouch for; it must be read and hashed.
@@ -1632,13 +1690,18 @@ struct ToHash {
     /// Everything but `id` is known from the walk.
     row: FileState,
     prev: Option<FileState>,
+    resolved_kind: EntryKind,
 }
 
 /// Reads one file the stat cache could not vouch for and stores its blob.
-fn read_and_store(store: &dyn tig_core::Store, item: &ToHash) -> Result<ObjectId> {
+fn read_and_store(store: &dyn tig_core::Store, item: &ToHash) -> Result<Leaf> {
     use tig_core::store::StoreExt;
     let bytes = read_shape(&item.disk, item.shape)?;
-    Ok(store.put_blob(&bytes)?)
+    if item.row.kind == EntryKind::Conflict {
+        let previous = Leaf::new(EntryKind::Conflict, item.row.id)?;
+        return Ok(tig_core::conflict::snapshot_file(store, previous, &bytes, item.resolved_kind)?);
+    }
+    leaf_of(item.row.kind, store.put_blob(&bytes)?)
 }
 
 fn read_shape(path: &Path, shape: Shape) -> io::Result<Vec<u8>> {
@@ -1683,7 +1746,7 @@ fn write_leaf(root: &Path, rel: &RepoPath, leaf: Leaf, bytes: &[u8]) -> Result<b
     ensure_ancestors_real(root, rel)?;
     match leaf.kind() {
         EntryKind::Symlink => write_symlink(&dest, bytes),
-        EntryKind::File | EntryKind::Executable => {
+        EntryKind::File | EntryKind::Executable | EntryKind::Conflict => {
             atomic_write(&dest, bytes, false)?;
             #[cfg(unix)]
             set_unix_mode(&dest, leaf.kind() == EntryKind::Executable)?;
@@ -2341,6 +2404,7 @@ mod tests {
             working: ObjectId([1; 32]),
             tree: ObjectId([2; 32]),
             cache,
+            has_conflicts: false,
         };
         let decoded = decode_state(&encode_state(&state)).unwrap();
         assert_eq!(decoded.working, state.working);
@@ -2371,6 +2435,7 @@ mod tests {
             working: ObjectId([1; 32]),
             tree: ObjectId([2; 32]),
             cache: PathIndex::new(),
+            has_conflicts: false,
         };
         let bytes = encode_state(&state);
         assert_eq!(&bytes[..5], b"TIGW\x02");
@@ -2414,6 +2479,7 @@ mod tests {
             working: ObjectId([1; 32]),
             tree: ObjectId([2; 32]),
             cache,
+            has_conflicts: false,
         };
         let mut bytes = encode_state(&state);
         // A single flipped racy bit is still a valid encoding.
@@ -2455,6 +2521,7 @@ mod tests {
                 working: ObjectId([1; 32]),
                 tree: ObjectId([2; 32]),
                 cache,
+                has_conflicts: false,
             };
             assert!(decode_state(&encode_state(&state)).is_err());
         }

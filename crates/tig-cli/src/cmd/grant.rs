@@ -14,8 +14,14 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String, token: String)
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
     let mut bundle = super::remote::load_owner(&cfg, &identity)?;
-    bundle.keyring.grant(&bundle.keys, &identity, &member)?;
-    super::remote::commit_keyring(&cfg, &mut bundle)?;
+    tig_private::access::grant(
+        bundle.remote.as_ref(),
+        &cfg.dir,
+        &identity,
+        &bundle.keys,
+        &mut bundle.state,
+        &member,
+    )?;
     println!("granted {} on {remote_name}", member.fingerprint());
     super::announce_if_moved(&mut session, before)
 }

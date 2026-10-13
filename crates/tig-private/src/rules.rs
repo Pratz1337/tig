@@ -5,6 +5,8 @@
 //! exactly: `*`, `?` and `[...]` never match `/`, and `{}` is literal), and
 //! all rules are compiled once into a single [`regex::RegexSet`]. Classifying
 //! a path is one query against that set; the last matching rule wins.
+//! Embedded `**` before `/` has differed between Git versions. Positive
+//! rules use the broader reading; negations use the narrower reading.
 //!
 //! Matching is Unicode case-insensitive (the regex crate's simple case
 //! folding, so `.ÉNV` matches `.énv`) on NFC-normalized text.
@@ -20,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use regex::{RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexSet, RegexSetBuilder};
 use tig_core::RepoPath;
 use unicode_normalization::UnicodeNormalization;
 
@@ -137,6 +139,7 @@ struct CompiledRule {
 pub struct Rules {
     set: RegexSet,
     rules: Vec<CompiledRule>,
+    compatibility: Vec<(usize, Regex, Regex)>,
     /// Custom roles named anywhere in the file. Never includes `private`.
     roles: BTreeSet<String>,
 }
@@ -147,6 +150,7 @@ impl Rules {
         Rules {
             set: RegexSet::empty(),
             rules: Vec::new(),
+            compatibility: Vec::new(),
             roles: BTreeSet::new(),
         }
     }
@@ -173,8 +177,16 @@ impl Rules {
         let mut rules = Vec::new();
         let mut regexes = Vec::new();
         let mut roles = BTreeSet::new();
+        let mut compatibility = Vec::new();
         for &(text, source) in parts {
-            push_rules(text, source, &mut rules, &mut regexes, &mut roles)?;
+            push_rules(
+                text,
+                source,
+                &mut rules,
+                &mut regexes,
+                &mut roles,
+                &mut compatibility,
+            )?;
         }
         let set = RegexSetBuilder::new(&regexes)
             .case_insensitive(true)
@@ -183,7 +195,12 @@ impl Rules {
                 let line = rules.last().map(|rule| rule.reference.line).unwrap_or(1);
                 rule_error(line, format!("rules too large to compile: {e}"))
             })?;
-        Ok(Rules { set, rules, roles })
+        Ok(Rules {
+            set,
+            rules,
+            roles,
+            compatibility,
+        })
     }
 
     /// Classify `path`. The repo root is always public.
@@ -226,6 +243,19 @@ impl Rules {
         matches!(self.classify(path), Verdict::Private { .. })
     }
 
+    /// Warn only when a path hits a known Git-version interpretation difference.
+    /// The message identifies the public rule, never the matched private path.
+    pub(crate) fn compatibility_warnings(&self, path: &RepoPath) -> Vec<String> {
+        if self.compatibility.is_empty() {
+            return Vec::new();
+        }
+        let normalized: String = path.as_str().nfc().collect();
+        self.compatibility.iter()
+            .filter(|(_, narrow, broad)| narrow.is_match(&normalized) != broad.is_match(&normalized))
+            .map(|(index, _, _)| format!("{}: Git versions disagree on embedded ** before '/'; tig uses the more private reading. Use a whole-component ** to make the intent explicit.", self.rules[*index].reference.explanation()))
+            .collect()
+    }
+
     /// Every custom role named in the file, in sorted order. Excludes `private`.
     pub fn roles(&self) -> BTreeSet<String> {
         self.roles.clone()
@@ -247,6 +277,7 @@ fn push_rules(
     rules: &mut Vec<CompiledRule>,
     regexes: &mut Vec<String>,
     roles: &mut BTreeSet<String>,
+    compatibility: &mut Vec<(usize, Regex, Regex)>,
 ) -> Result<(), RuleError> {
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
@@ -296,12 +327,24 @@ fn push_rules(
         }
 
         let pattern: String = pattern.nfc().collect();
-        let regex = rule_regex(&pattern).map_err(|message| rule_error(line_no, message))?;
+        let narrow = rule_regex(&pattern, false).map_err(|message| rule_error(line_no, message))?;
+        let broad = rule_regex(&pattern, true).map_err(|message| rule_error(line_no, message))?;
+        let regex = if negated { &narrow } else { &broad };
         // Compile alone first so a bad pattern reports its own line.
-        regex::RegexBuilder::new(&regex)
+        regex::RegexBuilder::new(regex)
             .build()
             .map_err(|e| rule_error(line_no, format!("invalid pattern: {e}")))?;
-        regexes.push(regex);
+        if narrow != broad {
+            let compile = |pattern: &str| {
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| rule_error(line_no, format!("invalid pattern: {e}")))
+            };
+            compatibility.push((rules.len(), compile(&narrow)?, compile(&broad)?));
+        }
+        // Positive rules protect the union; negations allow only the intersection.
+        regexes.push(regex.clone());
         rules.push(CompiledRule {
             reference: RuleRef {
                 line: line_no,
@@ -393,9 +436,10 @@ fn parse_role(token: &str) -> Result<String, String> {
 ///   file paths instead of pruning a directory walk.
 /// - Two or more stars as a whole component span zero or more directories (leading,
 ///   middle) or everything inside (trailing). Elsewhere it is plain `*`.
+///   The conservative reading also spans directories for embedded stars before `/`.
 /// - `*`, `?` and `[...]` never match `/`. `{`, `}` and every other
 ///   character are literal. `\x` escapes `x`.
-fn rule_regex(pattern: &str) -> Result<String, String> {
+fn rule_regex(pattern: &str, conservative: bool) -> Result<String, String> {
     let directory = pattern.ends_with('/') && !pattern.ends_with("\\/");
     let body = if directory {
         &pattern[..pattern.len() - 1]
@@ -430,13 +474,17 @@ fn rule_regex(pattern: &str) -> Result<String, String> {
         if i != last {
             if let Some((prefix, stars)) = comp.rsplit_once("\\/") {
                 if stars.len() >= 2 && stars.bytes().all(|c| c == b'*') {
-                    re.push_str(&component_regex(prefix)?);
+                    re.push_str(&component_regex(prefix, conservative, true)?);
                     re.push_str("/(?:[^/]+/)*");
                     continue;
                 }
             }
         }
-        re.push_str(&component_regex(comp)?);
+        re.push_str(&component_regex(
+            comp,
+            conservative,
+            i != last || directory,
+        )?);
         if i != last {
             re.push('/');
         }
@@ -467,7 +515,11 @@ fn split_components(body: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn component_regex(comp: &str) -> Result<String, String> {
+fn component_regex(
+    comp: &str,
+    conservative: bool,
+    followed_by_separator: bool,
+) -> Result<String, String> {
     let chars: Vec<char> = comp.chars().collect();
     let mut re = String::new();
     let mut i = 0;
@@ -489,8 +541,14 @@ fn component_regex(comp: &str) -> Result<String, String> {
                 let boundary_before = start == 0 || chars[start - 1] == '/';
                 let boundary_after = i == chars.len()
                     || (chars.get(i) == Some(&'\\') && chars.get(i + 1) == Some(&'/'));
+                let before_separator = (i == chars.len() && followed_by_separator)
+                    || (chars.get(i) == Some(&'\\') && chars.get(i + 1) == Some(&'/'));
                 re.push_str(if i - start >= 2 && boundary_before && boundary_after {
                     ".*"
+                } else if i - start >= 2 && conservative && before_separator {
+                    // Git exposure scans also classify non-portable names;
+                    // broadening must preserve ordinary-star newline matches.
+                    "(?s:.*)"
                 } else {
                     "[^/]*"
                 });
@@ -581,6 +639,14 @@ fn class_char(c: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conservative_stars_preserve_matches_in_git_exposure_text() {
+        let rules = Rules::parse("a**/b").unwrap();
+        for path in ["a\n/b", "ax/\n/b"] {
+            assert!(matches!(rules.classify_text(path), Verdict::Private { .. }));
+        }
+    }
 
     fn parse_ok(text: &str) -> Rules {
         Rules::parse(text).unwrap_or_else(|e| panic!("parse failed: {e}"))

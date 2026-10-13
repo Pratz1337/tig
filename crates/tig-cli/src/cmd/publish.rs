@@ -12,13 +12,14 @@ use tig_core::treeops::walk;
 use tig_core::{EntryKind, ObjectId, RepoPath};
 use tig_private::keyring::Keyring;
 use tig_private::publish::{self, PublishOptions};
-use tig_private::remote::DirRemote;
+use tig_private::remote::Remote;
 
 use super::identity;
 use super::workspace;
 use super::{CliError, Result};
 use crate::ui::RevLabel;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     repository: Option<&Path>,
     remote_name: String,
@@ -27,19 +28,20 @@ pub(super) fn run(
     acknowledge_leaked: bool,
     confirm_negations: bool,
     declassify: Vec<String>,
+    force: bool,
 ) -> Result<()> {
     let (mut session, before) = super::open_ready(repository)?;
     let identity = identity::load_or_create()?;
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
-    super::remote::finish_keyring_update(&cfg)?;
+    super::remote::finish_keyring_update(&cfg, &identity)?;
     let rev = publish_rev(&session, revision)?;
-    let dir_remote = super::remote::open_or_create(&cfg.path)?;
-    let missing_keyring = !cfg.path.join("keyring").try_exists()?;
+    let remote = super::remote::connect(&cfg, Some(&identity), true)?;
+    let missing_keyring = remote.read_head()?.keyring.is_none();
     // Keys hit disk before publish can write a keyring. A refusal still
     // leaves the remote keyring absent; the saved keys are what a retry uses.
     if missing_keyring && super::remote::load_owner_keys(&cfg.dir)?.is_none() {
-        let (_preview, keys) = Keyring::create(dir_remote.remote_id(), &identity)?;
+        let (_preview, keys) = Keyring::create(remote.remote_id(), &identity)?;
         super::remote::save_owner_keys_new(&cfg.dir, &keys)?;
     }
     let owner_keys = super::remote::load_owner_keys(&cfg.dir)?;
@@ -47,6 +49,7 @@ pub(super) fn run(
         return Err(CliError::msg("could not save owner keys before publishing"));
     }
     let mut state = super::remote::load_publish_state(&cfg.dir)?;
+    let fetched = super::remote::load_fetch_state(&cfg.dir)?;
     if let Some(imported) = super::import_git::load_state(&tig)? {
         state.ever_public.extend(imported.exposed);
     }
@@ -57,17 +60,20 @@ pub(super) fn run(
             .iter()
             .map(|p| super::parse_path(p))
             .collect::<Result<_>>()?,
+        force,
     };
     let report = publish::publish(
         session.repo.store().as_ref(),
-        &dir_remote,
+        remote.as_ref(),
         &identity,
         owner_keys.as_ref(),
         &mut state,
+        &fetched,
         &bookmark,
         rev,
         &options,
-    )?;
+    )
+    .map_err(|err| super::remote::explain(&cfg, err))?;
     super::remote::save_publish_state(&cfg.dir, &state)?;
     let mut tx = session
         .repo
@@ -75,7 +81,7 @@ pub(super) fn run(
     tx.set_bookmark(&bookmark, rev)?;
     session.commit(tx)?;
 
-    let sealed = sealed_paths(&dir_remote, &bookmark)?;
+    let sealed = sealed_paths(remote.as_ref(), &bookmark)?;
     let noun = if report.revisions_published == 1 {
         "revision"
     } else {
@@ -126,9 +132,14 @@ fn publish_rev(session: &super::Session, revision: Option<String>) -> Result<Obj
     }
 }
 
-fn sealed_paths(remote: &DirRemote, bookmark: &str) -> Result<Vec<String>> {
-    let refs = remote.read_refs()?;
-    let id = refs.get(bookmark).copied().ok_or_else(|| {
+fn sealed_paths(remote: &dyn Remote, bookmark: &str) -> Result<Vec<String>> {
+    let bytes = remote.read_head()?.manifest.ok_or_else(|| {
+        CliError::msg(format!(
+            "remote bookmark {bookmark} is missing after publish"
+        ))
+    })?;
+    let manifest = tig_private::manifest::Manifest::decode(&bytes)?;
+    let id = manifest.refs.get(bookmark).copied().ok_or_else(|| {
         CliError::msg(format!(
             "remote bookmark {bookmark} is missing after publish"
         ))

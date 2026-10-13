@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tig-core.workspace = true
 tig-private.workspace = true
+tig-remote-http = { path = "../tig-remote-http" }
 clap.workspace = true
 ignore.workspace = true
 similar.workspace = true

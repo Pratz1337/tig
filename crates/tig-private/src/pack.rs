@@ -118,6 +118,7 @@ impl<'a> PackBuilder<'a> {
         id: ObjectId,
         body: &[u8],
     ) -> Result<(), PackError> {
+        if kind == ObjectKind::Conflict { return Err(PackError::Invalid("local conflicts cannot occur in sealed packs".into())); }
         if body.len() > MAX_BYTES {
             return Err(PackError::Invalid("object is too large".into()));
         }
@@ -363,6 +364,7 @@ fn decode_index(bytes: &[u8]) -> Result<(Vec<IndexObject>, Vec<SealedRecord>), P
             return Err(PackError::Invalid("duplicate wire id in the index".into()));
         }
         let kind = ObjectKind::from_u8(r.u8()?)?;
+        if kind == ObjectKind::Conflict { return Err(PackError::Invalid("local conflicts cannot occur in sealed packs".into())); }
         let id = r.id()?;
         objects.push((WireId(wire), kind, id));
     }
@@ -393,6 +395,9 @@ fn decode_index(bytes: &[u8]) -> Result<(Vec<IndexObject>, Vec<SealedRecord>), P
 }
 
 fn entry_kind(byte: u8) -> Result<EntryKind, PackError> {
+    if byte == EntryKind::Conflict as u8 {
+        return Err(PackError::Invalid("local conflicts cannot occur in sealed packs".into()));
+    }
     EntryKind::from_u8(byte).map_err(|_| PackError::Invalid(format!("unknown entry kind {byte}")))
 }
 
@@ -515,6 +520,8 @@ mod tests {
         assert_eq!(EntryKind::Symlink as u8, 3);
         assert_eq!(EntryKind::Tree as u8, 4);
         assert_eq!(EntryKind::Sealed as u8, 5);
+        assert_eq!(EntryKind::Conflict as u8, 6);
+        assert!(entry_kind(6).is_err(), "local conflicts must not extend the pack wire format");
     }
 
     #[test]

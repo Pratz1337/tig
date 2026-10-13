@@ -4,6 +4,7 @@
 //! Read DESIGN.md at the repo root before changing anything here.
 
 pub mod domain;
+pub mod conflict;
 pub mod encode;
 pub mod error;
 pub mod id;
