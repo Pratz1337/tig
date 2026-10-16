@@ -46,6 +46,8 @@ pub const PACK_INDEX_AAD: &[u8] = b"tig pack index v1";
 pub const KEYRING_HEAD_SIGNATURE: &str = "tig keyring head signature v1";
 /// Prefix of the canonical encoding signed in a publish manifest.
 pub const PUBLISH_MANIFEST_SIGNATURE: &str = "tig publish manifest signature v1";
+/// Owner signature on a private-change reveal certificate.
+pub const PRIVATE_CHANGE_REVEAL_SIGNATURE: &str = "tig private change reveal signature v1";
 
 /// Prefix for the filesystem workspace state's BLAKE3 integrity checksum.
 pub const WORKSPACE_STATE: &[u8] = b"tig workspace state v2";

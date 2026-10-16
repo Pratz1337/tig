@@ -340,7 +340,7 @@ mod tests {
         bad_magic[0] = b'X';
         fs::write(&path, bad_magic).unwrap();
         assert!(matches!(store.kind(&id), Err(Error::Corrupt { id: bad, .. }) if bad == id));
-        for invalid_kind in [0, 7, 255] {
+        for invalid_kind in [0, 8, 255] {
             let mut bad_kind = header;
             bad_kind[4] = invalid_kind;
             fs::write(&path, bad_kind).unwrap();

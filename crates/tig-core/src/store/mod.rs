@@ -43,11 +43,7 @@ pub trait StoreExt: Store {
     }
 
     fn put_blob(&self, data: &[u8]) -> Result<ObjectId> {
-        let id = hash_object(ObjectKind::Blob, data);
-        if !self.has(&id)? {
-            self.put_raw(&id, ObjectKind::Blob, data)?;
-        }
-        Ok(id)
+        crate::blob::put_bytes(self, data)
     }
 
     fn get(&self, id: &ObjectId) -> Result<Object> {
@@ -66,8 +62,11 @@ pub trait StoreExt: Store {
         Ok(body)
     }
 
+    /// File bytes. A chunked blob is concatenated when it is at most
+    /// [`crate::blob::MAX_MATERIALIZE`]. Larger files must be streamed with
+    /// [`crate::blob::write_content`].
     fn get_blob(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        self.get_kind(id, ObjectKind::Blob)
+        crate::blob::materialize(self, id)
     }
 
     fn get_conflict(&self, id: &ObjectId) -> Result<crate::conflict::Conflict> {

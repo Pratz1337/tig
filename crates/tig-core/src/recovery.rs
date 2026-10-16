@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::blob::{self, ChunkRef};
 use crate::object::{hash_object, EntryKind, ObjectKind, Operation, Revision, Tree, View};
 use crate::ophead::OpHeadStore;
 use crate::store::Store;
@@ -99,14 +100,18 @@ fn verify_view(store: &dyn Store, view: &View) -> Result<()> {
         .chain(view.bookmarks.values())
         .map(|id| (*id, ObjectKind::Revision))
         .collect();
-    let mut seen: HashMap<ObjectId, ObjectKind> = HashMap::new();
+    let mut seen: HashMap<ObjectId, (ObjectKind, usize)> = HashMap::new();
+    let mut chunk_len: HashMap<ObjectId, u32> = HashMap::new();
     while let Some((id, expected)) = pending.pop() {
-        if let Some(kind) = seen.get(&id) {
+        if let Some((kind, len)) = seen.get(&id) {
             if *kind != expected {
                 return Err(Error::WrongKind {
                     expected: expected.name(),
                     found: kind.name(),
                 });
+            }
+            if expected == ObjectKind::Blob && chunk_len.get(&id).is_some_and(|want| *want as usize != *len) {
+                return Err(Error::Corrupt { id, reason: "previously verified blob has the wrong chunk length".into() });
             }
             continue;
         }
@@ -116,7 +121,7 @@ fn verify_view(store: &dyn Store, view: &View) -> Result<()> {
             ));
         }
         let body = checked_raw(store, id, expected)?;
-        seen.insert(id, expected);
+        seen.insert(id, (expected, body.len()));
         match expected {
             ObjectKind::Revision => {
                 let rev = Revision::decode(&body)?;
@@ -128,7 +133,7 @@ fn verify_view(store: &dyn Store, view: &View) -> Result<()> {
                     let kind = match entry.kind() {
                         EntryKind::Tree => ObjectKind::Tree,
                         EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
-                            ObjectKind::Blob
+                            file_kind(store, &entry.id())?
                         }
                         EntryKind::Sealed => continue,
                         EntryKind::Conflict => ObjectKind::Conflict,
@@ -136,21 +141,60 @@ fn verify_view(store: &dyn Store, view: &View) -> Result<()> {
                     pending.push((entry.id(), kind));
                 }
             }
-            ObjectKind::Blob => {}
+            ObjectKind::Blob => {
+                if let Some(len) = chunk_len.get(&id) {
+                    if body.len() != *len as usize {
+                        return Err(Error::Corrupt {
+                            id,
+                            reason: format!("chunk is {} bytes; the manifest says {len}", body.len()),
+                        });
+                    }
+                }
+            }
+            ObjectKind::ChunkedBlob => {
+                let manifest = blob::parse_manifest(&body)?;
+                for chunk in manifest.chunks() {
+                    remember_chunk(&mut chunk_len, chunk)?;
+                    pending.push((chunk.id, ObjectKind::Blob));
+                }
+            }
             ObjectKind::Conflict => {
                 let conflict = crate::conflict::Conflict::decode(&body)?;
-                if let Some(draft) = conflict.draft() { pending.push((draft, ObjectKind::Blob)); }
+                if let Some(draft) = conflict.draft() { pending.push((draft, file_kind(store, &draft)?)); }
                 for leaf in conflict.adds().iter().chain(conflict.removes()).flatten() {
                     let kind = match leaf.kind() {
                         EntryKind::Tree => ObjectKind::Tree,
                         EntryKind::Conflict => ObjectKind::Conflict,
                         EntryKind::Sealed => continue,
-                        _ => ObjectKind::Blob,
+                        _ => file_kind(store, &leaf.id())?,
                     };
                     pending.push((leaf.id(), kind));
                 }
             }
             ObjectKind::Operation | ObjectKind::View => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn file_kind(store: &dyn Store, id: &ObjectId) -> Result<ObjectKind> {
+    match store.kind(id)? {
+        Some(kind @ (ObjectKind::Blob | ObjectKind::ChunkedBlob)) => Ok(kind),
+        Some(kind) => Err(Error::WrongKind {
+            expected: "blob",
+            found: kind.name(),
+        }),
+        None => Err(Error::NotFound(*id)),
+    }
+}
+
+fn remember_chunk(lens: &mut HashMap<ObjectId, u32>, chunk: &ChunkRef) -> Result<()> {
+    if let Some(previous) = lens.insert(chunk.id, chunk.len) {
+        if previous != chunk.len {
+            return Err(Error::Corrupt {
+                id: chunk.id,
+                reason: "chunk length disagrees across manifests".into(),
+            });
         }
     }
     Ok(())

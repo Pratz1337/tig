@@ -3,6 +3,7 @@
 //!
 //! Read DESIGN.md at the repo root before changing anything here.
 
+pub mod blob;
 pub mod domain;
 pub mod conflict;
 pub mod encode;
@@ -20,6 +21,7 @@ pub mod store;
 pub mod treeops;
 pub mod workspace;
 
+pub use blob::{ChunkManifest, ChunkRef, CHUNK_LEN};
 pub use error::{Error, Result};
 pub use id::{ChangeId, ObjectId};
 pub use object::{
