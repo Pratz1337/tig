@@ -113,6 +113,7 @@ struct WcState {
     tree: ObjectId,
     cache: PathIndex<FileState>,
     has_conflicts: bool,
+    watcher_enabled: bool,
 }
 
 impl WcState {
@@ -122,6 +123,7 @@ impl WcState {
             tree: empty_tree_id(),
             cache: PathIndex::new(),
             has_conflicts: false,
+            watcher_enabled: false,
         }
     }
 }
@@ -193,6 +195,7 @@ impl WorkingCopy {
                 tree,
                 cache: PathIndex::new(),
                 has_conflicts: false,
+                watcher_enabled: false,
             },
             trusted: true,
             load_warning: None,
@@ -255,7 +258,9 @@ impl WorkingCopy {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        let watcher_enabled = self.state.watcher_enabled;
         self.state = WcState::blank();
+        self.state.watcher_enabled = watcher_enabled;
         self.trusted = false;
         Ok(())
     }
@@ -299,6 +304,54 @@ impl WorkingCopy {
 
     /// `rehash` bypasses stat cache hits without invalidating checkout state.
     pub fn snapshot_with_rehash(&mut self, repo: &mut Repo, rehash: bool) -> Result<SnapshotStats> {
+        let hints = if self.state.watcher_enabled {
+            Some(crate::watcher::load_dirty(&self.workspace_meta_dir()).map_err(|e| Error::Msg(e.to_string()))?)
+        } else { None };
+        let rehash = rehash || hints.as_ref().is_some_and(|h| !h.is_empty());
+        let stats = self.snapshot_inner(repo, rehash, None)?;
+        if let Some(hints) = hints {
+            crate::watcher::consume_dirty_through(&self.workspace_meta_dir(), hints.epoch)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+        }
+        Ok(stats)
+    }
+
+    pub fn workspace_meta_dir(&self) -> PathBuf {
+        self.tig_dir.join("workspaces").join(&self.name)
+    }
+
+    pub fn enable_watcher(&mut self) -> Result<()> {
+        self.state.watcher_enabled = true;
+        self.save_state(true)
+    }
+
+    /// A different command moved the revision before this process adopted
+    /// the corresponding checkout state.
+    pub fn baseline_is_stale(&self, repo: &Repo) -> Result<bool> {
+        Ok(self.trusted && self.state.working != repo.working_revision(&self.name)?)
+    }
+
+    /// Native event paths are hints. Structural events and unusable state
+    /// fall back to the authoritative full walk.
+    pub fn snapshot_paths(&mut self, repo: &mut Repo, paths: &[PathBuf], full: bool, rehash: bool) -> Result<SnapshotStats> {
+        let mut selected = BTreeSet::new();
+        for path in paths {
+            if self.root.join(path).is_dir() {
+                return self.snapshot_inner(repo, true, None);
+            }
+            let Some(text) = path.to_str() else {
+                return self.snapshot_inner(repo, true, None);
+            };
+            let normalized = if cfg!(windows) { text.replace('\\', "/") } else { text.to_string() };
+            let Ok(path) = RepoPath::new(&normalized) else {
+                return self.snapshot_inner(repo, true, None);
+            };
+            selected.insert(path);
+        }
+        self.snapshot_inner(repo, rehash, if full { None } else { Some(&selected) })
+    }
+
+    fn snapshot_inner(&mut self, repo: &mut Repo, rehash: bool, selected: Option<&BTreeSet<RepoPath>>) -> Result<SnapshotStats> {
         let _snap = crate::trace::span("snapshot");
         let pre = crate::trace::span("  snapshot: checks + reload");
         ensure_canonical_directory(&self.root)?;
@@ -361,12 +414,13 @@ impl WorkingCopy {
 
         let mut ws = Workspace::open(repo, &self.name)?;
         let scan = crate::trace::span("  snapshot: walk + stat + hash");
-        let (mut stats, cache) = self.scan(
+        let (mut stats, cache) = self.scan_selected(
             repo,
             &mut ws,
             &mut warnings,
             rehash,
             rehash || !self.trusted,
+            selected.filter(|_| self.trusted),
         )?;
         drop(scan);
         stats.changed = ws.pending().len();
@@ -497,6 +551,11 @@ impl WorkingCopy {
             .collect();
         for change in &diff {
             ensure_clean(repo.store().as_ref(), &self.root, &self.state.cache, change, &deleted)?;
+            if let Some(leaf) = change.new.filter(|leaf| leaf.is_file_like()) {
+                // Validate the complete chunk closure before deleting or
+                // replacing any disk path. A missing tail is a failed checkout.
+                tig_core::blob::content_objects(repo.store().as_ref(), &leaf.id())?;
+            }
         }
 
         let mut stats = CheckoutStats {
@@ -520,7 +579,6 @@ impl WorkingCopy {
         for change in &writes {
             let leaf = change.new.expect("writes have a new leaf");
             // Sealed and directory leaves are rejected in preflight.
-            let bytes = tig_core::conflict::materialize(repo.store().as_ref(), leaf)?;
             ensure_ancestors_safe(&self.root, &change.path, &BTreeSet::new())?;
             ensure_clean(repo.store().as_ref(), &self.root, &self.state.cache, change, &BTreeSet::new())?;
             let dest = disk_path(&self.root, &change.path);
@@ -529,7 +587,14 @@ impl WorkingCopy {
                 // refuses if an untracked file appeared since that check.
                 fs::remove_dir(&dest)?;
             }
-            let stand_in = write_leaf(&self.root, &change.path, leaf, &bytes)?;
+            let stand_in = if matches!(leaf.kind(), EntryKind::File | EntryKind::Executable) {
+                write_file_stream(repo.store().as_ref(), &self.root, &change.path, leaf)?;
+                false
+            } else {
+                // Conflict markers and symlink targets are bounded text.
+                let bytes = tig_core::conflict::materialize(repo.store().as_ref(), leaf)?;
+                write_leaf(&self.root, &change.path, leaf, &bytes)?
+            };
             let disk = disk_path(&self.root, &change.path);
             let meta = fs::symlink_metadata(&disk)?;
             let mtime = observed_mtime(&meta, self.now());
@@ -606,6 +671,7 @@ impl WorkingCopy {
                 tree: empty_tree_id(),
                 cache: PathIndex::new(),
                 has_conflicts: false,
+                watcher_enabled: false,
             },
             trusted: true,
             load_warning: None,
@@ -748,6 +814,19 @@ impl WorkingCopy {
         rehash: bool,
         include_tracked: bool,
     ) -> Result<(SnapshotStats, PathIndex<FileState>)> {
+        self.scan_selected(repo, ws, warnings, rehash, include_tracked, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_selected(
+        &self,
+        repo: &Repo,
+        ws: &mut Workspace,
+        warnings: &mut Vec<String>,
+        rehash: bool,
+        include_tracked: bool,
+        selected: Option<&BTreeSet<RepoPath>>,
+    ) -> Result<(SnapshotStats, PathIndex<FileState>)> {
         let mut stats = SnapshotStats {
             scanned: 0,
             hashed: 0,
@@ -776,14 +855,20 @@ impl WorkingCopy {
         // nothing tracked went missing and the deletion pass is skipped.
         let mut seen: Vec<RepoPath> = Vec::new();
         let mut cached_seen = 0usize;
+        if let Some(selected) = selected {
+            seen.extend(self.state.cache.iter().filter(|(path, _)| !selected.contains(*path)).map(|(path, _)| path.clone()));
+            cached_seen = seen.len();
+        }
 
         // One parallel walk; each file is classified, and read if needed,
         // on the worker thread that found it.
         let store = repo.store().as_ref();
         let walk_span = crate::trace::span("    scan: walk + classify + hash");
-        let (outcomes, walk_warnings) = crate::walk::walk(&self.root, is_scratch_name, |found| {
-            self.classify(store, found, rehash, &baseline)
-        })
+        let visit = |found: crate::walk::Found<'_>| self.classify(store, found, rehash, &baseline);
+        let (outcomes, walk_warnings) = match selected {
+            Some(paths) => crate::walk::walk_paths(&self.root, is_scratch_name, paths, visit),
+            None => crate::walk::walk(&self.root, is_scratch_name, visit),
+        }
         .map_err(|e| Error::Msg(format!("walking {}: {e}", self.root.display())))?;
         drop(walk_span);
         warnings.extend(walk_warnings);
@@ -922,10 +1007,16 @@ impl WorkingCopy {
                         let previous = prev.filter(|row| row.kind == EntryKind::Conflict)
                             .map(|row| leaf_of(row.kind, row.id)).transpose()?
                             .or_else(|| baseline.get(&path).copied().filter(|leaf| leaf.kind() == EntryKind::Conflict));
-                        let bytes = read_shape(&disk, shape)?;
                         let leaf = if let Some(previous) = previous.filter(|_| shape == Shape::File) {
+                            let bytes = read_shape(&disk, shape)?;
                             tig_core::conflict::snapshot_file(repo.store().as_ref(), previous, &bytes, kind)?
-                        } else { leaf_of(kind, repo.store().put_blob(&bytes)?)? };
+                        } else if shape == Shape::File {
+                            let mut file = OpenOptions::new().read(true).open(&disk)?;
+                            leaf_of(kind, tig_core::blob::put_reader(repo.store().as_ref(), &mut file)?)?
+                        } else {
+                            let bytes = read_shape(&disk, shape)?;
+                            leaf_of(kind, repo.store().put_blob(&bytes)?)?
+                        };
                         let (kind, id) = (leaf.kind(), leaf.id());
                         stats.scanned += 1;
                         stats.hashed += 1;
@@ -981,7 +1072,8 @@ fn load_state_file(path: &Path) -> Result<(WcState, bool, Option<String>)> {
 
 fn encode_state(state: &WcState) -> Vec<u8> {
     let mut body = Writer::new();
-    body.u8(if state.has_conflicts { 3 } else { STATE_VERSION });
+    body.u8(if state.watcher_enabled { 4 } else if state.has_conflicts { 3 } else { STATE_VERSION });
+    if state.watcher_enabled { body.u8(1); }
     body.id(&state.working);
     body.id(&state.tree);
     body.varint(state.cache.len() as u64);
@@ -1028,7 +1120,7 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         return Err("bad magic; delete the state file and let tig re-scan".into());
     }
     let version = bytes[4];
-    if !matches!(version, 2 | 3) {
+    if !matches!(version, 2..=4) {
         return Err(format!(
             "unsupported version {version}; delete the state file and let tig re-scan"
         ));
@@ -1041,6 +1133,10 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         return Err("checksum mismatch".into());
     }
     let mut r = Reader::new(&payload[5..], "workspace state");
+    let watcher_enabled = if version == 4 {
+        if r.u8().map_err(|e| e.to_string())? != 1 { return Err("unknown watcher state flags".into()); }
+        true
+    } else { false };
     let working = r.id().map_err(|e| e.to_string())?;
     let tree = r.id().map_err(|e| e.to_string())?;
     // Each row carries a 32-byte id, so a huge count cannot allocate forever.
@@ -1074,7 +1170,7 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         };
         let kind = kind_from_byte(r.u8().map_err(|e| e.to_string())?)?;
         has_conflicts |= kind == EntryKind::Conflict;
-        if kind == EntryKind::Conflict && version != 3 { return Err("conflict row requires state version 3".into()); }
+        if kind == EntryKind::Conflict && version < 3 { return Err("conflict row requires state version 3".into()); }
         let id = r.id().map_err(|e| e.to_string())?;
         let flags = r.u8().map_err(|e| e.to_string())?;
         if flags & !(FLAG_RACY | FLAG_STAND_IN) != 0 {
@@ -1097,13 +1193,14 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         ));
     }
     r.finish().map_err(|e| e.to_string())?;
-    if (version == 3) != has_conflicts { return Err("non-canonical conflict state version".into()); }
+    if version != 4 && (version == 3) != has_conflicts { return Err("non-canonical conflict state version".into()); }
     let cache = PathIndex::from_sorted(rows).map_err(|e| e.to_string())?;
     Ok(WcState {
         working,
         tree,
         cache,
         has_conflicts,
+        watcher_enabled,
     })
 }
 
@@ -1488,21 +1585,20 @@ fn ensure_clean(
             "changed on disk since the last snapshot",
         ));
     }
-    let bytes = read_shape(&disk, shape)?;
     if shape == Shape::File {
         for leaf in [change.old, change.new].into_iter().flatten().filter(|leaf| leaf.kind() == EntryKind::Conflict) {
-            if bytes == tig_core::conflict::materialize(store, leaf)? { return Ok(()); }
+            let marker = tig_core::conflict::materialize(store, leaf)?;
+            if file_matches_slice(&disk, &marker)? { return Ok(()); }
         }
     }
-    let id = hash_object(ObjectKind::Blob, &bytes);
     if let Some(leaf) = change.old {
         let (kind, _) = desired_kind(&meta, shape, cache.get(&change.path), None);
-        if leaf.id() == id && leaf.kind() == kind && leaf_matches_shape(leaf, shape) {
+        if leaf.kind() == kind && leaf_matches_shape(leaf, shape) && content_matches(store, &disk, shape, leaf)? {
             return Ok(());
         }
     }
     if let Some(leaf) = change.new {
-        if leaf.id() == id && leaf_matches_shape(leaf, shape) {
+        if leaf_matches_shape(leaf, shape) && content_matches(store, &disk, shape, leaf)? {
             return Ok(());
         }
     }
@@ -1696,12 +1792,86 @@ struct ToHash {
 /// Reads one file the stat cache could not vouch for and stores its blob.
 fn read_and_store(store: &dyn tig_core::Store, item: &ToHash) -> Result<Leaf> {
     use tig_core::store::StoreExt;
-    let bytes = read_shape(&item.disk, item.shape)?;
     if item.row.kind == EntryKind::Conflict {
+        let bytes = read_shape(&item.disk, item.shape)?;
         let previous = Leaf::new(EntryKind::Conflict, item.row.id)?;
         return Ok(tig_core::conflict::snapshot_file(store, previous, &bytes, item.resolved_kind)?);
     }
-    leaf_of(item.row.kind, store.put_blob(&bytes)?)
+    if item.shape != Shape::File {
+        let bytes = read_shape(&item.disk, item.shape)?;
+        return leaf_of(item.row.kind, store.put_blob(&bytes)?);
+    }
+    let mut file = OpenOptions::new().read(true).open(&item.disk)?;
+    // Preserve legacy kind-1 ids when a rehash reads identical file bytes.
+    if let Some(prev) = item.prev.as_ref().filter(|prev| prev.size > tig_core::blob::CHUNK_LEN as u64) {
+        if store.kind(&prev.id)? == Some(ObjectKind::Blob) {
+            if tig_core::blob::matches_reader(store, &prev.id, &mut file)? {
+                return leaf_of(item.row.kind, prev.id);
+            }
+            use std::io::Seek;
+            file.rewind()?;
+        }
+    }
+    leaf_of(item.row.kind, tig_core::blob::put_reader(store, &mut file)?)
+}
+
+fn content_matches(
+    store: &dyn tig_core::Store,
+    disk: &Path,
+    shape: Shape,
+    leaf: Leaf,
+) -> Result<bool> {
+    match shape {
+        Shape::Symlink => {
+            let bytes = read_symlink_bytes(disk)?;
+            Ok(tig_core::blob::matches_reader(store, &leaf.id(), io::Cursor::new(bytes))?)
+        }
+        Shape::File => {
+            let mut file = OpenOptions::new().read(true).open(disk)?;
+            Ok(tig_core::blob::matches_reader(store, &leaf.id(), &mut file)?)
+        }
+        Shape::Dir | Shape::Other => Ok(false),
+    }
+}
+
+fn file_matches_slice(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut buf = [0u8; 8192];
+    let mut offset = 0usize;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(offset == bytes.len());
+        }
+        let end = offset.saturating_add(n);
+        if end > bytes.len() || buf[..n] != bytes[offset..end] {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+fn write_file_stream(
+    store: &dyn tig_core::Store,
+    root: &Path,
+    rel: &RepoPath,
+    leaf: Leaf,
+) -> Result<()> {
+    prepare_parent(root, rel)?;
+    ensure_ancestors_real(root, rel)?;
+    let dest = disk_path(root, rel);
+    let parent = dest.parent().ok_or_else(|| {
+        Error::Msg(format!("{} has no parent directory", dest.display()))
+    })?;
+    let (tmp, mut file) = create_temp(parent)?;
+    let guard = RemoveOnDrop(tmp.clone());
+    tig_core::blob::write_content(store, &leaf.id(), &mut file)?;
+    drop(file);
+    rename_replacing(&tmp, &dest)?;
+    drop(guard);
+    #[cfg(unix)]
+    set_unix_mode(&dest, leaf.kind() == EntryKind::Executable)?;
+    Ok(())
 }
 
 fn read_shape(path: &Path, shape: Shape) -> io::Result<Vec<u8>> {
@@ -2405,6 +2575,7 @@ mod tests {
             tree: ObjectId([2; 32]),
             cache,
             has_conflicts: false,
+            watcher_enabled: false,
         };
         let decoded = decode_state(&encode_state(&state)).unwrap();
         assert_eq!(decoded.working, state.working);
@@ -2436,6 +2607,7 @@ mod tests {
             tree: ObjectId([2; 32]),
             cache: PathIndex::new(),
             has_conflicts: false,
+            watcher_enabled: false,
         };
         let bytes = encode_state(&state);
         assert_eq!(&bytes[..5], b"TIGW\x02");
@@ -2480,6 +2652,7 @@ mod tests {
             tree: ObjectId([2; 32]),
             cache,
             has_conflicts: false,
+            watcher_enabled: false,
         };
         let mut bytes = encode_state(&state);
         // A single flipped racy bit is still a valid encoding.
@@ -2522,6 +2695,7 @@ mod tests {
                 tree: ObjectId([2; 32]),
                 cache,
                 has_conflicts: false,
+                watcher_enabled: false,
             };
             assert!(decode_state(&encode_state(&state)).is_err());
         }

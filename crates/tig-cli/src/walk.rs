@@ -17,7 +17,7 @@
 //! - Hidden files are included (`.env` is part of the working copy).
 //! - Symlinks are reported as files and never followed.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, FileType, Metadata};
 use std::io;
@@ -110,6 +110,83 @@ where
         Some(e) => Err(e),
         None => Ok((results, warnings)),
     }
+}
+
+/// Looks at event-selected files using the same exclusions as a full walk.
+/// Directory changes and ignore-rule changes require a full walk instead.
+pub fn walk_paths<T, F>(
+    root: &Path,
+    is_scratch: fn(&OsStr) -> bool,
+    paths: &BTreeSet<RepoPath>,
+    visit: F,
+) -> io::Result<(Vec<T>, Vec<String>)>
+where
+    F: Fn(Found<'_>) -> T,
+{
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    for path in paths {
+        let components: Vec<_> = path.components().collect();
+        if components.is_empty() || components.iter().any(|name| {
+            let name = OsStr::new(name);
+            name == OsStr::new(".tig") || is_scratch(name) || is_vcs_metadata(name)
+        }) {
+            continue;
+        }
+        let mut dir = root.to_path_buf();
+        let mut ignores = Vec::new();
+        for (depth, name) in components.iter().enumerate() {
+            if depth > 0 {
+                let meta = match fs::symlink_metadata(&dir) {
+                    Ok(meta) => meta,
+                    Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => break,
+                    Err(error) => return Err(error),
+                };
+                if !meta.is_dir() || meta.file_type().is_symlink() {
+                    break;
+                }
+                match fs::symlink_metadata(dir.join(".tig")) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut builder = GitignoreBuilder::new(&dir);
+            for file in [".gitignore", ".tigignore"] {
+                let ignore_path = dir.join(file);
+                if ignore_path.is_file() {
+                    if let Some(error) = builder.add(&ignore_path) {
+                        warnings.push(format!("ignore rules near {}: {error}", ignore_path.display()));
+                    }
+                }
+            }
+            match builder.build() {
+                Ok(matcher) => ignores.push(Arc::new(matcher)),
+                Err(error) => warnings.push(format!("ignore rules near {}: {error}", dir.display())),
+            }
+            let disk = dir.join(name);
+            let is_parent = depth + 1 < components.len();
+            if ignored(&ignores, &disk, is_parent) {
+                break;
+            }
+            if is_parent {
+                dir = disk;
+                continue;
+            }
+            let meta = match fs::symlink_metadata(&disk) {
+                Ok(meta) => meta,
+                Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => break,
+                Err(error) => return Err(error),
+            };
+            let file_type = meta.file_type();
+            if file_type.is_file() || file_type.is_symlink() {
+                out.push(visit(Found { path: Ok(path.clone()), disk, file_type, meta: &meta }));
+            } else if !file_type.is_dir() {
+                warnings.push(format!("skipping special file {}", disk.display()));
+            }
+        }
+    }
+    Ok((out, warnings))
 }
 
 /// Blocks until a directory is available, or returns `None` when the queue

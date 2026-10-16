@@ -33,6 +33,7 @@ mod snapshot;
 mod status;
 mod undo;
 mod why;
+mod watch;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -312,6 +313,7 @@ pub fn run() -> Result<()> {
             verbose,
         } => export_git::run(repository, &path, bookmark, declassify, force, verbose)?,
         Cmd::Status => status::run(repository)?,
+        Cmd::Watch => watch::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
         Cmd::Log { limit } => log::run(repository, limit)?,
@@ -389,6 +391,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Snapshot filesystem changes from native events
+    Watch,
     /// Manage ranked roles and their access groups
     Role(role::Args),
     /// Run a command with secrets authorized for a role

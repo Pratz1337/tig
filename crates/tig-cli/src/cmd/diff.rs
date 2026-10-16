@@ -96,6 +96,11 @@ fn stat_row(repo: &Repo, entry: &DiffEntry) -> Result<Option<StatRow>> {
             plus: 0,
             minus: 0,
         })),
+        Some(Sides::Large { .. }) => Ok(Some(StatRow {
+            text: format!("{} | large", entry.path),
+            plus: 0,
+            minus: 0,
+        })),
         Some(Sides::Text { old, new }) => {
             let (plus, minus) = line_delta(&old, &new);
             Ok(Some(StatRow {
@@ -120,6 +125,10 @@ fn render_unified(repo: &Repo, entry: &DiffEntry) -> Result<Option<String>> {
     };
     match sides {
         Sides::Binary => Ok(Some(format!("Binary file {} differs\n", entry.path))),
+        Sides::Large { old_len, new_len } => Ok(Some(format!(
+            "Large file {} ({old_len} -> {new_len} bytes)\n",
+            entry.path
+        ))),
         Sides::Text { old, new } => {
             let (old_header, new_header) = headers(entry);
             if old.is_empty() && new.is_empty() {
@@ -149,19 +158,28 @@ fn headers(entry: &DiffEntry) -> (String, String) {
 
 enum Sides {
     Binary,
+    Large { old_len: u64, new_len: u64 },
     Text { old: String, new: String },
 }
+
+/// Unified text above this size is replaced with an explicit length summary.
+const TEXT_DIFF_MAX: u64 = 1024 * 1024;
 
 /// `None` when both sides exist and the bytes are identical.
 fn load_sides(repo: &Repo, entry: &DiffEntry) -> Result<Option<Sides>> {
     if !file_like(entry.old) || !file_like(entry.new) {
         return Ok(Some(Sides::Binary));
     }
-    let old = read_leaf(repo, entry.old)?;
-    let new = read_leaf(repo, entry.new)?;
-    if old == new {
+    let old_len = side_len(repo, entry.old)?;
+    let new_len = side_len(repo, entry.new)?;
+    if same_bytes(repo, entry.old, entry.new, old_len, new_len)? {
         return Ok(None);
     }
+    if old_len > TEXT_DIFF_MAX || new_len > TEXT_DIFF_MAX || chunked_side(repo, entry)? {
+        return Ok(Some(Sides::Large { old_len, new_len }));
+    }
+    let old = read_leaf(repo, entry.old)?;
+    let new = read_leaf(repo, entry.new)?;
     let old_bytes = old.as_deref().unwrap_or(b"");
     let new_bytes = new.as_deref().unwrap_or(b"");
     if is_binary(old_bytes) || is_binary(new_bytes) {
@@ -180,6 +198,46 @@ fn file_like(leaf: Option<Leaf>) -> bool {
     match leaf {
         None => true,
         Some(leaf) => leaf.is_file_like(),
+    }
+}
+
+fn side_len(repo: &Repo, leaf: Option<Leaf>) -> Result<u64> {
+    match leaf {
+        None => Ok(0),
+        Some(leaf) => Ok(tig_core::blob::content_len(repo.store().as_ref(), &leaf.id())?),
+    }
+}
+
+fn chunked_side(repo: &Repo, entry: &DiffEntry) -> Result<bool> {
+    for leaf in [entry.old, entry.new].into_iter().flatten() {
+        if repo.store().kind(&leaf.id())? == Some(tig_core::ObjectKind::ChunkedBlob) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn same_bytes(
+    repo: &Repo,
+    old: Option<Leaf>,
+    new: Option<Leaf>,
+    old_len: u64,
+    new_len: u64,
+) -> Result<bool> {
+    if old_len != new_len {
+        return Ok(false);
+    }
+    match (old, new) {
+        (None, None) => Ok(true),
+        (None, Some(_)) | (Some(_), None) => Ok(false),
+        (Some(old), Some(new)) => {
+            if old.id() == new.id() {
+                return Ok(true);
+            }
+            let store = repo.store();
+            Ok(tig_core::blob::content_hash(store.as_ref(), &old.id())?
+                == tig_core::blob::content_hash(store.as_ref(), &new.id())?)
+        }
     }
 }
 

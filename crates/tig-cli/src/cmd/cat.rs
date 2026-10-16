@@ -15,9 +15,13 @@ pub(super) fn run(repository: Option<&Path>, path: &str, revision: Option<&str>)
     let leaf = lookup(session.repo.store().as_ref(), &rev.tree, &path)?;
     match leaf {
         Some(leaf) if leaf.is_file_like() || leaf.kind() == tig_core::EntryKind::Conflict => {
-            let bytes = tig_core::conflict::materialize(session.repo.store().as_ref(), leaf)?;
             let mut stdout = io::stdout().lock();
-            stdout.write_all(&bytes)?;
+            if leaf.kind() == tig_core::EntryKind::Conflict {
+                let bytes = tig_core::conflict::materialize(session.repo.store().as_ref(), leaf)?;
+                stdout.write_all(&bytes)?;
+            } else {
+                tig_core::blob::write_content(session.repo.store().as_ref(), &leaf.id(), &mut stdout)?;
+            }
             stdout.flush()?;
             Ok(())
         }

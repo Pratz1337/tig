@@ -20,6 +20,7 @@ getrandom.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 zeroize.workspace = true
+notify = "=8.2.0"
 
 [dev-dependencies]
 tempfile.workspace = true
