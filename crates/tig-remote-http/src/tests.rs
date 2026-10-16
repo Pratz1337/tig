@@ -85,8 +85,32 @@ fn packs_round_trip() {
     let pack = PackBuilder::new(&key).finish().unwrap();
     remote.put_pack(&pack).unwrap();
     remote.put_pack(&pack).unwrap();
+    let pack_id = *blake3::hash(&pack).as_bytes();
+    assert_eq!(remote.list_pack_ids("private", 1).unwrap(), vec![pack_id]);
+    assert_eq!(remote.get_pack("private", 1, &pack_id).unwrap(), Some(pack.clone()));
+    assert!(remote.get_pack("private", 1, &[99; 32]).unwrap().is_none());
     assert_eq!(remote.list_packs("private", 1).unwrap(), vec![pack]);
     assert!(remote.list_packs("private", 2).unwrap().is_empty());
+}
+
+#[test]
+fn pack_id_listing_does_not_read_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = tig_private::remote::DirRemote::create(dir.path(), [92; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let pack_dir = dir.path().join("packs/private/1");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    let id = [7; 32];
+    let file = std::fs::File::create(pack_dir.join(format!("{}.pack", hex::encode(id)))).unwrap();
+    file.set_len(crate::limits::MAX_PACK_FILE as u64 + 1).unwrap();
+    drop(file);
+    // Listing is bounded by id count, independently of ciphertext size.
+    assert_eq!(remote.list_pack_ids("private", 1).unwrap(), vec![id]);
+    assert!(remote.get_pack("private", 1, &id).is_err());
+    let server = serve_dir(dir.path(), owner.public(), "127.0.0.1:0".parse().unwrap(), None).unwrap();
+    let client = HttpRemote::connect(&format!("http://{}", server.local_addr()), None).unwrap();
+    assert_eq!(client.list_pack_ids("private", 1).unwrap(), vec![id]);
+    assert!(client.get_pack("private", 1, &id).is_err());
 }
 
 #[test]
@@ -1044,11 +1068,8 @@ fn client_checks_pack_hash_context_and_listing_order() {
         .is_err());
     worker.join().unwrap();
     let duplicate = crate::wire::encode_ids(&[id, id]).unwrap();
-    // A duplicate may be detected after the first pack is downloaded.
-    let (url, worker) = malicious_peer(vec![
-        peer_response(200, &duplicate, ""),
-        peer_response(200, &pack, ""),
-    ]);
+    // Validate the complete listing before downloading any pack.
+    let (url, worker) = malicious_peer(vec![peer_response(200, &duplicate, "")]);
     assert!(HttpRemote::connect(&url, None)
         .unwrap()
         .list_packs("private", 1)
@@ -1339,4 +1360,65 @@ fn startup_refuses_keyring_not_signed_by_pinned_owner() {
         .commit_head(&empty.version(), Some(&ring.encode().unwrap()), None)
         .unwrap();
     assert!(serve(remote, owner.public(), "127.0.0.1:0".parse().unwrap(), None).is_err());
+}
+
+#[test]
+fn role_manager_heads_do_not_grant_upload_rights_and_successor_accepts_transfer() {
+    use std::collections::BTreeSet;
+    use tig_private::roles::{self, Role, TransitionBody};
+    let owner = Identity::generate().unwrap();
+    let manager = Identity::generate().unwrap();
+    let successor = Identity::generate().unwrap();
+    let id = [210; 16];
+    let (_server, url) = start(id, &owner);
+    let root = HttpRemote::connect(&url, Some(copy_identity(&owner))).unwrap();
+    let admin = HttpRemote::connect(&url, Some(copy_identity(&manager))).unwrap();
+    let next_owner = HttpRemote::connect(&url, Some(copy_identity(&successor))).unwrap();
+    let (mut ring, keys) = Keyring::create(id, &owner).unwrap();
+    let head = root.read_head().unwrap();
+    root.commit_head(&head.version(), Some(&ring.encode().unwrap()), None).unwrap();
+    let body = TransitionBody::SetRole { name: "manager".into(), role: Role {
+        rank: 10, permissions: roles::MANAGE_ROLES, groups: BTreeSet::new(),
+    }}.sign(id, &owner.public().signing, 2, &owner);
+    ring.commit_policy(&owner, vec![body], vec![]).unwrap();
+    root.commit_head(&root.read_head().unwrap().version(), Some(&ring.encode().unwrap()), None).unwrap();
+    let assign = TransitionBody::Assign { member: manager.public(), role: "manager".into() }
+        .sign(id, &owner.public().signing, 3, &owner);
+    ring.commit_policy(&owner, vec![assign], vec![]).unwrap();
+    root.commit_head(&root.read_head().unwrap().version(), Some(&ring.encode().unwrap()), None).unwrap();
+    let define = TransitionBody::SetRole { name: "reader".into(), role: Role {
+        rank: 1, permissions: 0, groups: BTreeSet::from(["billing".into()]),
+    }}.sign(id, &owner.public().signing, 4, &manager);
+    ring.commit_policy(&manager, vec![define], vec![]).unwrap();
+    admin.commit_head(&admin.read_head().unwrap().version(), Some(&ring.encode().unwrap()), None).unwrap();
+    assert!(matches!(admin.put_batch(&[blob(b"manager cannot upload")]), Err(tig_private::remote::RemoteError::Denied(_))));
+    let pack = PackBuilder::new(&keys.keys[&("private".into(), 1)]).finish().unwrap();
+    assert!(matches!(admin.put_pack(&pack), Err(tig_private::remote::RemoteError::Denied(_))));
+    let before = admin.read_head().unwrap();
+    let mut forged = ring.clone();
+    let define = TransitionBody::SetRole { name: "other".into(), role: Role {
+        rank: 1, permissions: 0, groups: BTreeSet::new(),
+    }}.sign(id, &owner.public().signing, 5, &manager);
+    forged.commit_policy(&manager, vec![define], vec![]).unwrap();
+    let extra = tig_private::keys::grant(&keys.keys[&("private".into(), 1)], &manager.public(), &owner).unwrap();
+    forged.policy.baseline.insert(extra.signature);
+    forged.grants.push(extra);
+    let mut message = forged.head.signing_bytes();
+    message.extend(forged.policy.digest(id, &owner.public().signing));
+    forged.head.signature = manager.sign(&message);
+    forged.verify(&owner.public().signing, 0).unwrap();
+    assert!(admin.commit_head(&before.version(), Some(&forged.encode().unwrap()), None).is_err());
+    assert_eq!(admin.read_head().unwrap().version(), before.version());
+    let transfer = TransitionBody::Transfer { owner: successor.public() }
+        .sign(id, &owner.public().signing, 5, &owner);
+    ring.commit_policy(&successor, vec![transfer], vec![]).unwrap();
+    next_owner.commit_head(&before.version(), Some(&ring.encode().unwrap()), None).unwrap();
+    next_owner.put_batch(&[blob(b"new owner can publish")]).unwrap();
+    assert!(matches!(root.put_batch(&[blob(b"former owner cannot publish")]), Err(tig_private::remote::RemoteError::Denied(_))));
+    let mut signature_message = ring.head.signing_bytes();
+    signature_message.extend(ring.policy.digest(id, &owner.public().signing));
+    ring.head.signature = owner.sign(&signature_message);
+    let after = next_owner.read_head().unwrap();
+    assert!(root.commit_head(&after.version(), Some(&ring.encode().unwrap()), None).is_err());
+    assert_eq!(next_owner.read_head().unwrap().version(), after.version());
 }

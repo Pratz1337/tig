@@ -471,6 +471,20 @@ impl Remote for HttpRemote {
     /// Same aggregate cap as `DirRemote`: one epoch's packs total at most
     /// `MAX_PACK_FILE` bytes.
     fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError> {
+        let ids = self.list_pack_ids(group, epoch)?;
+        let mut out = Vec::with_capacity(ids.len());
+        let mut remaining = MAX_PACK_FILE;
+        for id in ids {
+            let bytes = self.read_pack(group, epoch, &id, remaining)?
+                .ok_or_else(|| RemoteError::Invalid("listed pack is missing".into()))?;
+            remaining = remaining.checked_sub(bytes.len())
+                .ok_or_else(|| RemoteError::Invalid("pack listing is too large".into()))?;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
         check_group(group).map_err(RemoteError::Invalid)?;
         let path = format!("/v1/packs/{group}/{epoch}");
         let response = expect_ok(
@@ -478,37 +492,14 @@ impl Remote for HttpRemote {
             "/v1/packs",
         )?;
         let ids = decode_ids(&response.body, MAX_LISTED_PACKS).map_err(RemoteError::Invalid)?;
-        let mut out = Vec::with_capacity(ids.len());
-        let mut previous: Option<ObjectId> = None;
-        let mut remaining = MAX_PACK_FILE;
-        for id in ids {
-            if previous.is_some_and(|prev| prev >= id) {
-                return Err(RemoteError::Invalid("pack list is not ordered".into()));
-            }
-            previous = Some(id);
-            let one = format!("/v1/packs/{group}/{epoch}/{}", hex::encode(id.0));
-            let file = expect_ok(
-                call(&self.inner, "GET", &one, &[], false, None, remaining)?,
-                "/v1/packs",
-            )?;
-            if *blake3::hash(&file.body).as_bytes() != id.0 {
-                return Err(RemoteError::Invalid(
-                    "pack bytes do not match the pack id".into(),
-                ));
-            }
-            let header = Pack::peek_header(&file.body)?;
-            if header.remote != self.inner.remote_id
-                || header.group != group
-                || header.epoch != epoch
-            {
-                return Err(RemoteError::Invalid(
-                    "pack context does not match the request".into(),
-                ));
-            }
-            remaining -= file.body.len();
-            out.push(file.body);
+        if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(RemoteError::Invalid("pack list is not ordered".into()));
         }
-        Ok(out)
+        Ok(ids.into_iter().map(|id| id.0).collect())
+    }
+
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        self.read_pack(group, epoch, id, tig_private::pack::PACK_BATCH_MAX)
     }
 
     fn read_head(&self) -> Result<RemoteHead, RemoteError> {
@@ -597,6 +588,34 @@ impl Remote for HttpRemote {
         }
         Ok(CommitOutcome::Committed(version))
     }
+}
+
+impl HttpRemote {
+    fn read_pack(&self, group: &str, epoch: u64, id: &[u8; 32], limit: usize) -> Result<Option<Vec<u8>>, RemoteError> {
+        check_group(group).map_err(RemoteError::Invalid)?;
+        let path = format!("/v1/packs/{group}/{epoch}/{}", hex::encode(id));
+        let file = call(&self.inner, "GET", &path, &[], false, None, limit)?;
+        if file.status == 404 {
+            return Ok(None);
+        }
+        let file = expect_ok(file, "/v1/packs")?;
+            if blake3::hash(&file.body).as_bytes() != id {
+                return Err(RemoteError::Invalid(
+                    "pack bytes do not match the pack id".into(),
+                ));
+            }
+            let header = Pack::peek_header(&file.body)?;
+            if header.remote != self.inner.remote_id
+                || header.group != group
+                || header.epoch != epoch
+            {
+                return Err(RemoteError::Invalid(
+                    "pack context does not match the request".into(),
+                ));
+            }
+        Ok(Some(file.body))
+    }
+
 }
 
 impl Store for HttpStore {
