@@ -24,6 +24,8 @@ const PACK_VERSION: u8 = 1;
 const INDEX_VERSION: u8 = 1;
 /// One object's ciphertext, or the index ciphertext.
 const MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Each encrypted pack from [`PackBatch`] stays under the 128 MiB HTTP pack cap.
+pub const PACK_BATCH_MAX: usize = 16 * 1024 * 1024;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_GROUP: usize = 1024;
 const MAX_PATH: usize = 64 * 1024;
@@ -93,6 +95,8 @@ pub struct PackBuilder<'a> {
     key: &'a EpochKey,
     objects: BTreeMap<WireId, StoredObject>,
     sealed: Vec<SealedRecord>,
+    object_bytes: usize,
+    sealed_bytes: usize,
 }
 
 struct StoredObject {
@@ -107,6 +111,8 @@ impl<'a> PackBuilder<'a> {
             key,
             objects: BTreeMap::new(),
             sealed: Vec::new(),
+            object_bytes: 0,
+            sealed_bytes: 0,
         }
     }
 
@@ -133,6 +139,7 @@ impl<'a> PackBuilder<'a> {
         if self.objects.len() >= MAX_OBJECTS {
             return Err(PackError::Invalid("too many objects".into()));
         }
+        self.object_bytes += 32 + varint_len(ciphertext.len() as u64) + ciphertext.len();
         self.objects.insert(
             wire,
             StoredObject {
@@ -159,6 +166,7 @@ impl<'a> PackBuilder<'a> {
         if self.sealed.len() >= MAX_OBJECTS {
             return Err(PackError::Invalid("too many sealed records".into()));
         }
+        self.sealed_bytes += 65 + varint_len(path.as_str().len() as u64) + path.as_str().len();
         self.sealed.push(SealedRecord {
             sealed_id,
             path,
@@ -169,6 +177,32 @@ impl<'a> PackBuilder<'a> {
     }
 
     pub fn finish(self) -> Result<Vec<u8>, PackError> {
+        self.encode()
+    }
+
+    fn encoded_len(&self) -> usize {
+        let ctx = self.key.context();
+        // AEAD adds a 16-byte tag to the canonical index.
+        let index_len = 1 + varint_len(self.objects.len() as u64) + 65 * self.objects.len()
+            + varint_len(self.sealed.len() as u64) + self.sealed_bytes + 16;
+        4 + 1 + 16 + varint_len(ctx.group.len() as u64) + ctx.group.len()
+            + varint_len(ctx.epoch) + 24 + varint_len(index_len as u64) + index_len
+            + varint_len(self.objects.len() as u64) + self.object_bytes
+    }
+
+    fn remove_object(&mut self, wire: &WireId) {
+        if let Some(object) = self.objects.remove(wire) {
+            self.object_bytes -= 32 + varint_len(object.ciphertext.len() as u64) + object.ciphertext.len();
+        }
+    }
+
+    fn pop_sealed(&mut self) {
+        if let Some(record) = self.sealed.pop() {
+            self.sealed_bytes -= 65 + varint_len(record.path.as_str().len() as u64) + record.path.as_str().len();
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, PackError> {
         let ctx = self.key.context();
         if ctx.group.len() > MAX_GROUP {
             return Err(PackError::Invalid("group name is too long".into()));
@@ -207,7 +241,108 @@ impl<'a> PackBuilder<'a> {
     }
 }
 
-/// Opening and inspecting a sealed pack.
+fn varint_len(mut value: u64) -> usize {
+    let mut bytes = 1;
+    while value >= 128 { value >>= 7; bytes += 1; }
+    bytes
+}
+
+/// Writes several independent version-1 packs, each at most [`PACK_BATCH_MAX`]
+/// encoded bytes. A single object that cannot fit is refused. Pack bytes are
+/// handed to `emit` and not retained.
+pub struct PackBatch<'a> {
+    key: &'a EpochKey,
+    current: PackBuilder<'a>,
+    limit: usize,
+    packs: usize,
+}
+
+impl<'a> PackBatch<'a> {
+    pub fn new(key: &'a EpochKey) -> Self {
+        Self::with_limit(key, PACK_BATCH_MAX)
+    }
+
+    fn with_limit(key: &'a EpochKey, limit: usize) -> Self {
+        PackBatch {
+            key,
+            current: PackBuilder::new(key),
+            limit,
+            packs: 0,
+        }
+    }
+
+    pub fn add_object(
+        &mut self,
+        kind: ObjectKind,
+        id: ObjectId,
+        body: &[u8],
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
+    ) -> Result<(), PackError> {
+        self.current.add_object(kind, id, body)?;
+        if self.current.encoded_len() <= self.limit {
+            return Ok(());
+        }
+        let wire = self.key.wire_id(&id);
+        self.current.remove_object(&wire);
+        self.flush(emit)?;
+        self.current.add_object(kind, id, body)?;
+        if self.current.encoded_len() > self.limit {
+            let wire = self.key.wire_id(&id);
+            self.current.remove_object(&wire);
+            return Err(PackError::Invalid(
+                "object does not fit in one pack batch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn add_sealed(
+        &mut self,
+        sealed_id: SealedId,
+        path: RepoPath,
+        kind: EntryKind,
+        target: ObjectId,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
+    ) -> Result<(), PackError> {
+        let before = self.current.sealed.len();
+        self.current.add_sealed(sealed_id, path.clone(), kind, target)?;
+        if self.current.encoded_len() <= self.limit {
+            return Ok(());
+        }
+        if self.current.sealed.len() > before {
+            self.current.pop_sealed();
+        }
+        self.flush(emit)?;
+        self.current.add_sealed(sealed_id, path, kind, target)?;
+        if self.current.encoded_len() > self.limit {
+            self.current.pop_sealed();
+            return Err(PackError::Invalid(
+                "sealed record does not fit in one pack batch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn finish(
+        mut self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
+    ) -> Result<usize, PackError> {
+        self.flush(emit)?;
+        Ok(self.packs)
+    }
+
+    fn flush(&mut self, emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>) -> Result<(), PackError> {
+        if self.current.objects.is_empty() && self.current.sealed.is_empty() { return Ok(()); }
+        let bytes = self.current.encode()?;
+        if bytes.len() > self.limit {
+            return Err(PackError::Invalid("pack batch is too large".into()));
+        }
+        emit(&bytes)?;
+        self.packs += 1;
+        self.current = PackBuilder::new(self.key);
+        Ok(())
+    }
+}
 pub struct Pack;
 
 impl Pack {
@@ -550,6 +685,51 @@ mod tests {
         assert!(
             matches!(Pack::peek_header(&huge), Err(PackError::Invalid(ref reason)) if reason.contains("longer than input"))
         );
+    }
+
+    #[test]
+    fn batches_stay_within_the_limit_and_round_trip() {
+        use crate::keys::{EpochKey, GroupEpoch};
+        let key = EpochKey::from_bytes(
+            GroupEpoch {
+                remote: [1; 16],
+                group: "g".into(),
+                epoch: 3,
+            },
+            [9; 32],
+        );
+        let id_a = tig_core::object::hash_object(ObjectKind::Blob, b"one");
+        let id_b = tig_core::object::hash_object(ObjectKind::Blob, b"two");
+        let mut single = PackBuilder::new(&key);
+        single.add_object(ObjectKind::Blob, id_a, b"one").unwrap();
+        let limit = single.finish().unwrap().len();
+        let mut batch = PackBatch::with_limit(&key, limit);
+        let mut packs = Vec::new();
+        let mut emit = |bytes: &[u8]| {
+            assert!(bytes.len() <= limit);
+            packs.push(bytes.to_vec());
+            Ok(())
+        };
+        batch.add_object(ObjectKind::Blob, id_a, b"one", &mut emit).unwrap();
+        batch.add_object(ObjectKind::Blob, id_a, b"one", &mut emit).unwrap();
+        batch.add_object(ObjectKind::Blob, id_b, b"two", &mut emit).unwrap();
+        let path = RepoPath::new(".env").unwrap();
+        let sealed = key.seal(&path, EntryKind::File, &id_b);
+        batch.add_sealed(sealed, path, EntryKind::File, id_b, &mut emit).unwrap();
+        assert_eq!(batch.finish(&mut emit).unwrap(), 3);
+        assert_eq!(packs.len(), 3);
+        let first = Pack::open(&packs[0], &key).unwrap();
+        let second = Pack::open(&packs[1], &key).unwrap();
+        assert_eq!(first.objects.len(), 1);
+        assert_eq!(second.objects.len(), 1);
+        assert_eq!(&first.objects[0].2[..], b"one");
+        assert_eq!(&second.objects[0].2[..], b"two");
+        let third = Pack::open(&packs[2], &key).unwrap();
+        assert!(third.objects.is_empty());
+        assert_eq!(third.sealed[0].target, id_b);
+        let mut too_small = PackBatch::with_limit(&key, 1);
+        let mut sink = |_bytes: &[u8]| Ok(());
+        assert!(too_small.add_object(ObjectKind::Blob, id_a, b"one", &mut sink).is_err());
     }
 
     #[test]

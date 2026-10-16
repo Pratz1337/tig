@@ -14,7 +14,7 @@ use tig_core::treeops::{lookup, MAX_TREE_DEPTH};
 use tig_core::{EntryKind, ObjectId, ObjectKind, RepoPath, Revision, Signature};
 
 use crate::project::{
-    classify_tree, metadata_mention_warning, names_hidden_inside, rules_of, uniform_private_roots,
+    classify_with_roles, metadata_mention_warning, names_hidden_inside, rules_of, uniform_private_roots,
     ClassifiedTree, ProjectError, RULES_FILE,
 };
 use crate::rules::Rules;
@@ -286,7 +286,7 @@ pub fn export_git(
     let mut compatibility = BTreeSet::new();
     for id in &order {
         let revision = store.get_revision(id)?;
-        let classified = classify_tree(store, &revision.tree)?;
+        let classified = classify_with_roles(store, &revision.tree)?;
         compatibility.extend(classified.warnings.iter().cloned());
         for (path, _) in &classified.private_files {
             omitted_paths.insert(path.clone());
@@ -306,7 +306,7 @@ pub fn export_git(
             },
         );
     }
-    refuse_pastes(&plans, options)?;
+    refuse_pastes(store, &plans, options)?;
     warnings.extend(compatibility);
     if let Some(warning) = mention_warning(store, &plans)? {
         warnings.push(warning);
@@ -497,15 +497,18 @@ fn rules_for<'a>(
 }
 
 fn refuse_pastes(
+    store: &dyn Store,
     plans: &BTreeMap<ObjectId, Planned>,
     options: &ExportOptions,
 ) -> Result<(), ExportError> {
     let empty = hash_object(ObjectKind::Blob, b"");
     let mut private_blobs = BTreeSet::new();
+    let mut private_hashes = BTreeSet::new();
     for plan in plans.values() {
         for (_, leaf) in &plan.classified.private_files {
             if leaf.is_file_like() && leaf.id() != empty {
-                private_blobs.insert(leaf.id());
+                private_blobs.extend(tig_core::blob::content_ids(store, &leaf.id())?);
+                private_hashes.insert(*tig_core::blob::content_hash(store, &leaf.id())?.as_bytes());
             }
         }
     }
@@ -515,7 +518,9 @@ fn refuse_pastes(
             if leaf.kind() == EntryKind::Sealed || !leaf.is_file_like() || leaf.id() == empty {
                 continue;
             }
-            if private_blobs.contains(&leaf.id()) && !options.declassify.contains(path) {
+            if !options.declassify.contains(path)
+                && (tig_core::blob::content_ids(store, &leaf.id())?.iter().any(|id| private_blobs.contains(id))
+                    || private_hashes.contains(tig_core::blob::content_hash(store, &leaf.id())?.as_bytes())) {
                 paths.insert(path.clone());
             }
         }
@@ -613,8 +618,10 @@ impl TreeWriter<'_> {
                     crate::rules::Verdict::Private { .. } => continue,
                     crate::rules::Verdict::Public { .. } => {}
                 }
-                let bytes = self.store.get_blob(&entry.id())?;
-                let oid = self.repo.write_blob(&bytes).map_err(export_error)?.detach();
+                use gix::objs::Write;
+                let mut content = tig_core::blob::ContentReader::new(self.store, &entry.id())?;
+                let oid = self.repo.objects.write_stream(gix::objs::Kind::Blob, content.content_len(), &mut content)
+                    .map_err(export_error)?;
                 let mode = match entry.kind() {
                     EntryKind::File => gix::objs::tree::EntryKind::Blob.into(),
                     EntryKind::Executable => gix::objs::tree::EntryKind::BlobExecutable.into(),

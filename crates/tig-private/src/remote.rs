@@ -45,6 +45,7 @@ const MAX_MANIFEST_FILE: u64 = 256 * 1024 * 1024;
 const MAX_LISTED_PACKS: usize = 100_000;
 const MAX_REFS: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
+const MAX_GROUP_NAME: usize = 1024;
 const MAX_BATCH_OBJECTS: usize = 1000;
 const MAX_BATCH_BYTES: usize = 512 * 1024 * 1024;
 const REFS_VERSION: u8 = 1;
@@ -146,6 +147,34 @@ pub trait Remote: Send + Sync {
 
     /// Pack bytes for one group and epoch, ordered by pack id.
     fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError>;
+
+    /// Ordered pack ids, without buffering an epoch's ciphertext.
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        let mut ids: Vec<_> = self.list_packs(group, epoch)?.iter()
+            .map(|bytes| *blake3::hash(bytes).as_bytes()).collect();
+        ids.sort();
+        if ids.len() > MAX_LISTED_PACKS || ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RemoteError::Invalid("invalid pack listing".into()));
+        }
+        Ok(ids)
+    }
+
+    /// One immutable pack; absent packs are reported without reading others.
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        for bytes in self.list_packs(group, epoch)? {
+            if blake3::hash(&bytes).as_bytes() == id {
+                verify_pack_request(&bytes, self.remote_id(), group, epoch, id)?;
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Known ciphertext size for reserving a server response before reading it.
+    /// Backends without cheap metadata return None; servers reserve the pack cap.
+    fn pack_size(&self, _group: &str, _epoch: u64, _id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        Ok(None)
+    }
 
     fn read_head(&self) -> Result<RemoteHead, RemoteError>;
 
@@ -319,6 +348,68 @@ impl DirRemote {
             out.push(bytes);
         }
         Ok(out)
+    }
+
+    pub fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        check_group(group)?;
+        let dir = self.root.join("packs").join(group).join(epoch.to_string());
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".pack")) else {
+                continue;
+            };
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let id = name
+                .parse::<ObjectId>()
+                .map_err(|_| RemoteError::Invalid("invalid stored pack id".into()))?;
+            if id.to_hex() != name {
+                return Err(RemoteError::Invalid("noncanonical stored pack id".into()));
+            }
+            ids.push(id.0);
+            if ids.len() > MAX_LISTED_PACKS {
+                return Err(RemoteError::Invalid("too many packs".into()));
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    pub fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        check_group(group)?;
+        let path = self.root.join("packs").join(group).join(epoch.to_string())
+            .join(format!("{}.pack", hex::encode(id)));
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !meta.is_file() || meta.len() > crate::pack::PACK_BATCH_MAX as u64 {
+            return Err(RemoteError::Invalid("pack is too large or not a file".into()));
+        }
+        let bytes = read_limited(&path, meta.len())?;
+        verify_pack_request(&bytes, self.remote_id, group, epoch, id)?;
+        Ok(Some(bytes))
+    }
+
+    pub fn pack_size(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        check_group(group)?;
+        let path = self.root.join("packs").join(group).join(epoch.to_string())
+            .join(format!("{}.pack", hex::encode(id)));
+        match fs::metadata(path) {
+            Ok(meta) if meta.is_file() && meta.len() <= MAX_PACK_FILE as u64 => Ok(Some(meta.len() as usize)),
+            Ok(_) => Err(RemoteError::Invalid("pack is too large or not a file".into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(0)),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn read_keyring(&self) -> Result<Vec<u8>, RemoteError> {
@@ -699,6 +790,18 @@ impl Remote for DirRemote {
         DirRemote::list_packs(self, group, epoch)
     }
 
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        DirRemote::list_pack_ids(self, group, epoch)
+    }
+
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        DirRemote::get_pack(self, group, epoch, id)
+    }
+
+    fn pack_size(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        DirRemote::pack_size(self, group, epoch, id)
+    }
+
     fn read_head(&self) -> Result<RemoteHead, RemoteError> {
         DirRemote::read_head(self)
     }
@@ -717,11 +820,25 @@ impl Remote for DirRemote {
     }
 }
 
+fn verify_pack_request(bytes: &[u8], remote: [u8; 16], group: &str, epoch: u64, id: &[u8; 32]) -> Result<(), RemoteError> {
+    if blake3::hash(bytes).as_bytes() != id {
+        return Err(RemoteError::Invalid("pack bytes do not match the pack id".into()));
+    }
+    let header = Pack::peek_header(bytes)?;
+    if header.remote != remote || header.group != group || header.epoch != epoch {
+        return Err(RemoteError::Invalid("pack context does not match the request".into()));
+    }
+    Ok(())
+}
+
 fn check_group(group: &str) -> Result<(), RemoteError> {
     let ok = !group.is_empty()
+        && group.len() <= MAX_GROUP_NAME
         && group
             .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'+'))
+        && group.split('+').all(|part| !part.is_empty())
+        && group.split('+').zip(group.split('+').skip(1)).all(|(a, b)| a < b);
     if ok {
         Ok(())
     } else {

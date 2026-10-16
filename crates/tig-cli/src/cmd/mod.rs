@@ -5,6 +5,7 @@
 mod abandon;
 mod bookmark;
 mod cat;
+mod changes;
 mod clone;
 mod describe;
 mod diff;
@@ -22,6 +23,7 @@ mod new_change;
 mod op;
 mod publish;
 mod remote;
+mod role;
 mod resolve;
 mod revoke;
 mod settings;
@@ -54,6 +56,12 @@ impl CliError {
         CliError {
             message: message.into(),
         }
+    }
+}
+
+impl From<tig_private::changes::ChangeError> for CliError {
+    fn from(err: tig_private::changes::ChangeError) -> Self {
+        CliError::msg(err.to_string())
     }
 }
 
@@ -316,6 +324,9 @@ pub fn run() -> Result<()> {
         Cmd::Why { path } => why::run(repository, &path)?,
         Cmd::Identity { show } => identity::run(show)?,
         Cmd::Remote { action } => remote::run(repository, action)?,
+        Cmd::Role(args) => role::run(repository, args)?,
+        Cmd::Seal { remote, bookmark, revision, role } => changes::seal(repository, remote, bookmark, revision, role)?,
+        Cmd::Reveal { remote, revision } => changes::reveal(repository, remote, revision)?,
         Cmd::Publish {
             remote,
             bookmark,
@@ -362,6 +373,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Manage ranked roles and their access groups
+    Role(role::Args),
+    /// Publish an opaque change that can be opened in place
+    Seal {
+        remote: String,
+        bookmark: String,
+        #[arg(short = 'r', long, value_name = "REV")]
+        revision: Option<String>,
+        #[arg(long)]
+        role: String,
+    },
+    /// Reveal an opaque change without rewriting its public history
+    Reveal {
+        remote: String,
+        #[arg(short = 'r', long, value_name = "REV")]
+        revision: String,
+    },
     /// Import complete Git history into this repository (creates an empty destination)
     ImportGit {
         /// Source Git working tree or bare repository

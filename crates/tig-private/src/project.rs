@@ -35,6 +35,8 @@ pub enum ProjectError {
     RulesFileIsPrivate,
     #[error("roles ({0}) are not supported yet; this version publishes simple mode only (one `private` group)")]
     RolesNotSupported(String),
+    #[error("no epoch key for access group `{0}`")]
+    MissingGroupKey(String),
 }
 
 /// One private entry replaced by a sealed entry in the public tree.
@@ -99,8 +101,27 @@ pub struct ClassifiedTree {
 /// Classifies `root` with [`rules_of`]. Shared by publish and Git export so
 /// both use one matcher and the same built-in floor.
 pub fn classify_tree(store: &dyn Store, root: &ObjectId) -> Result<ClassifiedTree, ProjectError> {
+    classify_inner(store, root, false)
+}
+
+/// Same classification as [`classify_tree`], including `@role` rules.
+pub fn classify_with_roles(store: &dyn Store, root: &ObjectId) -> Result<ClassifiedTree, ProjectError> {
+    classify_inner(store, root, true)
+}
+
+/// Stable pack group for a reader set. One name stays that name. Several
+/// names join in byte order with `+` (role names are already public).
+pub fn access_group(readers: &BTreeSet<String>) -> String {
+    readers.iter().cloned().collect::<Vec<_>>().join("+")
+}
+
+fn classify_inner(
+    store: &dyn Store,
+    root: &ObjectId,
+    allow_roles: bool,
+) -> Result<ClassifiedTree, ProjectError> {
     let rules = rules_of(store, root)?;
-    if !rules.is_simple_mode() {
+    if !allow_roles && !rules.is_simple_mode() {
         let roles: Vec<String> = rules.roles().into_iter().map(|r| format!("@{r}")).collect();
         return Err(ProjectError::RolesNotSupported(roles.join(", ")));
     }
@@ -236,6 +257,47 @@ pub fn metadata_mention_warning(hidden: &BTreeSet<String>, public_text: &str, ve
             named.join(", ")
         ))
     }
+}
+
+/// Projects `root` when rules name roles. `keys` is keyed by [`access_group`].
+/// A missing key is an error. This does not publish; publish must also call
+/// [`crate::roles::Snapshot::require_publisher_reads`] and refuse a frozen group.
+pub fn project_grouped(
+    store: &dyn Store,
+    root: &ObjectId,
+    keys: &BTreeMap<String, &EpochKey>,
+) -> Result<Projection, ProjectError> {
+    let classified = classify_with_roles(store, root)?;
+    let roots = uniform_private_roots(
+        &classified.public_files,
+        &classified.private_files,
+        &classified.readers_of,
+    );
+    let mut sealed = Vec::with_capacity(roots.len());
+    let mut edits = BTreeMap::new();
+    for (path, readers) in roots {
+        let group = access_group(&readers);
+        let key = keys.get(&group).ok_or_else(|| ProjectError::MissingGroupKey(group.clone()))?;
+        if key.context().group != group {
+            return Err(tig_core::Error::Invalid("projection key belongs to a different access group".into()).into());
+        }
+        let leaf = lookup(store, root, &path)?
+            .ok_or_else(|| tig_core::Error::Invalid(format!("sealed root {path} vanished")))?;
+        let sid = key.seal(&path, leaf.kind(), &leaf.id());
+        edits.insert(path.clone(), Some(Leaf::sealed(sid)));
+        sealed.push(SealedRoot { path, leaf, readers });
+    }
+    let public_tree = apply_edits(store, root, &edits)?;
+    let mut public_files = classified.public_files;
+    public_files.retain(|(path, _)| !tig_core::path::has_ancestor(&edits, path));
+    Ok(Projection {
+        public_tree,
+        sealed,
+        public_files,
+        private_files: classified.private_files,
+        negated: classified.negated,
+        warnings: classified.warnings,
+    })
 }
 
 /// Projects `root` for publishing under the `private` group's `key`.

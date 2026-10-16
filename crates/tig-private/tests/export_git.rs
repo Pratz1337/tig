@@ -15,6 +15,67 @@ const SECRET: &[u8] = b"export-git-secret-bytes-9f3a";
 const PUBLIC: &[u8] = b"public-readme";
 
 #[test]
+fn chunked_public_file_exports_exact_git_bytes_and_imports_chunked() {
+    let store = MemoryStore::new();
+    let mut bytes = vec![23; 9 * 1024 * 1024];
+    bytes[4 * 1024 * 1024] = 61;
+    let id = tig_core::blob::put_bytes(&store, &bytes).unwrap();
+    let root = apply_edits(&store, &empty_tree_id(), &BTreeMap::from([
+        (RepoPath::new("large.bin").unwrap(), Some(Leaf::file(id))),
+    ])).unwrap();
+    let rev = revision(&store, root, &[root_revision_id()], "large file");
+    let dir = tempfile::tempdir().unwrap();
+    export_to(dir.path(), &store, &marks(&[("main", rev)]));
+    let output = Command::new("git").current_dir(dir.path())
+        .args(["cat-file", "blob", "main:large.bin"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, bytes);
+    let imported = MemoryStore::new();
+    let mut state = ImportState::new(false).unwrap();
+    let report = import_git(dir.path(), &imported, &mut state).unwrap();
+    let tree = imported.get_revision(&report.bookmarks["main"]).unwrap().tree;
+    let leaf = lookup(&imported, &tree, &RepoPath::new("large.bin").unwrap()).unwrap().unwrap();
+    assert_eq!(leaf.id(), id);
+    assert_eq!(imported.get_blob(&leaf.id()).unwrap(), bytes);
+}
+
+#[test]
+fn private_chunk_copied_to_public_file_is_refused_before_git_objects() {
+    let store = MemoryStore::new();
+    let bytes = vec![47; tig_core::blob::CHUNK_LEN + 1];
+    let private = tig_core::blob::put_bytes(&store, &bytes).unwrap();
+    let chunk = tig_core::blob::content_ids(&store, &private).unwrap()[0];
+    let mut root = tree(&store, &[(".private", b"secrets/\n")]);
+    root = apply_edits(&store, &root, &BTreeMap::from([
+        (RepoPath::new("secrets/file").unwrap(), Some(Leaf::file(private))),
+        (RepoPath::new("public.bin").unwrap(), Some(Leaf::file(chunk))),
+    ])).unwrap();
+    let rev = revision(&store, root, &[root_revision_id()], "chunk paste");
+    let dir = tempfile::tempdir().unwrap();
+    let error = export_git(dir.path(), &store, &marks(&[("main", rev)]),
+        &mut ExportState::default(), &ExportOptions::default()).unwrap_err();
+    assert!(matches!(error, tig_private::export_git::ExportError::PastedSecret { .. }));
+}
+
+#[test]
+fn legacy_blob_copy_of_chunked_private_bytes_is_refused() {
+    let store = MemoryStore::new();
+    let bytes = vec![37; tig_core::blob::CHUNK_LEN + 1];
+    let private = store.put_blob(&bytes).unwrap();
+    let legacy = store.put(&Object::Blob(bytes)).unwrap();
+    assert_ne!(private, legacy);
+    let root = apply_edits(&store, &tree(&store, &[(".private", b"secrets/\n")]), &BTreeMap::from([
+        (RepoPath::new("secrets/file").unwrap(), Some(Leaf::file(private))),
+        (RepoPath::new("public.bin").unwrap(), Some(Leaf::file(legacy))),
+    ])).unwrap();
+    let rev = revision(&store, root, &[root_revision_id()], "legacy paste");
+    let dir = tempfile::tempdir().unwrap();
+    let error = export_git(dir.path(), &store, &marks(&[("main", rev)]),
+        &mut ExportState::default(), &ExportOptions::default()).unwrap_err();
+    assert!(matches!(error, tig_private::export_git::ExportError::PastedSecret { .. }));
+}
+
+#[test]
 fn ambiguous_double_star_rules_omit_private_files_and_warn() {
     let store = MemoryStore::new();
     let rev = revision(
@@ -380,7 +441,7 @@ fn round_trip_keeps_public_history_parents_and_metadata() {
 fn private_paths_and_seals_never_reach_git_objects() {
     let store = MemoryStore::new();
     let secret = store.put_blob(SECRET).unwrap();
-    let rules = store.put_blob(b"secrets/\n").unwrap();
+    let rules = store.put_blob(b"secrets/ @billing\n").unwrap();
     let readme = store.put_blob(PUBLIC).unwrap();
     let edits = [
         (p(".private"), Some(Leaf::file(rules))),

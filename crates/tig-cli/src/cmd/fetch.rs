@@ -16,6 +16,10 @@ pub(super) fn run(repository: Option<&Path>, remote_name: String) -> Result<()> 
     let tig = workspace::main_tig_dir(session.wc.root())?;
     let cfg = super::remote::require(&tig, &remote_name)?;
     let remote = super::remote::connect(&cfg, identity.as_ref(), false)?;
+    if let Some(bytes) = remote.read_head()?.keyring {
+        let keyring = tig_private::keyring::Keyring::decode(&bytes)?;
+        super::remote::verify_policy_checkpoints(&cfg.dir, &keyring)?;
+    }
     let mut state = super::remote::load_fetch_state(&cfg.dir)?;
     let published = super::remote::load_publish_state(&cfg.dir)?;
     let mut tx = session.repo.start(format!("fetch {remote_name}"));

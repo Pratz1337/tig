@@ -37,7 +37,12 @@ pub(super) fn run(
     super::remote::finish_keyring_update(&cfg, &identity)?;
     let rev = publish_rev(&session, revision)?;
     let remote = super::remote::connect(&cfg, Some(&identity), true)?;
-    let missing_keyring = remote.read_head()?.keyring.is_none();
+    let head = remote.read_head()?;
+    if let Some(bytes) = &head.keyring {
+        let keyring = Keyring::decode(bytes)?;
+        super::remote::verify_policy_checkpoints(&cfg.dir, &keyring)?;
+    }
+    let missing_keyring = head.keyring.is_none();
     // Keys hit disk before publish can write a keyring. A refusal still
     // leaves the remote keyring absent; the saved keys are what a retry uses.
     if missing_keyring && super::remote::load_owner_keys(&cfg.dir)?.is_none() {

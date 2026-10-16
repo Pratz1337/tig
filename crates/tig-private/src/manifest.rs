@@ -23,11 +23,13 @@ use tig_core::seal::SealedId;
 use tig_core::ObjectId;
 
 use crate::keyring::Keyring;
+use crate::changes::{ChangeEntry, RevealCertificate};
 use crate::keys::Identity;
 use crate::project::PRIVATE_GROUP;
 use crate::remote::RemoteError;
 
 const VERSION: u8 = 1;
+const VERSION_CHANGES: u8 = 2;
 const MAX_REFS: usize = 100_000;
 const MAX_PACKS: usize = 1_000_000;
 const MAX_SEALED_PER_PACK: usize = 1_000_000;
@@ -67,6 +69,8 @@ pub struct Manifest {
     pub publisher: [u8; 32],
     pub refs: BTreeMap<String, ObjectId>,
     pub packs: BTreeMap<[u8; 32], PackEntry>,
+    pub changes: BTreeMap<ObjectId, ChangeEntry>,
+    pub reveals: BTreeMap<ObjectId, RevealCertificate>,
     pub signature: [u8; 64],
 }
 
@@ -79,12 +83,27 @@ impl Manifest {
         packs: BTreeMap<[u8; 32], PackEntry>,
         publisher: &Identity,
     ) -> Result<Self, ManifestError> {
+        Self::signed_with_changes(remote, sequence, refs, packs, BTreeMap::new(), BTreeMap::new(), publisher)
+    }
+
+    /// Signs cumulative private-change associations and owner reveal certificates.
+    pub fn signed_with_changes(
+        remote: [u8; 16],
+        sequence: u64,
+        refs: BTreeMap<String, ObjectId>,
+        packs: BTreeMap<[u8; 32], PackEntry>,
+        changes: BTreeMap<ObjectId, ChangeEntry>,
+        reveals: BTreeMap<ObjectId, RevealCertificate>,
+        publisher: &Identity,
+    ) -> Result<Self, ManifestError> {
         let mut manifest = Manifest {
             remote,
             sequence,
             publisher: publisher.public().signing,
             refs,
             packs,
+            changes,
+            reveals,
             signature: [0; 64],
         };
         manifest.signature = publisher.sign(&manifest.signing_bytes()?);
@@ -99,7 +118,7 @@ impl Manifest {
         keyring: &Keyring,
         min_sequence: u64,
     ) -> Result<(), ManifestError> {
-        if self.remote != remote {
+        if self.remote != remote || keyring.remote != remote {
             return Err(ManifestError::WrongRemote);
         }
         if self.sequence < min_sequence {
@@ -117,15 +136,38 @@ impl Manifest {
             &self.signing_bytes()?,
             &ed25519_dalek::Signature::from_bytes(&self.signature),
         )
-        .map_err(|_| ManifestError::BadSignature)
+        .map_err(|_| ManifestError::BadSignature)?;
+        let owner = keyring.policy_snapshot().map_err(|_| ManifestError::BadSignature)?.current_owner;
+        for (id, entry) in &self.changes {
+            if id != &entry.skeleton || entry.group.is_empty() || entry.group.len() > MAX_NAME {
+                return Err(ManifestError::Malformed("invalid private-change association".into()));
+            }
+            let pack = self.packs.get(&entry.wrapper_pack)
+                .ok_or_else(|| ManifestError::Malformed("missing private-change wrapper pack".into()))?;
+            if pack.group != entry.group || pack.epoch != entry.epoch || !pack.sealed.is_empty() {
+                return Err(ManifestError::Malformed("private-change wrapper context mismatch".into()));
+            }
+        }
+        for (id, cert) in &self.reveals {
+            if id != &cert.skeleton || cert.remote != self.remote {
+                return Err(ManifestError::BadSignature);
+            }
+            cert.verify(&owner.signing).map_err(|_| ManifestError::BadSignature)?;
+            if !self.changes.get(id).is_some_and(|entry| crate::changes::cert_matches(entry, cert)) {
+                return Err(ManifestError::BadSignature);
+            }
+        }
+        Ok(())
     }
 
     fn body(&self) -> Result<Writer, ManifestError> {
-        if self.refs.len() > MAX_REFS || self.packs.len() > MAX_PACKS {
+        if self.refs.len() > MAX_REFS || self.packs.len() > MAX_PACKS
+            || self.changes.len() > MAX_REFS || self.reveals.len() > MAX_REFS {
             return Err(ManifestError::Malformed("too many refs or packs".into()));
         }
         let mut w = Writer::new();
-        w.u8(VERSION);
+        let extended = !self.changes.is_empty() || !self.reveals.is_empty();
+        w.u8(if extended { VERSION_CHANGES } else { VERSION });
         w.buf.extend_from_slice(&self.remote);
         w.varint(self.sequence);
         w.buf.extend_from_slice(&self.publisher);
@@ -153,6 +195,22 @@ impl Manifest {
                 w.buf.extend_from_slice(sealed.as_bytes());
             }
         }
+        if extended {
+            w.varint(self.changes.len() as u64);
+            for (id, entry) in &self.changes {
+                if id != &entry.skeleton || entry.group.is_empty() || entry.group.len() > MAX_NAME {
+                    return Err(ManifestError::Malformed("invalid private-change association".into()));
+                }
+                crate::changes::write_entry(&mut w, entry);
+            }
+            w.varint(self.reveals.len() as u64);
+            for (id, cert) in &self.reveals {
+                if id != &cert.skeleton || cert.group.is_empty() || cert.group.len() > MAX_NAME {
+                    return Err(ManifestError::Malformed("invalid reveal certificate".into()));
+                }
+                w.bytes(&cert.encode());
+            }
+        }
         Ok(w)
     }
 
@@ -173,7 +231,8 @@ impl Manifest {
     /// Decodes canonical bytes only (sorted, no duplicates, no trailing data).
     pub fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
         let mut r = Reader::new(bytes, "publish manifest");
-        if r.u8()? != VERSION {
+        let version = r.u8()?;
+        if version != VERSION && version != VERSION_CHANGES {
             return Err(ManifestError::Malformed("unsupported version".into()));
         }
         let remote: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
@@ -236,6 +295,49 @@ impl Manifest {
                 },
             );
         }
+        let mut changes = BTreeMap::new();
+        let mut reveals = BTreeMap::new();
+        if version == VERSION_CHANGES {
+            let n = r.count(32 + 16 + 32 + 32 + 32 + 1 + 1 + 32)?;
+            if n > MAX_REFS {
+                return Err(ManifestError::Malformed("too many private changes".into()));
+            }
+            let mut last = None;
+            for _ in 0..n {
+                let entry = ChangeEntry {
+                    skeleton: r.id()?,
+                    change_id: r.change_id()?,
+                    capsule: r.id()?,
+                    marker: SealedId::from_stored(r.take(32)?.try_into().expect("32 bytes")),
+                    commitment: r.take(32)?.try_into().expect("32 bytes"),
+                    group: r.str()?.to_string(),
+                    epoch: r.varint()?,
+                    wrapper_pack: r.take(32)?.try_into().expect("32 bytes"),
+                };
+                if last.is_some_and(|id| id >= entry.skeleton) || entry.group.is_empty() || entry.group.len() > MAX_NAME {
+                    return Err(ManifestError::Malformed("private changes are not canonical".into()));
+                }
+                last = Some(entry.skeleton);
+                changes.insert(entry.skeleton, entry);
+            }
+            let n = r.count(1 + 200)?;
+            if n > MAX_REFS {
+                return Err(ManifestError::Malformed("too many reveals".into()));
+            }
+            let mut last = None;
+            for _ in 0..n {
+                let cert = RevealCertificate::decode(r.bytes()?)
+                    .map_err(|e| ManifestError::Malformed(e.to_string()))?;
+                if last.is_some_and(|id| id >= cert.skeleton) || cert.group.is_empty() || cert.group.len() > MAX_NAME {
+                    return Err(ManifestError::Malformed("reveals are not canonical".into()));
+                }
+                last = Some(cert.skeleton);
+                reveals.insert(cert.skeleton, cert);
+            }
+            if changes.is_empty() && reveals.is_empty() {
+                return Err(ManifestError::Malformed("empty version-2 manifest".into()));
+            }
+        }
         let signature: [u8; 64] = r.take(64)?.try_into().expect("64 bytes");
         r.finish()?;
         Ok(Manifest {
@@ -244,8 +346,14 @@ impl Manifest {
             publisher,
             refs,
             packs,
+            changes,
+            reveals,
             signature,
         })
+    }
+
+    pub fn entry(&self, skeleton: &ObjectId) -> Option<&ChangeEntry> {
+        self.changes.get(skeleton)
     }
 }
 
@@ -267,20 +375,32 @@ pub fn resign_as_owner(
     };
     let current = Manifest::decode(bytes)?;
     current.verify(remote_id, keyring, min_sequence)?;
-    if owner.public() != keyring.owner {
+    if owner.public() != keyring.policy_snapshot().map_err(|_| ManifestError::BadSignature)?.current_owner {
         return Err(ManifestError::BadSignature);
     }
     let sequence = current
         .sequence
         .checked_add(1)
         .ok_or_else(|| ManifestError::Malformed("sequence overflow".into()))?;
-    let resigned = Manifest::signed(current.remote, sequence, current.refs, current.packs, owner)?;
+    let resigned = Manifest::signed_with_changes(current.remote, sequence, current.refs, current.packs, current.changes, current.reveals, owner)?;
     Ok(Some(resigned.encode()?))
 }
 
 /// Who may sign a manifest: the owner, and members with a grant for the
 /// current epoch of the private group. `keyring` must already be verified.
 pub fn allowed_signers(keyring: &Keyring) -> BTreeSet<[u8; 32]> {
+    if !keyring.policy.is_empty() {
+        let Ok(snapshot) = keyring.policy_snapshot() else {
+            return BTreeSet::new();
+        };
+        let mut allowed = BTreeSet::from([snapshot.current_owner.signing]);
+        for actor in snapshot.assignments.keys() {
+            if snapshot.has(actor, crate::roles::PUBLISH) {
+                allowed.insert(actor.signing);
+            }
+        }
+        return allowed;
+    }
     let mut allowed = BTreeSet::from([keyring.owner.signing]);
     if let Some(&current) = keyring.head.epochs.get(PRIVATE_GROUP) {
         for grant in &keyring.grants {
