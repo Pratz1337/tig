@@ -76,6 +76,38 @@ fn legacy_blob_copy_of_chunked_private_bytes_is_refused() {
 }
 
 #[test]
+fn legacy_private_chunk_copied_to_public_file_is_refused_before_git_objects() {
+    let store = MemoryStore::new();
+    let mut bytes = vec![53; tig_core::blob::CHUNK_LEN + 17];
+    bytes[tig_core::blob::CHUNK_LEN..].fill(79);
+    let public = store.put_blob(&bytes[tig_core::blob::CHUNK_LEN..]).unwrap();
+    let private = store.put(&Object::Blob(bytes)).unwrap();
+    let root = apply_edits(&store, &tree(&store, &[(".private", b"secrets/\n")]), &BTreeMap::from([
+        (RepoPath::new("secrets/file").unwrap(), Some(Leaf::file(private))),
+        (RepoPath::new("public.bin").unwrap(), Some(Leaf::file(public))),
+    ])).unwrap();
+    let rev = revision(&store, root, &[root_revision_id()], "legacy chunk paste");
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = ExportState::default();
+    let before = state.clone();
+    let error = export_git(dir.path(), &store, &marks(&[("main", rev)]),
+        &mut state, &ExportOptions::default()).unwrap_err();
+    assert!(matches!(error, tig_private::export_git::ExportError::PastedSecret { .. }));
+    assert_eq!(state, before);
+    assert!(git(dir.path(), &["cat-file", "--batch-all-objects", "--batch-check"]).is_empty());
+    let options = ExportOptions {
+        declassify: [RepoPath::new("public.bin").unwrap()].into_iter().collect(),
+        ..ExportOptions::default()
+    };
+    export_git(dir.path(), &store, &marks(&[("main", rev)]), &mut state, &options).unwrap();
+    let output = Command::new("git").current_dir(dir.path())
+        .args(["cat-file", "blob", "main:public.bin"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, vec![79; 17]);
+    assert!(!git(dir.path(), &["ls-tree", "-r", "--name-only", "main"]).contains("secrets/"));
+}
+
+#[test]
 fn ambiguous_double_star_rules_omit_private_files_and_warn() {
     let store = MemoryStore::new();
     let rev = revision(

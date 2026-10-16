@@ -15,7 +15,14 @@ diffs report content and size changes without loading the entire file as text.
 
 Private content is encrypted in independent packs capped at 16 MiB. Each
 file's manifest and chunk closure travel together. Publish and Git export
-include chunk IDs in the private-content paste check. Git export streams
+include canonical 4 MiB chunk IDs and the complete-content blob ID in the
+private-content paste check for both legacy and chunked files. This includes
+the final short chunk, without rewriting legacy objects or history. It is
+an exact file/chunk comparison, not an arbitrary substring scan. Older publish
+caches expand their private and declassified evidence once, on the next successful
+publish, without changing revision mappings. Missing historical content refuses
+that upgrade; computed whole-blob aliases are recovered from stored chunks.
+Git export streams
 content directly into the object database. Git import chunks the blob after
 gitoxide reads it. Packed Git import still materializes a Git blob and refuses
 blobs above 256 MiB from their headers before allocating the body.

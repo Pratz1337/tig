@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use tig_core::blob::leak_ids;
 use tig_core::encode::{Reader, Writer};
 use tig_core::object::{hash_object, Object, ObjectKind, Tree};
 use tig_core::repo::{rebase_revision, root_revision, root_revision_id};
@@ -33,7 +34,7 @@ use crate::pack::{Pack, PackBatch, PackError};
 use crate::project::{access_group, project_grouped, public_revision, Projection, PRIVATE_GROUP};
 use crate::remote::{CommitOutcome, Remote, RemoteError};
 
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_PATHS: usize = 1_000_000;
 const MAX_WIRES: usize = 1_000_000;
@@ -152,6 +153,8 @@ pub struct PublishState {
     /// bytes may not reappear in a public file unless declassified, even
     /// after the private file was renamed or deleted.
     pub ever_private: BTreeSet<ObjectId>,
+    /// Historical evidence includes canonical chunks of legacy blobs.
+    pub legacy_chunk_evidence: bool,
     /// Blobs the user explicitly declassified with `declassify`.
     pub declassified: BTreeSet<ObjectId>,
     /// Highest publish manifest sequence seen or written (rollback floor).
@@ -179,6 +182,7 @@ impl PublishState {
             confirmed_negations: BTreeSet::new(),
             sent: BTreeMap::new(),
             ever_private: BTreeSet::new(),
+            legacy_chunk_evidence: true,
             declassified: BTreeSet::new(),
             manifest_seq: 0,
             revealed: BTreeSet::new(),
@@ -194,7 +198,7 @@ impl PublishState {
             return Err(PublishError::Invalid("publish state is too large".into()));
         }
         let mut w = Writer::new();
-        w.u8(if self.policy_checkpoint.is_some() || !self.revealed.is_empty() { VERSION } else { 4 });
+        w.u8(VERSION);
         w.buf.extend_from_slice(&self.remote_id);
         match self.owner_signing {
             Some(pin) => {
@@ -226,17 +230,16 @@ impl PublishState {
         write_ids(&mut w, &self.ever_private)?;
         write_ids(&mut w, &self.declassified)?;
         w.varint(self.manifest_seq);
-        if self.policy_checkpoint.is_some() || !self.revealed.is_empty() {
-            match self.policy_checkpoint {
-                Some(checkpoint) => {
-                    w.u8(1);
-                    w.varint(checkpoint.transitions);
-                    w.buf.extend_from_slice(&checkpoint.digest);
-                }
-                None => w.u8(0),
+        match self.policy_checkpoint {
+            Some(checkpoint) => {
+                w.u8(1);
+                w.varint(checkpoint.transitions);
+                w.buf.extend_from_slice(&checkpoint.digest);
             }
-            write_ids(&mut w, &self.revealed)?;
+            None => w.u8(0),
         }
+        write_ids(&mut w, &self.revealed)?;
+        w.u8(u8::from(self.legacy_chunk_evidence));
         Ok(w.finish())
     }
 
@@ -333,6 +336,13 @@ impl PublishState {
             };
             (checkpoint, read_ids(&mut r)?)
         } else { (None, BTreeSet::new()) };
+        let legacy_chunk_evidence = if version >= 6 {
+            match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(PublishError::Invalid("invalid legacy chunk evidence flag".into())),
+            }
+        } else { false };
         r.finish()?;
         // Earlier projections used the narrower embedded-** privacy policy.
         // Keep exposure evidence and rollback floors, but reclassify history.
@@ -349,6 +359,7 @@ impl PublishState {
             confirmed_negations,
             sent,
             ever_private,
+            legacy_chunk_evidence,
             declassified,
             manifest_seq,
             revealed,
@@ -600,6 +611,7 @@ pub fn publish(
                 state.ever_public = ever_public;
                 state.confirmed_negations.extend(checked.confirmed);
                 state.ever_private.extend(checked.new_private);
+                state.legacy_chunk_evidence = true;
                 state.declassified.extend(checked.new_declassified);
                 state.manifest_seq = sequence;
                 state.revealed = revealed_floor;
@@ -1392,7 +1404,11 @@ fn check_refusals(
     // Everything private in this batch plus everything ever sealed to this
     // remote: a rename or delete inside an unpublished window, or after an
     // earlier publish, must not let those bytes out.
-    let mut new_private = BTreeSet::new();
+    let mut new_private = if state.legacy_chunk_evidence { BTreeSet::new() }
+        else { expand_legacy_evidence(store, &state.ever_private)? };
+    let upgraded_declassified = if state.legacy_chunk_evidence { None }
+        else { Some(expand_legacy_evidence(store, &state.declassified)?) };
+    let old_declassified = upgraded_declassified.as_ref().unwrap_or(&state.declassified);
     for plan in plans {
         for (_, leaf) in &plan.projection.private_files {
             if leaf.is_file_like() && leaf.id() != empty {
@@ -1401,13 +1417,13 @@ fn check_refusals(
         }
     }
     let mut previously_private = BTreeSet::new();
-    let mut new_declassified = BTreeSet::new();
+    let mut new_declassified = upgraded_declassified.clone().unwrap_or_default();
     for plan in plans {
         for (path, leaf) in &plan.projection.public_files {
             let id = leaf.id();
             if !leaf.is_file_like() || id == empty { continue; }
             let ids = leak_ids(store, &id)?;
-            if ids.iter().any(|id| !state.declassified.contains(id) && (new_private.contains(id) || state.ever_private.contains(id))) {
+            if ids.iter().any(|id| !old_declassified.contains(id) && (new_private.contains(id) || state.ever_private.contains(id))) {
                 if options.declassify.contains(path) {
                     new_declassified.extend(ids);
                 } else {
@@ -1482,6 +1498,25 @@ fn check_refusals(
     })
 }
 
+/// Older caches can contain a computed whole-blob id without storing that
+/// representation. Resolve those aliases from the stored chunked object;
+/// refuse missing historical content rather than dropping leak evidence.
+fn expand_legacy_evidence(store: &dyn Store, ids: &BTreeSet<ObjectId>) -> Result<BTreeSet<ObjectId>, PublishError> {
+    let mut expanded = BTreeSet::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        if store.has(id)? {
+            expanded.extend(leak_ids(store, id)?);
+        } else {
+            missing.push(*id);
+        }
+    }
+    if let Some(id) = missing.into_iter().find(|id| !expanded.contains(id)) {
+        return Err(tig_core::Error::NotFound(id).into());
+    }
+    Ok(expanded)
+}
+
 fn hidden_now(path: &RepoPath, projection: &Projection) -> bool {
     projection
         .private_files
@@ -1514,27 +1549,6 @@ fn pastes_in(store: &dyn Store, projection: &Projection, empty: ObjectId) -> Res
         }
     }
     Ok(found)
-}
-
-/// Include the ordinary blob ID of the complete bytes so historical kind-1
-/// files and new chunked representations share the same leak evidence.
-fn leak_ids(store: &dyn Store, id: &ObjectId) -> Result<Vec<ObjectId>, PublishError> {
-    let mut ids = tig_core::blob::content_ids(store, id)?;
-    if store.kind(id)? == Some(ObjectKind::ChunkedBlob) {
-        struct HashWriter(blake3::Hasher);
-        impl std::io::Write for HashWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.update(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
-        let mut hash = HashWriter(blake3::Hasher::new_derive_key(tig_core::domain::OBJECT_ID));
-        hash.0.update(&[ObjectKind::Blob as u8]);
-        tig_core::blob::write_content(store, id, &mut hash)?;
-        ids.push(ObjectId(*hash.0.finalize().as_bytes()));
-    }
-    Ok(ids)
 }
 
 fn empty_blob() -> ObjectId {
@@ -1830,6 +1844,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_evidence_upgrade_recovers_aliases_and_refuses_missing_history() {
+        let store = tig_core::MemoryStore::new();
+        let bytes = vec![59; tig_core::blob::CHUNK_LEN + 17];
+        let id = store.put_blob(&bytes).unwrap();
+        let legacy = hash_object(ObjectKind::Blob, &bytes);
+        assert!(!store.has(&legacy).unwrap());
+        let mut evidence: BTreeSet<_> = tig_core::blob::content_ids(&store, &id).unwrap().into_iter().collect();
+        evidence.insert(legacy);
+        let count = store.len();
+        assert_eq!(expand_legacy_evidence(&store, &evidence).unwrap(), evidence);
+        assert_eq!(store.len(), count);
+        let missing = ObjectId([199; 32]);
+        evidence.insert(missing);
+        assert!(matches!(expand_legacy_evidence(&store, &evidence),
+            Err(PublishError::Core(tig_core::Error::NotFound(got))) if got == missing));
+    }
+
+    #[test]
     fn remote_history_retry_reads_only_new_revisions_and_trees() {
         struct CountingStore {
             inner: tig_core::MemoryStore,
@@ -1949,14 +1981,23 @@ mod tests {
 
         let mut legacy = bytes.clone();
         legacy[0] = 3;
+        legacy.truncate(legacy.len() - 3); // No checkpoint, reveals or evidence flag.
         let mut migrated = state.clone();
         migrated.revisions.clear();
+        migrated.legacy_chunk_evidence = false;
         assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        legacy[0] = 4;
+        migrated.revisions = state.revisions.clone();
+        assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        legacy[0] = 5;
+        legacy.extend_from_slice(&[0, 0]); // Empty checkpoint and reveals.
+        assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        assert_eq!(PublishState::decode(&migrated.encode().unwrap()).unwrap(), migrated);
 
         let mut protected = state.clone();
         protected.revealed.insert(ObjectId([3; 32]));
         let revealed_only = protected.encode().unwrap();
-        assert_eq!(revealed_only[0], 5);
+        assert_eq!(revealed_only[0], VERSION);
         assert_eq!(PublishState::decode(&revealed_only).unwrap(), protected);
         protected.policy_checkpoint = Some(crate::keyring::PolicyCheckpoint {
             transitions: 3, digest: [4; 32],
@@ -1970,6 +2011,9 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(PublishState::decode(&trailing).is_err());
+        let mut bad_flag = bytes.clone();
+        *bad_flag.last_mut().unwrap() = 2;
+        assert!(PublishState::decode(&bad_flag).is_err());
 
         // Swap the two revision records (64 bytes each) so the keys decrease.
         let mut unsorted = bytes.clone();

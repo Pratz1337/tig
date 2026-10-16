@@ -166,6 +166,47 @@ fn private_chunk_copied_to_public_file_is_refused_before_upload() {
 }
 
 #[test]
+fn legacy_private_chunk_copied_to_public_file_is_refused_before_upload() {
+    for deleted in [false, true] {
+        let mut repo = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
+        let mut bytes = vec![53; tig_core::blob::CHUNK_LEN + 17];
+        bytes[tig_core::blob::CHUNK_LEN..].fill(79);
+        let private_id = repo.store().put(&tig_core::Object::Blob(bytes.clone())).unwrap();
+        let public_id = repo.store().put_blob(&bytes[tig_core::blob::CHUNK_LEN..]).unwrap();
+        let secret_path = RepoPath::new("secrets/old.bin").unwrap();
+        let mut workspace = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+        workspace.write(&repo, &RepoPath::new(".private").unwrap(), b"secrets/\n").unwrap();
+        workspace.set(&repo, secret_path.clone(), Some(Leaf::file(private_id))).unwrap();
+        workspace.snapshot(&mut repo).unwrap();
+        if deleted {
+            let mut tx = repo.start("copy a deleted legacy chunk");
+            let child = tx.new_change(&[workspace.working_revision()], "copy private tail").unwrap();
+            tx.set_working(DEFAULT_WORKSPACE, child).unwrap();
+            repo.commit(tx).unwrap();
+            workspace = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+            workspace.remove(&repo, &secret_path).unwrap();
+        }
+        workspace.set(&repo, RepoPath::new("public.bin").unwrap(), Some(Leaf::file(public_id))).unwrap();
+        workspace.snapshot(&mut repo).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let remote = DirRemote::create(dir.path(), [174; 16]).unwrap();
+        let owner = Identity::generate().unwrap();
+        let (_, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+        let mut state = PublishState::new();
+        let before = state.clone();
+        let error = publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut state,
+            &FetchState::new(), "main", workspace.working_revision(), &PublishOptions::default()).unwrap_err();
+        assert!(matches!(error, PublishError::PastedSecret { .. } | PublishError::PreviouslyPrivate { .. }), "{error}");
+        assert_eq!(state, before);
+        let head = remote.read_head().unwrap();
+        assert!(head.keyring.is_none() && head.manifest.is_none());
+        assert!(!remote.public_store().has(&public_id).unwrap());
+        assert!(remote.list_packs("private", 1).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn deleted_private_file_copied_with_other_blob_encoding_is_refused_before_upload() {
     for private_chunked in [true, false] {
         let mut repo = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
@@ -206,4 +247,67 @@ fn deleted_private_file_copied_with_other_blob_encoding_is_refused_before_upload
         }
         assert!(remote.list_packs("private", 1).unwrap().is_empty());
     }
+}
+
+#[test]
+fn legacy_publish_cache_preserves_deleted_private_chunks_and_revision_mappings() {
+    let mut repo = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
+    let mut bytes = vec![53; tig_core::blob::CHUNK_LEN + 17];
+    bytes[tig_core::blob::CHUNK_LEN..].fill(79);
+    let public_id = repo.store().put_blob(&bytes[tig_core::blob::CHUNK_LEN..]).unwrap();
+    let private_id = repo.store().put(&tig_core::Object::Blob(bytes)).unwrap();
+    let private_path = RepoPath::new("secrets/old.bin").unwrap();
+    let mut workspace = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    workspace.write(&repo, &RepoPath::new(".private").unwrap(), b"secrets/\n").unwrap();
+    workspace.set(&repo, private_path.clone(), Some(Leaf::file(private_id))).unwrap();
+    workspace.snapshot(&mut repo).unwrap();
+    let original = workspace.working_revision();
+    let dir = tempfile::tempdir().unwrap();
+    let remote = DirRemote::create(dir.path(), [173; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let (_, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    let mut state = PublishState::new();
+    publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut state,
+        &FetchState::new(), "main", original, &PublishOptions::default()).unwrap();
+    let original_public = state.revisions[&original];
+    state.ever_private = [private_id].into_iter().collect();
+    let mut legacy = state.encode().unwrap();
+    if legacy[0] == 6 { legacy.truncate(legacy.len() - 3); }
+    legacy[0] = 4;
+    state = PublishState::decode(&legacy).unwrap();
+    assert_eq!(state.revisions[&original], original_public);
+
+    let mut tx = repo.start("copy a previously published legacy chunk");
+    let child = tx.new_change(&[original], "copy deleted private tail").unwrap();
+    tx.set_working(DEFAULT_WORKSPACE, child).unwrap();
+    repo.commit(tx).unwrap();
+    workspace = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    workspace.remove(&repo, &private_path).unwrap();
+    let public_path = RepoPath::new("public.bin").unwrap();
+    workspace.set(&repo, public_path.clone(), Some(Leaf::file(public_id))).unwrap();
+    workspace.snapshot(&mut repo).unwrap();
+    let before = state.clone();
+    let head = remote.read_head().unwrap();
+    let error = publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut state,
+        &FetchState::new(), "main", workspace.working_revision(), &PublishOptions::default()).unwrap_err();
+    assert!(matches!(error, PublishError::PreviouslyPrivate { .. }), "{error}");
+    assert_eq!(state, before);
+    assert_eq!(remote.read_head().unwrap(), head);
+    assert!(!remote.public_store().has(&public_id).unwrap());
+
+    let options = PublishOptions { declassify: [public_path].into_iter().collect(), ..PublishOptions::default() };
+    publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut state,
+        &FetchState::new(), "main", workspace.working_revision(), &options).unwrap();
+    assert_eq!(state.revisions[&original], original_public);
+    assert!(state.ever_private.contains(&public_id));
+    assert!(state.declassified.contains(&public_id));
+    assert_eq!(PublishState::decode(&state.encode().unwrap()).unwrap(), state);
+
+    // An earlier whole-file declassification also applies to its chunks.
+    let mut predeclassified = before;
+    predeclassified.declassified.insert(private_id);
+    publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut predeclassified,
+        &FetchState::new(), "main", workspace.working_revision(), &PublishOptions::default()).unwrap();
+    assert!(predeclassified.declassified.contains(&public_id));
+    assert_eq!(predeclassified.revisions[&original], original_public);
 }

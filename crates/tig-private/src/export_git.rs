@@ -503,12 +503,10 @@ fn refuse_pastes(
 ) -> Result<(), ExportError> {
     let empty = hash_object(ObjectKind::Blob, b"");
     let mut private_blobs = BTreeSet::new();
-    let mut private_hashes = BTreeSet::new();
     for plan in plans.values() {
         for (_, leaf) in &plan.classified.private_files {
             if leaf.is_file_like() && leaf.id() != empty {
-                private_blobs.extend(tig_core::blob::content_ids(store, &leaf.id())?);
-                private_hashes.insert(*tig_core::blob::content_hash(store, &leaf.id())?.as_bytes());
+                private_blobs.extend(tig_core::blob::leak_ids(store, &leaf.id())?);
             }
         }
     }
@@ -519,8 +517,7 @@ fn refuse_pastes(
                 continue;
             }
             if !options.declassify.contains(path)
-                && (tig_core::blob::content_ids(store, &leaf.id())?.iter().any(|id| private_blobs.contains(id))
-                    || private_hashes.contains(tig_core::blob::content_hash(store, &leaf.id())?.as_bytes())) {
+                && tig_core::blob::leak_ids(store, &leaf.id())?.iter().any(|id| private_blobs.contains(id)) {
                 paths.insert(path.clone());
             }
         }

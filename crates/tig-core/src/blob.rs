@@ -558,6 +558,43 @@ pub fn content_ids<S: Store + ?Sized>(store: &S, id: &ObjectId) -> Result<Vec<Ob
         .collect())
 }
 
+/// Evidence for private-content paste checks at publication boundaries.
+/// Includes the file id, canonical chunk ids, and the ordinary blob id of
+/// the complete bytes, regardless of the stored encoding. Does not store
+/// chunks or rewrite legacy objects. Chunked content is read one chunk at a time.
+pub fn leak_ids<S: Store + ?Sized>(store: &S, id: &ObjectId) -> Result<Vec<ObjectId>> {
+    let (kind, body) = load(store, id)?;
+    let mut ids = vec![*id];
+    match kind {
+        ObjectKind::Blob => {
+            if body.len() > CHUNK_LEN {
+                ids.extend(
+                    body.chunks(CHUNK_LEN)
+                        .map(|bytes| hash_object(ObjectKind::Blob, bytes)),
+                );
+            }
+        }
+        ObjectKind::ChunkedBlob => {
+            let manifest = parse_manifest(&body)?;
+            let mut hash = blake3::Hasher::new_derive_key(crate::domain::OBJECT_ID);
+            hash.update(&[ObjectKind::Blob as u8]);
+            for chunk in manifest.chunks() {
+                let bytes = load_chunk(store, id, chunk)?;
+                hash.update(&bytes);
+                ids.push(chunk.id);
+            }
+            ids.push(ObjectId(*hash.finalize().as_bytes()));
+        }
+        other => {
+            return Err(Error::WrongKind {
+                expected: "blob",
+                found: other.name(),
+            })
+        }
+    }
+    Ok(ids)
+}
+
 /// Chunk ids named by a manifest body. Empty for a plain blob. Used when the
 /// object has been fetched but its chunks have not.
 pub fn linked_ids(kind: ObjectKind, body: &[u8]) -> Result<Vec<ObjectId>> {
@@ -645,6 +682,31 @@ mod tests {
         assert_eq!(materialize(&store, &id).unwrap(), b"hello\n");
         let empty = put_reader(&store, Cursor::new([])).unwrap();
         assert_eq!(empty, hash_object(ObjectKind::Blob, b""));
+    }
+
+    #[test]
+    fn leak_evidence_matches_across_encodings_without_rewriting_objects() {
+        use std::collections::BTreeSet;
+        use crate::store::StoreExt;
+
+        for length in [0, CHUNK_LEN, CHUNK_LEN + 17, 2 * CHUNK_LEN] {
+            let store = MemoryStore::new();
+            let mut bytes = vec![53; length];
+            if length > CHUNK_LEN { bytes[CHUNK_LEN..].fill(79); }
+            let legacy = store.put(&Object::Blob(bytes.clone())).unwrap();
+            let chunked = put_bytes(&store, &bytes).unwrap();
+            let count = store.len();
+            let legacy_ids: BTreeSet<_> = leak_ids(&store, &legacy).unwrap().into_iter().collect();
+            let mut chunked_ids: BTreeSet<_> = leak_ids(&store, &chunked).unwrap().into_iter().collect();
+            if legacy != chunked { assert!(chunked_ids.remove(&chunked)); }
+            assert_eq!(legacy_ids, chunked_ids);
+            assert!(legacy_ids.contains(&legacy));
+            for part in bytes.chunks(CHUNK_LEN) {
+                assert!(legacy_ids.contains(&hash_object(ObjectKind::Blob, part)));
+            }
+            assert_eq!(store.len(), count);
+            assert_eq!(store.get_raw(&legacy).unwrap().unwrap(), (ObjectKind::Blob, bytes));
+        }
     }
 
     #[test]
@@ -787,6 +849,7 @@ mod tests {
             .put_raw(&id, ObjectKind::ChunkedBlob, &manifest.encode())
             .unwrap();
         assert!(matches!(materialize(&store, &id), Err(Error::NotFound(got)) if got == missing));
+        assert!(matches!(leak_ids(&store, &id), Err(Error::NotFound(got)) if got == missing));
 
         let tree = crate::object::Tree::empty().encode();
         let tree_id = hash_object(ObjectKind::Tree, &tree);
@@ -813,6 +876,7 @@ mod tests {
             materialize(&store, &bad_id),
             Err(Error::Corrupt { .. })
         ));
+        assert!(matches!(leak_ids(&store, &bad_id), Err(Error::Corrupt { .. })));
 
         let lie = manifest_of(
             vec![
@@ -833,5 +897,6 @@ mod tests {
             materialize(&store, &lie_id),
             Err(Error::Corrupt { .. })
         ));
+        assert!(matches!(leak_ids(&store, &lie_id), Err(Error::Corrupt { .. })));
     }
 }
