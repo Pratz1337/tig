@@ -17,6 +17,7 @@ chacha20poly1305.workspace = true
 x25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 zeroize.workspace = true
+argon2 = { version = "0.5", features = ["zeroize"] }
 gix.workspace = true
 
 [dev-dependencies]

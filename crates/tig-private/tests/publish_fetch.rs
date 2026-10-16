@@ -335,7 +335,7 @@ fn alice_publishes_secrets_bob_reads_them_carol_does_not() {
         alice_report.newly_pinned.as_deref(),
         Some(alice.public().fingerprint().as_str())
     );
-    assert_eq!(alice.public().fingerprint().len(), 16);
+    assert_eq!(alice.public().fingerprint().len(), 32);
     let alice_got = alice_store.get_revision(&tip(&alice_report)).unwrap();
     assert_eq!(alice_got.tree, alice_tree);
     assert_eq!(alice_report.unsealed, 2);

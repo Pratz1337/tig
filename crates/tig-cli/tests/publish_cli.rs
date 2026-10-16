@@ -20,7 +20,7 @@ fn tig(dir: &Path, name: &str, email: &str, identity: &Path) -> Command {
         .env("TIG_AUTHOR_NAME", name)
         .env("TIG_AUTHOR_EMAIL", email)
         .env("TIG_TIMESTAMP_MS", "1700000000000")
-        .env("TIG_IDENTITY_FILE", identity);
+        .env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", identity);
     cmd
 }
 
@@ -180,8 +180,8 @@ fn identity_is_created_once_and_show_does_not_create() {
     let (token, fingerprint) = identity_lines(&first);
     assert!(token.starts_with("tig1:"), "{first}");
     assert_eq!(token.len(), "tig1:".len() + 128, "{first}");
-    assert_eq!(fingerprint.len(), 16, "{first}");
-    assert_eq!(fs::read(&path).unwrap().len(), 64);
+    assert_eq!(fingerprint.len(), 32, "{first}");
+    assert!(fs::read(&path).unwrap().starts_with(b"TIGI"));
 
     let again = expect_ok(tig(tmp.path(), "Ada", "ada@example.com", &path).args(["identity"]));
     assert_eq!(again, first);
@@ -509,4 +509,40 @@ fn outsider_edits_snapshots_and_republishes_without_deleting_seals() {
     assert!(!tree_contains(&own_remote, OLD_MARKER.as_bytes()));
     let cat = run(outsider(&clone).args(["cat", ".env"]));
     assert!(cat.stderr.contains(".env is not a file"));
+}
+
+#[test]
+fn identity_is_never_saved_as_plaintext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("protected.id");
+    expect_ok(tig(tmp.path(), "Ada", "ada@example.com", &path).args(["identity"]));
+    let stored = fs::read(&path).unwrap();
+    assert!(stored.starts_with(b"TIGI"), "identity must have a protected envelope");
+    assert_ne!(stored.len(), 64, "raw identity secrets must not be persisted");
+}
+
+#[test]
+fn identity_migration_preserves_keys_and_bad_passwords_or_tampering_never_replace_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("legacy.id");
+    let identity = tig_private::keys::Identity::from_bytes([37; 64]);
+    fs::write(&path, *identity.to_bytes()).unwrap();
+    let shown = expect_ok(tig(tmp.path(), "Ada", "ada@example.com", &path).args(["identity", "--show"]));
+    let (token, _) = identity_lines(&shown);
+    assert_eq!(token, tig_cli::ui::identity_token(&identity.public()));
+    let protected = fs::read(&path).unwrap();
+    assert!(protected.starts_with(b"TIGI"));
+    assert!(!protected.windows(64).any(|b| b == identity.to_bytes().as_slice()));
+    let denied = run(tig(tmp.path(), "Ada", "ada@example.com", &path)
+        .env("TIG_IDENTITY_PASSPHRASE", "wrong test passphrase").args(["identity", "--show"]));
+    assert_eq!(denied.code, Some(1));
+    assert_eq!(fs::read(&path).unwrap(), protected);
+    for mut damaged in [protected.clone(), protected[..64].to_vec()] {
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        fs::write(&path, &damaged).unwrap();
+        let denied = run(tig(tmp.path(), "Ada", "ada@example.com", &path).args(["identity", "--show"]));
+        assert_eq!(denied.code, Some(1));
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
 }

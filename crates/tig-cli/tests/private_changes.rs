@@ -10,7 +10,7 @@ use tig_private::remote::DirRemote;
 
 fn command(dir: &Path, identity: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tig"));
-    cmd.current_dir(dir).env("TIG_IDENTITY_FILE", identity)
+    cmd.current_dir(dir).env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", identity)
         .env("TIG_AUTHOR_NAME", "owner").env("TIG_AUTHOR_EMAIL", "owner@example")
         .env("TIG_TIMESTAMP_MS", "1700000000000");
     cmd
@@ -81,7 +81,7 @@ fn seal_reveal_opens_same_history_and_retains_independent_env_privacy() {
     assert!(tig_private::publish::PublishState::decode(&published).unwrap().revealed.contains(&skeleton));
     assert!(tig_private::publish::PublishState::decode(&published).unwrap().ever_public.contains(&tig_core::RepoPath::new("fix.txt").unwrap()));
     assert!(tig_private::fetch::FetchState::decode(&fetched).unwrap().revealed.contains(&skeleton));
-    let signer = tig_private::keys::Identity::from_bytes(fs::read(&owner_id).unwrap().try_into().unwrap());
+    let signer = tig_private::keys::Identity::decrypt(&fs::read(&owner_id).unwrap(), b"tig test identity passphrase").unwrap();
     let head = remote.read_head().unwrap();
     let dropped = Manifest::signed_with_changes(after.remote, after.sequence + 1, after.refs,
         after.packs, after.changes, Default::default(), &signer).unwrap();

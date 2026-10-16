@@ -31,6 +31,7 @@ fn tig(dir: &Path, args: &[&str], paths: &[&Path]) -> Output {
         .args(paths)
         .env("TIG_AUTHOR_NAME", "importer")
         .env("TIG_AUTHOR_EMAIL", "importer@x")
+        .env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase")
         .env(
             "TIG_IDENTITY_FILE",
             dir.parent().unwrap().join("importer.id"),

@@ -34,7 +34,7 @@ fn command(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env("TIG_AUTHOR_NAME", "Conflict test")
         .env("TIG_AUTHOR_EMAIL", "conflict@example.com")
-        .env("TIG_IDENTITY_FILE", root.join(".tig/test-identity"))
+        .env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", root.join(".tig/test-identity"))
         .args(args)
         .output()
         .unwrap()

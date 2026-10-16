@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 
 fn command(dir: &Path, identity: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tig"));
-    command.current_dir(dir).env("TIG_IDENTITY_FILE", identity)
+    command.current_dir(dir).env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", identity)
         .env("TIG_AUTHOR_NAME", "tester").env("TIG_AUTHOR_EMAIL", "tester@example")
         .env("TIG_TIMESTAMP_MS", "1700000000000");
     command

@@ -16,7 +16,7 @@ fn tig(dir: &Path, name: &str, identity: &Path) -> Command {
         .env("TIG_AUTHOR_NAME", name)
         .env("TIG_AUTHOR_EMAIL", format!("{name}@example.com"))
         .env("TIG_TIMESTAMP_MS", "1700000000000")
-        .env("TIG_IDENTITY_FILE", identity);
+        .env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", identity);
     cmd
 }
 
@@ -71,8 +71,8 @@ fn token(stdout: &str) -> String {
 /// A server on 127.0.0.1 with an ephemeral port, owned by the identity in
 /// `owner_file`, storing into a directory remote under `root`.
 fn start_server(root: &Path, owner_file: &Path) -> (Server, String) {
-    let bytes: [u8; 64] = fs::read(owner_file).unwrap().try_into().unwrap();
-    let owner = Identity::from_bytes(bytes).public();
+    let bytes = fs::read(owner_file).unwrap();
+    let owner = Identity::decrypt(&bytes, b"tig test identity passphrase").unwrap().public();
     let dir = root.join("server");
     init_server_dir(&dir, &owner).unwrap();
     let server = serve_dir(

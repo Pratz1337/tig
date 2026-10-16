@@ -36,6 +36,10 @@ pub const OBJECT_AAD: &[u8] = b"tig sealed object v1";
 
 /// Display fingerprint of an encryption key and signing key, in that order.
 pub const IDENTITY_FINGERPRINT: &str = "tig identity fingerprint v1";
+/// Associated data for passphrase-protected identity files.
+pub const IDENTITY_FILE_AAD: &[u8] = b"tig identity file v1";
+/// Application context for current-user Windows identity protection.
+pub const IDENTITY_WINDOWS_ENTROPY: &[u8] = b"tig identity DPAPI v1";
 /// Commits to an epoch key and its length-prefixed group/epoch context.
 pub const EPOCH_KEY_COMMITMENT: &str = "tig epoch key commitment v1";
 /// Prefix of the canonical encoding signed by an epoch grant's owner.
