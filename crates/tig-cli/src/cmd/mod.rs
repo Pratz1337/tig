@@ -24,6 +24,7 @@ mod op;
 mod publish;
 mod remote;
 mod role;
+mod env;
 mod resolve;
 mod revoke;
 mod settings;
@@ -49,13 +50,19 @@ use crate::wc::WorkingCopy;
 #[derive(Debug)]
 pub struct CliError {
     message: String,
+    child_exit: Option<i32>,
 }
 
 impl CliError {
     pub(super) fn msg(message: impl Into<String>) -> Self {
         CliError {
             message: message.into(),
+            child_exit: None,
         }
+    }
+
+    pub fn child_exit_code(&self) -> Option<i32> {
+        self.child_exit
     }
 }
 
@@ -325,6 +332,15 @@ pub fn run() -> Result<()> {
         Cmd::Identity { show } => identity::run(show)?,
         Cmd::Remote { action } => remote::run(repository, action)?,
         Cmd::Role(args) => role::run(repository, args)?,
+        Cmd::Env(args) => {
+            let status = env::run(repository, args)?;
+            if !status.success() {
+                return Err(CliError {
+                    message: String::new(),
+                    child_exit: Some(status.code().unwrap_or(1)),
+                });
+            }
+        }
         Cmd::Seal { remote, bookmark, revision, role } => changes::seal(repository, remote, bookmark, revision, role)?,
         Cmd::Reveal { remote, revision } => changes::reveal(repository, remote, revision)?,
         Cmd::Publish {
@@ -375,6 +391,8 @@ struct Cli {
 enum Cmd {
     /// Manage ranked roles and their access groups
     Role(role::Args),
+    /// Run a command with secrets authorized for a role
+    Env(env::Args),
     /// Publish an opaque change that can be opened in place
     Seal {
         remote: String,
