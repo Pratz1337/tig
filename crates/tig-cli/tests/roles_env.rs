@@ -101,3 +101,76 @@ fn transfer_proposal_is_public_successor_accepts_and_former_owner_loses_authorit
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("role"));
 }
+
+#[test]
+fn role_create_grant_and_revoke_rotate_keys_and_limit_reader_visibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner_id = temp.path().join("owner.id");
+    let reader_id = temp.path().join("reader.id");
+    let owner = temp.path().join("owner");
+    let reader = temp.path().join("reader");
+    let remote_path = temp.path().join("remote");
+    let reader_token = token(temp.path(), &reader_id);
+    ok(command(temp.path(), &owner_id).arg("init").arg(&owner));
+    fs::write(owner.join("readme"), "public").unwrap();
+    fs::write(owner.join(".env"), "owner-only-default-secret").unwrap();
+    ok(command(&owner, &owner_id).args(["remote", "add", "origin"]).arg(&remote_path));
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&owner, &owner_id).args(["role", "create", "billing", "--rank", "1"]));
+    fs::create_dir_all(owner.join("packages/billing")).unwrap();
+    fs::create_dir_all(owner.join("packages/payroll")).unwrap();
+    fs::write(owner.join("packages/billing/report"), "billing version one").unwrap();
+    fs::write(owner.join("packages/payroll/report"), "payroll owner only").unwrap();
+    fs::write(owner.join(".private"), "packages/billing/ @billing\npackages/payroll/\n").unwrap();
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&owner, &owner_id).args(["role", "grant", "billing", &reader_token]));
+    ok(command(temp.path(), &reader_id).arg("clone").arg(&remote_path).arg(&reader));
+    ok(command(&reader, &reader_id).args(["edit", "origin/main"]));
+    assert_eq!(fs::read_to_string(reader.join("packages/billing/report")).unwrap(), "billing version one");
+    assert!(!reader.join("packages/payroll/report").exists());
+    assert!(!reader.join(".env").exists());
+    let remote = tig_private::remote::DirRemote::open(&remote_path).unwrap();
+    let before = tig_private::keyring::Keyring::decode(remote.read_head().unwrap().keyring.as_deref().unwrap()).unwrap();
+    ok(command(&owner, &owner_id).args(["role", "revoke", "billing", &reader_token]));
+    let after = tig_private::keyring::Keyring::decode(remote.read_head().unwrap().keyring.as_deref().unwrap()).unwrap();
+    let epoch = after.head.epochs["billing"];
+    assert_eq!(epoch, before.head.epochs["billing"] + 1);
+    let reader_identity = tig_cli::ui::parse_identity_token(&reader_token).unwrap();
+    assert!(!after.grants.iter().any(|grant| grant.context.group == "billing" && grant.context.epoch == epoch && grant.recipient == reader_identity));
+    assert!(after.grants.iter().any(|grant| grant.context.group == "billing" && grant.context.epoch == epoch && grant.recipient == after.owner));
+    ok(command(&owner, &owner_id).args(["new", "-m", "after revocation"]));
+    fs::write(owner.join("packages/billing/report"), "billing version two").unwrap();
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&reader, &reader_id).args(["fetch", "origin"]));
+    let denied = command(&reader, &reader_id).args(["cat", "packages/billing/report", "-r", "origin/main"]).output().unwrap();
+    assert!(!denied.status.success());
+    assert!(!String::from_utf8_lossy(&denied.stdout).contains("billing version two"));
+}
+
+#[test]
+fn role_tag_activates_policy_without_migrating_existing_members() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner_id = temp.path().join("owner.id");
+    let member_id = temp.path().join("member.id");
+    let owner = temp.path().join("owner");
+    let member = temp.path().join("member");
+    let remote = temp.path().join("remote");
+    let member_token = token(temp.path(), &member_id);
+    ok(command(temp.path(), &owner_id).arg("init").arg(&owner));
+    fs::write(owner.join("readme"), "public").unwrap();
+    fs::write(owner.join(".env"), "existing private").unwrap();
+    ok(command(&owner, &owner_id).args(["remote", "add", "origin"]).arg(&remote));
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&owner, &owner_id).args(["grant", "origin", &member_token]));
+    ok(command(temp.path(), &member_id).arg("clone").arg(&remote).arg(&member));
+    fs::create_dir_all(owner.join("packages/billing")).unwrap();
+    fs::write(owner.join("packages/billing/report"), "billing secret").unwrap();
+    fs::write(owner.join(".private"), "packages/billing/ @billing\n").unwrap();
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&member, &member_id).args(["fetch", "origin"]));
+    ok(command(&member, &member_id).args(["edit", "origin/main"]));
+    assert_eq!(fs::read_to_string(member.join(".env")).unwrap(), "existing private");
+    assert!(!member.join("packages/billing/report").exists());
+    fs::write(member.join("member-public"), "still allowed to publish").unwrap();
+    ok(command(&member, &member_id).args(["publish", "origin", "-b", "member"]));
+}

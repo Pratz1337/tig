@@ -618,6 +618,10 @@ fn check_pack_epoch(keyring: Option<&[u8]>, group: &str, epoch: u64) -> Result<(
         Some(current) => Err(RemoteError::Invalid(format!(
             "pack is for epoch {epoch} of {group}, but the remote is at epoch {current}; publish again"
         ))),
+        // Stage a new group's ciphertext before its policy and manifest
+        // become visible together. Existing groups still require their
+        // current epoch, so revoked epochs remain refused.
+        None if epoch == 1 => Ok(()),
         None => Err(RemoteError::Invalid(format!(
             "the remote keyring has no group {group}"
         ))),

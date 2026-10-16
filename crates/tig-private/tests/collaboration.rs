@@ -2404,3 +2404,32 @@ fn collect_packs(root: &Path, out: &mut Vec<Vec<u8>>) {
         }
     }
 }
+
+
+#[test]
+fn role_initialization_rebuilds_ciphertext_after_a_public_only_head_race() {
+    let mut repo = repo();
+    let base = save(&mut repo, &[("public", b"base")]);
+    let temp = tempfile::tempdir().unwrap();
+    let remote = DirRemote::create(temp.path(), [74; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let keys = owner_keys(&remote, &owner);
+    let mut state = PublishState::new();
+    publish_rev(&repo, &remote, &owner, Some(&keys), &mut state, &FetchState::new(), "main", base, false).unwrap();
+    let tip = save_child(&mut repo, &[(".private", b"billing/ @billing\n"), ("billing/report", b"secret after role initialization")]);
+    let race = Intercept {
+        remote: &remote, reply: 0,
+        before_commit: std::sync::Mutex::new(Some(Box::new(|| {
+            let head = remote.read_head().unwrap();
+            let old = Manifest::decode(head.manifest.as_deref().unwrap()).unwrap();
+            let next = Manifest::signed(remote.remote_id(), old.sequence + 1, old.refs, old.packs, &owner).unwrap().encode().unwrap();
+            assert!(matches!(remote.commit_head(&head.version(), None, Some(&next)).unwrap(), CommitOutcome::Committed(_)));
+        }))),
+    };
+    publish(repo.store().as_ref(), &race, &owner, Some(&keys), &mut state, &FetchState::new(), "main", tip, &PublishOptions::default()).unwrap();
+    let fresh = tig_core::MemoryStore::new();
+    let report = fetch(&remote, &fresh, Some(&owner), &mut FetchState::new(), &PublishState::new()).unwrap();
+    let revision = fresh.get_revision(&report.refs["main"]).unwrap();
+    let leaf = tig_core::treeops::lookup(&fresh, &revision.tree, &RepoPath::new("billing/report").unwrap()).unwrap().unwrap();
+    assert_eq!(fresh.get_blob(&leaf.id()).unwrap(), b"secret after role initialization");
+}

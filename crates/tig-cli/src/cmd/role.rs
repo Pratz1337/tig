@@ -13,7 +13,9 @@ use tig_private::roles::{self, PolicyLog, Role, TransitionBody};
 use super::{identity, remote, workspace, CliError, Result};
 
 #[derive(ClapArgs)]
+#[command(subcommand_precedence_over_arg = true)]
 pub(super) struct Args {
+    #[arg(default_value = "origin")]
     pub remote: String,
     #[command(subcommand)]
     pub action: Action,
@@ -21,6 +23,14 @@ pub(super) struct Args {
 
 #[derive(Subcommand)]
 pub(super) enum Action {
+    /// Create a read role; the owner receives initial key custody.
+    Create {
+        name: String,
+        #[arg(long, default_value_t = 1)] rank: u32,
+        #[arg(long, value_delimiter = ',')] permissions: Vec<String>,
+    },
+    /// Remove a role assignment and rotate its keys atomically.
+    Revoke { role: String, token: String },
     /// Create or replace a role. Permissions are comma-separated names.
     Set {
         name: String,
@@ -118,6 +128,25 @@ pub(super) fn run(repository: Option<&Path>, args: Args) -> Result<()> {
             return Err(tig_private::access::AccessError::Invalid("transfer proposal was superseded".into()));
         }
         let counter = current.head.counter.checked_add(1).ok_or_else(|| tig_private::access::AccessError::Invalid("counter overflow".into()))?;
+        let ready = match &args.action {
+            Action::Create { name, rank, permissions } => {
+                let mut next = current.clone();
+                next.create_role(&actor, name, *rank, permission_bits(permissions).map_err(|e| tig_private::access::AccessError::Invalid(e.to_string()))?)?;
+                Some(next)
+            }
+            Action::Revoke { role, token } => {
+                let mut next = current.clone();
+                next.revoke_role(&actor, role, &parse_identity(token).map_err(|e| tig_private::access::AccessError::Invalid(e.to_string()))?)?;
+                Some(next)
+            }
+            Action::Grant { group, token } if current.policy_snapshot()?.roles.contains_key(group) => {
+                let mut next = current.clone();
+                next.grant_role(&actor, group, &parse_identity(token).map_err(|e| tig_private::access::AccessError::Invalid(e.to_string()))?)?;
+                Some(next)
+            }
+            _ => None,
+        };
+        let next = if let Some(next) = ready { next } else {
         let mut bodies = Vec::new();
         let mut grants = Vec::new();
         match &args.action {
@@ -165,6 +194,8 @@ pub(super) fn run(repository: Option<&Path>, args: Args) -> Result<()> {
         let transitions = proposed.clone().unwrap_or_else(|| bodies.into_iter().map(|body| body.sign(current.remote, &pin, counter, &actor)).collect());
         let mut next = current.clone();
         next.commit_policy(&actor, transitions, grants)?;
+        next
+        };
         let raw_manifest = transport.read_head()?.manifest;
         let manifest = if let Some(raw) = raw_manifest {
             let previous = Manifest::decode(&raw)?;

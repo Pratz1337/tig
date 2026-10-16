@@ -448,6 +448,11 @@ pub fn publish(
     let mut ever_public = state.ever_public.clone();
     let mut checked = None;
     let local_ids = local_of_public(state, fetched);
+    let known = published_ids(state, fetched);
+    let mut requested_roles = BTreeSet::new();
+    for id in parent_first(store, &[rev], |id| id == root_revision_id() || known.contains_key(&id))? {
+        requested_roles.extend(crate::project::rules_of(store, &store.get_revision(&id)?.tree)?.roles());
+    }
     // Rollback floors for this call. Local state moves only after a commit.
     let mut counter_floor = state.counter.max(fetched.counter);
     let mut policy_floor = None;
@@ -458,7 +463,7 @@ pub fn publish(
             Some(head) => head,
             None => remote.read_head()?,
         };
-        let session = open_session(
+        let mut session = open_session(
             remote.remote_id(),
             head.keyring.as_deref(),
             identity,
@@ -484,14 +489,22 @@ pub fn publish(
             return Err(PublishError::Invalid("the remote omitted a previously accepted reveal".into()));
         }
         if let Some(manifest) = &previous { revealed_floor.extend(manifest.reveals.keys().copied()); }
+        initialize_roles(&mut session, &requested_roles, identity, owner_keys)?;
+        // Proposed role keys are freshly random. A public-only CAS race can
+        // leave the remote keyring unchanged; its bytes alone cannot key the
+        // projection cache for this unpublished policy.
+        let projection_keyring = match &session.fresh {
+            Some(keyring) => Some(keyring.encode()?),
+            None => head.keyring.clone(),
+        };
         let reuse = prep.as_ref().is_some_and(|prep| {
-            prep.counter == session.counter && prep_keyring == head.keyring
+            prep.counter == session.counter && prep_keyring == projection_keyring
                 && prep_changes.as_ref().map(|(changes, reveals)| (changes, reveals))
                     == previous.as_ref().map(|manifest| (&manifest.changes, &manifest.reveals))
         });
         if !reuse {
             prep = Some(project(store, remote.public_store(), &session, state, fetched, rev, previous.as_ref())?);
-            prep_keyring = head.keyring.clone();
+            prep_keyring = projection_keyring;
             prep_changes = previous.as_ref().map(|manifest| (manifest.changes.clone(), manifest.reveals.clone()));
         }
         if let Some(manifest) = &previous {
@@ -1045,6 +1058,26 @@ fn read_manifest(
         )),
         None => Ok(None),
     }
+}
+
+// Build locally so policy activation and the new bookmark share one CAS.
+fn initialize_roles(session: &mut Session, names: &BTreeSet<String>, identity: &Identity, owner_keys: Option<&OwnerKeys>) -> Result<(), PublishError> {
+    let mut next = session.keyring.clone();
+    let mut changed = false;
+    for name in names {
+        if next.policy_snapshot()?.roles.contains_key(name) { continue; }
+        if next.policy_snapshot()?.current_owner != identity.public() {
+            return Err(PublishError::Invalid("the owner must initialize new roles".into()));
+        }
+        next.create_role(identity, name, 1, 0)?;
+        changed = true;
+    }
+    if changed {
+        let mut updated = open_session(next.remote, Some(&next.encode()?), identity, owner_keys, Some(session.pin), session.counter)?;
+        updated.fresh = Some(next);
+        *session = updated;
+    }
+    Ok(())
 }
 
 fn open_session(

@@ -397,6 +397,118 @@ impl Keyring {
         Ok(())
     }
 
+    /// Defines a read role and initializes its owner's key custody. Switching
+    /// from simple mode preserves existing members in the built-in role.
+    pub fn create_role(&mut self, actor: &Identity, name: &str, rank: u32, permissions: u32) -> Result<(), KeyringError> {
+        if name == PRIVATE_GROUP || self.policy_snapshot()?.roles.contains_key(name) {
+            return Err(KeyringError::Invalid("role already exists (private is built in)".into()));
+        }
+        let mut next = self.clone();
+        let owner = next.policy_snapshot()?.current_owner;
+        let mut definitions = Vec::new();
+        let mut assignments = Vec::new();
+        if next.policy.is_empty() {
+            definitions.push(TransitionBody::SetRole { name: PRIVATE_GROUP.into(), role: crate::roles::Role {
+                rank: 0, permissions: crate::roles::PUBLISH | crate::roles::EDIT_PRIVATE,
+                groups: BTreeSet::from([PRIVATE_GROUP.into()]),
+            }});
+            let epoch = next.current_epoch()?;
+            for member in Snapshot::current_holders(&next.grants, PRIVATE_GROUP, epoch) {
+                assignments.push(TransitionBody::Assign { member, role: PRIVATE_GROUP.into() });
+            }
+        }
+        definitions.push(TransitionBody::SetRole { name: name.into(), role: crate::roles::Role {
+            rank, permissions, groups: BTreeSet::from([name.into()]),
+        }});
+        next.role_batch(actor, definitions, Vec::new())?;
+        if actor.public() == owner {
+            assignments.push(TransitionBody::Assign { member: owner, role: name.into() });
+        }
+        if !assignments.is_empty() { next.role_batch(actor, assignments, Vec::new())?; }
+        if actor.public() == owner { next.grant_role(actor, name, &owner)?; }
+        *self = next;
+        Ok(())
+    }
+
+    /// Assigns visibility and wraps every applicable group in one proposed
+    /// keyring. Existing key custody is required before wrapping an epoch.
+    pub fn grant_role(&mut self, actor: &Identity, name: &str, member: &PublicIdentity) -> Result<(), KeyringError> {
+        let role = self.policy_snapshot()?.roles.get(name).cloned()
+            .ok_or_else(|| KeyringError::Invalid(format!("unknown role `{name}`")))?;
+        let mut next = self.clone();
+        if !next.policy_snapshot()?.assignments.get(member).is_some_and(|roles| roles.contains(name)) {
+            next.role_batch(actor, vec![TransitionBody::Assign { member: *member, role: name.into() }], Vec::new())?;
+        }
+        let mut groups = role.groups.clone();
+        groups.extend(next.head.epochs.keys().filter(|group| group.split('+').any(|part| role.groups.contains(part))).cloned());
+        let mut bodies = Vec::new();
+        let mut grants = Vec::new();
+        let verified = next.verify(&next.owner.signing, 0)?;
+        for group in groups {
+            if !verified.reads_now(&actor.public(), &group) { return Err(KeyringError::NotMember); }
+            let (epoch, key, recipients) = if let Some(epoch) = verified.current_epoch_of(&group) {
+                let key = verified.current_key(&group, actor)?;
+                (epoch, key, BTreeSet::from([*member]))
+            } else {
+                let key = EpochKey::generate(GroupEpoch { remote: next.remote, group: group.clone(), epoch: 1 })?;
+                bodies.push(TransitionBody::AdvanceEpoch { group: group.clone(), epoch: 1 });
+                (1, key, BTreeSet::from([actor.public(), *member]))
+            };
+            for recipient in recipients {
+                if next.grants.iter().any(|g| g.context.group == group && g.context.epoch == epoch && g.recipient == recipient) { continue; }
+                let issued = grant(&key, &recipient, actor)?;
+                bodies.push(TransitionBody::AuthorizeGrant { group: group.clone(), epoch, recipient, grant_signature: issued.signature });
+                grants.push(issued);
+            }
+        }
+        if !bodies.is_empty() { next.role_batch(actor, bodies, grants)?; }
+        *self = next;
+        Ok(())
+    }
+
+    /// Removes the assignment, rotates affected groups, and rewraps only
+    /// remaining readers. All batches are committed by one remote CAS.
+    pub fn revoke_role(&mut self, actor: &Identity, name: &str, member: &PublicIdentity) -> Result<(), KeyringError> {
+        let role = self.policy_snapshot()?.roles.get(name).cloned()
+            .ok_or_else(|| KeyringError::Invalid(format!("unknown role `{name}`")))?;
+        if !self.policy_snapshot()?.assignments.get(member).is_some_and(|roles| roles.contains(name)) {
+            return Err(KeyringError::NotMember);
+        }
+        let old = self.verify(&self.owner.signing, 0)?;
+        let groups: Vec<_> = self.head.epochs.keys()
+            .filter(|group| group.split('+').any(|part| role.groups.contains(part))).cloned().collect();
+        // Verify custody before proposing any visibility change.
+        for group in &groups { let _key = old.current_key(group, actor)?; }
+        let mut next = self.clone();
+        next.role_batch(actor, vec![TransitionBody::Unassign { member: *member, role: name.into() }], Vec::new())?;
+        let snapshot = next.policy_snapshot()?;
+        let mut bodies = Vec::new();
+        let mut grants = Vec::new();
+        for group in groups {
+            let previous = next.head.epochs[&group];
+            let epoch = previous.checked_add(1).ok_or_else(|| KeyringError::Invalid("epoch overflow".into()))?;
+            let key = EpochKey::generate(GroupEpoch { remote: next.remote, group: group.clone(), epoch })?;
+            bodies.push(TransitionBody::AdvanceEpoch { group: group.clone(), epoch });
+            let holders = Snapshot::current_holders(&next.grants, &group, previous);
+            let mut candidates: BTreeSet<_> = snapshot.assignments.keys().copied().collect();
+            candidates.extend(holders.iter().copied());
+            for recipient in candidates.into_iter().filter(|member| snapshot.may_read(member, &group, &holders)) {
+                let issued = grant(&key, &recipient, actor)?;
+                bodies.push(TransitionBody::AuthorizeGrant { group: group.clone(), epoch, recipient, grant_signature: issued.signature });
+                grants.push(issued);
+            }
+        }
+        if !bodies.is_empty() { next.role_batch(actor, bodies, grants)?; }
+        *self = next;
+        Ok(())
+    }
+
+    fn role_batch(&mut self, actor: &Identity, bodies: Vec<TransitionBody>, grants: Vec<Grant>) -> Result<(), KeyringError> {
+        let counter = self.head.counter.checked_add(1).ok_or_else(|| KeyringError::Invalid("counter overflow".into()))?;
+        let transitions = bodies.into_iter().map(|body| body.sign(self.remote, &self.owner.signing, counter, actor)).collect();
+        self.commit_policy(actor, transitions, grants)
+    }
+
     pub fn policy_checkpoint(&self) -> Option<PolicyCheckpoint> {
         if self.policy.is_empty() { return None; }
         Some(PolicyCheckpoint {
