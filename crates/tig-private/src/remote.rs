@@ -462,17 +462,19 @@ impl DirRemote {
             };
             let pending = encode_pending(new_keyring.as_deref(), new_manifest.as_deref())?;
             atomic_write(guard.root, &guard.root.join(PENDING_NAME), &pending, true)?;
+            #[cfg(test)]
+            crash_pause(guard.root, "after-pending");
             install_part(guard.root, &guard.root.join("keyring"), new_keyring.as_deref())?;
+            #[cfg(test)]
+            crash_pause(guard.root, "after-keyring");
             install_part(
                 guard.root,
                 &guard.root.join("manifest"),
                 new_manifest.as_deref(),
             )?;
-            match fs::remove_file(guard.root.join(PENDING_NAME)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            #[cfg(test)]
+            crash_pause(guard.root, "after-manifest");
+            remove_pending(&guard.root.join(PENDING_NAME))?;
             Ok(CommitOutcome::Committed(HeadVersion::of(
                 new_keyring.as_deref(),
                 new_manifest.as_deref(),
@@ -618,9 +620,8 @@ fn check_pack_epoch(keyring: Option<&[u8]>, group: &str, epoch: u64) -> Result<(
         Some(current) => Err(RemoteError::Invalid(format!(
             "pack is for epoch {epoch} of {group}, but the remote is at epoch {current}; publish again"
         ))),
-        // Stage a new group's ciphertext before its policy and manifest
-        // become visible together. Existing groups still require their
-        // current epoch, so revoked epochs remain refused.
+        // New groups stage epoch-one ciphertext before their policy/manifest CAS.
+        // Existing groups still require the current epoch.
         None if epoch == 1 => Ok(()),
         None => Err(RemoteError::Invalid(format!(
             "the remote keyring has no group {group}"
@@ -664,7 +665,7 @@ enum Pending {
 
 fn remove_pending(path: &Path) -> Result<(), RemoteError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(tig_core::durability::sync_parent(path)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -674,7 +675,7 @@ fn install_part(root: &Path, dest: &Path, bytes: Option<&[u8]>) -> Result<(), Re
     match bytes {
         Some(bytes) => atomic_write(root, dest, bytes, true),
         None => match fs::remove_file(dest) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(tig_core::durability::sync_parent(dest)?),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         },
@@ -951,6 +952,8 @@ fn atomic_write(root: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result
         fs::create_dir_all(parent)?;
     }
     let tmp = write_temp(root, bytes)?;
+    #[cfg(test)]
+    if dest.file_name().is_some_and(|name| name == PENDING_NAME) { crash_pause(root, "before-pending-rename"); }
     publish(&tmp.0, dest, bytes, replace)
 }
 
@@ -991,7 +994,7 @@ fn publish(tmp: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result<(), R
             return same_bytes(dest, bytes);
         }
         match fs::rename(tmp, dest) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(tig_core::durability::sync_parent(dest)?),
             Err(error) => {
                 if !replace && dest.try_exists()? {
                     return same_bytes(dest, bytes);
@@ -1020,8 +1023,57 @@ fn same_bytes(dest: &Path, bytes: &[u8]) -> Result<(), RemoteError> {
 }
 
 #[cfg(test)]
+fn crash_pause(root: &Path, phase: &str) {
+    if std::env::var_os("TIG_TEST_REMOTE_DIR").is_some_and(|path| Path::new(&path) == root)
+        && std::env::var("TIG_TEST_REMOTE_PHASE").ok().as_deref() == Some(phase)
+    {
+        println!("TIG_REMOTE_WRITE_READY");
+        std::io::stdout().flush().unwrap();
+        loop { std::thread::park(); }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_mid_remote_write_recovers_a_complete_keyring_and_manifest() {
+        if let Some(root) = std::env::var_os("TIG_TEST_REMOTE_DIR") {
+            let remote = DirRemote::open(root).unwrap();
+            remote.commit_head(&remote.read_head().unwrap().version(), Some(b"new keyring"), Some(b"new manifest")).unwrap();
+            panic!("writer was not interrupted");
+        }
+        for phase in ["before-pending-rename", "after-pending", "after-keyring", "after-manifest"] {
+            let temp = tempfile::tempdir().unwrap();
+            let remote = DirRemote::create(temp.path(), [9; 16]).unwrap();
+            remote.commit_head(&remote.read_head().unwrap().version(), Some(b"old keyring"), Some(b"old manifest")).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "remote::tests::kill_mid_remote_write_recovers_a_complete_keyring_and_manifest", "--nocapture"])
+                .env("TIG_TEST_REMOTE_DIR", temp.path()).env("TIG_TEST_REMOTE_PHASE", phase)
+                .stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+                    if line == "TIG_REMOTE_WRITE_READY" { let _ = send.send(()); break; }
+                }
+            });
+            let ready = receive.recv_timeout(Duration::from_secs(15));
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            ready.expect("child did not reach the transaction boundary");
+            assert!(!status.success());
+            let expected = if phase == "before-pending-rename" { (b"old keyring".to_vec(), b"old manifest".to_vec()) }
+                else { (b"new keyring".to_vec(), b"new manifest".to_vec()) };
+            let recovered = remote.read_head().unwrap();
+            assert_eq!((recovered.keyring, recovered.manifest), (Some(expected.0), Some(expected.1)), "{phase}");
+            assert!(!temp.path().join(PENDING_NAME).exists());
+            assert!(matches!(remote.commit_head(&remote.read_head().unwrap().version(), Some(b"next keyring"), Some(b"next manifest")).unwrap(), CommitOutcome::Committed(_)));
+        }
+    }
+
 
     #[test]
     fn listed_packs_have_an_aggregate_byte_limit() {

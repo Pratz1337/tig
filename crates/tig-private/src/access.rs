@@ -487,7 +487,7 @@ fn save_state(dir: &Path, state: &PublishState) -> Result<(), AccessError> {
 
 fn clear_pending(dir: &Path) -> Result<(), AccessError> {
     match fs::remove_file(dir.join(PENDING_FILE)) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(tig_core::durability::sync_parent(&dir.join(PENDING_FILE))?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -518,6 +518,7 @@ fn write_file(dest: &Path, bytes: &[u8], secret: bool) -> Result<(), AccessError
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, dest)?;
+        tig_core::durability::sync_parent(dest)?;
         Ok(())
     })();
     if write.is_err() {

@@ -5,6 +5,7 @@
 
 pub mod blob;
 pub mod domain;
+pub mod durability;
 pub mod conflict;
 pub mod encode;
 pub mod error;

@@ -125,21 +125,22 @@ impl FileOpHead {
             .or(durable_head)
     }
 
-    fn lock(&self) -> Result<LockGuard<'_>> {
+    fn lock(&self) -> Result<LockGuard> {
+        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&self.lock)?;
         let start = Instant::now();
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&self.lock) {
-                Ok(_) => return Ok(LockGuard(&self.lock)),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            match file.try_lock() {
+                Ok(()) => return Ok(LockGuard(file)),
+                Err(fs::TryLockError::WouldBlock) => {
                     if start.elapsed() > LOCK_TIMEOUT {
                         return Err(Error::Invalid(format!(
-                            "timed out waiting for {}; if no other tig process is running, delete it",
+                            "timed out waiting for {}; another tig process is using this repository",
                             self.lock.display()
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(e) => return Err(e.into()),
+                Err(fs::TryLockError::Error(e)) => return Err(e.into()),
             }
         }
     }
@@ -158,7 +159,14 @@ impl FileOpHead {
             if sync {
                 f.sync_all()?;
             }
-            Ok(fs::rename(&tmp, dest)?)
+            drop(f);
+            #[cfg(test)]
+            crash_pause(dest, "before-rename");
+            fs::rename(&tmp, dest)?;
+            #[cfg(test)]
+            crash_pause(dest, "after-rename");
+            if sync { crate::durability::sync_parent(dest)?; }
+            Ok(())
         })();
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
@@ -181,11 +189,22 @@ impl FileOpHead {
     }
 }
 
-struct LockGuard<'a>(&'a Path);
+#[cfg(test)]
+fn crash_pause(dest: &Path, phase: &str) {
+    if std::env::var_os("TIG_TEST_HEAD_FILE").is_some_and(|path| Path::new(&path) == dest)
+        && std::env::var("TIG_TEST_HEAD_PHASE").ok().as_deref() == Some(phase)
+    {
+        println!("TIG_HEAD_WRITE_READY");
+        std::io::stdout().flush().unwrap();
+        loop { std::thread::park(); }
+    }
+}
 
-impl Drop for LockGuard<'_> {
+struct LockGuard(fs::File);
+
+impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -262,6 +281,46 @@ impl OpHeadStore for FileOpHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_mid_head_write_keeps_complete_head_and_releases_lock() {
+        let old = ObjectId([1; 32]);
+        let new = ObjectId([2; 32]);
+        if let Some(path) = std::env::var_os("TIG_TEST_HEAD_FILE") {
+            let path = PathBuf::from(path);
+            FileOpHead::new(path.parent().unwrap()).compare_and_set(Some(old), new).unwrap();
+            panic!("writer was not interrupted");
+        }
+        for phase in ["before-rename", "after-rename"] {
+            let temp = tempfile::tempdir().unwrap();
+            let head = FileOpHead::new(temp.path());
+            assert!(head.compare_and_set(None, old).unwrap());
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ophead::tests::kill_mid_head_write_keeps_complete_head_and_releases_lock", "--nocapture"])
+                .env("TIG_TEST_HEAD_FILE", temp.path().join("op_head"))
+                .env("TIG_TEST_HEAD_PHASE", phase)
+                .stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+                    if line == "TIG_HEAD_WRITE_READY" { let _ = send.send(()); break; }
+                }
+            });
+            let ready = receive.recv_timeout(Duration::from_secs(15));
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            ready.expect("child did not reach the write boundary");
+            assert!(!status.success());
+            let expected = if phase == "before-rename" { old } else { new };
+            assert_eq!(head.get().unwrap(), Some(expected));
+            let next = ObjectId([3; 32]);
+            assert!(head.compare_and_set(Some(expected), next).unwrap(), "a killed writer must release its lock");
+            assert_eq!(head.get().unwrap(), Some(next));
+        }
+    }
+
 
     fn check(h: &dyn OpHeadStore) {
         let a = ObjectId([1; 32]);
