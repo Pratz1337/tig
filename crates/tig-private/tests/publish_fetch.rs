@@ -2,7 +2,7 @@
 //! bytes, member rebuild, outsider seals, the built-in floor, refusals,
 //! incremental republish, revocation, rollback, and a substituted owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -335,7 +335,7 @@ fn alice_publishes_secrets_bob_reads_them_carol_does_not() {
         alice_report.newly_pinned.as_deref(),
         Some(alice.public().fingerprint().as_str())
     );
-    assert_eq!(alice.public().fingerprint().len(), 16);
+    assert_eq!(alice.public().fingerprint().len(), 32);
     let alice_got = alice_store.get_revision(&tip(&alice_report)).unwrap();
     assert_eq!(alice_got.tree, alice_tree);
     assert_eq!(alice_report.unsealed, 2);
@@ -1261,13 +1261,20 @@ fn authenticated_seal_with_a_missing_target_is_refused() {
     let mut pack = PackBuilder::new(key);
     pack.add_sealed(sid, p(".env"), EntryKind::File, missing)
         .unwrap();
-    remote.put_pack(&pack.finish().unwrap()).unwrap();
+    let pack_bytes = pack.finish().unwrap();
+    remote.put_pack(&pack_bytes).unwrap();
     let tree = Tree::new(vec![TreeEntry::sealed(".env", sid).unwrap()]).unwrap();
     let tree_id = remote.public_store().put(&Object::Tree(tree)).unwrap();
     let mut rev = tig_core::repo::root_revision();
     rev.tree = tree_id;
     let id = remote.public_store().put(&Object::Revision(rev)).unwrap();
-    sign_main(&remote, &owner, id);
+    let manifest = tig_private::manifest::Manifest::signed(remote.remote_id(), 1,
+        BTreeMap::from([("main".into(), id)]),
+        BTreeMap::from([(tig_private::manifest::pack_id(&pack_bytes), tig_private::manifest::PackEntry {
+            group: "private".into(), epoch: 1, sealed: BTreeSet::from([sid]),
+        })]), &owner).unwrap();
+    let head = remote.read_head().unwrap();
+    remote.commit_head(&head.version(), None, Some(&manifest.encode().unwrap())).unwrap();
     let mut state = FetchState::new();
     let err = fetch(&remote, &MemoryStore::new(), Some(&owner), &mut state, &PublishState::new()).unwrap_err();
     assert!(err.to_string().contains("sealed target"), "{err}");

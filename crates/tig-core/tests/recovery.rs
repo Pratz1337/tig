@@ -6,7 +6,7 @@ use tig_core::object::{EntryKind, Object, Tree, TreeEntry};
 use tig_core::ophead::{FileOpHead, OpHeadStore};
 use tig_core::repo::{Repo, Settings, DEFAULT_WORKSPACE};
 use tig_core::seal::SealedId;
-use tig_core::store::{DiskStore, StoreExt};
+use tig_core::store::{DiskStore, Store, StoreExt};
 use tig_core::workspace::Workspace;
 use tig_core::{ObjectId, RepoPath};
 
@@ -80,6 +80,36 @@ fn recovery_checks_conflict_objects_sides_trees_and_drafts() {
         };
         f.remove(id);
         assert!(f.repo.recover().unwrap(), "missing {missing} must invalidate the view");
+        assert_eq!(f.repo.op_id(), before);
+    }
+}
+
+#[test]
+fn recovery_checks_chunk_lengths_even_when_blob_was_already_seen_as_a_file() {
+    use tig_core::encode::Writer;
+    use tig_core::object::{hash_object, ObjectKind};
+    for manifest_first in [true, false] {
+        let mut f = Fixture::new();
+        let before = f.repo.op_id();
+        let first = f.store.put_blob(&vec![7; tig_core::blob::CHUNK_LEN]).unwrap();
+        let bad_tail = f.store.put_blob(&vec![8; tig_core::blob::CHUNK_LEN]).unwrap();
+        let mut body = Writer::new();
+        body.u8(1); body.varint(tig_core::blob::CHUNK_LEN as u64 + 1); body.varint(2);
+        body.id(&first); body.varint(tig_core::blob::CHUNK_LEN as u64);
+        body.id(&bad_tail); body.varint(1);
+        let body = body.finish();
+        let manifest = hash_object(ObjectKind::ChunkedBlob, &body);
+        f.store.put_raw(&manifest, ObjectKind::ChunkedBlob, &body).unwrap();
+        let (manifest_name, plain_name) = if manifest_first { ("z_manifest", "a_plain") } else { ("a_manifest", "z_plain") };
+        let tree = f.store.put(&Object::Tree(Tree::new(vec![
+            TreeEntry::new(manifest_name, EntryKind::File, manifest).unwrap(),
+            TreeEntry::new(plain_name, EntryKind::File, bad_tail).unwrap(),
+        ]).unwrap())).unwrap();
+        let working = f.repo.working_revision(DEFAULT_WORKSPACE).unwrap();
+        let mut tx = f.repo.start("invalid chunk length");
+        tx.rewrite(working, |rev| rev.tree = tree).unwrap();
+        f.repo.commit(tx).unwrap();
+        assert!(f.repo.recover().unwrap(), "invalid view must be rejected in either traversal order");
         assert_eq!(f.repo.op_id(), before);
     }
 }

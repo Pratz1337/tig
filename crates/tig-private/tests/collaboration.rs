@@ -616,6 +616,87 @@ fn publish_retry_rechecks_the_new_bookmark_and_keeps_local_state() {
 }
 
 #[test]
+fn publish_retry_rechecks_new_public_paths() {
+    for acknowledge_leaked in [false, true] {
+        let mut repo = repo();
+        let base = save(&mut repo, &[("public", b"base")]);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = DirRemote::create(dir.path(), [90; 16]).unwrap();
+        let owner = Identity::generate().unwrap();
+        let keys = owner_keys(&remote, &owner);
+        let mut state = PublishState::new();
+        publish_rev(
+            &repo,
+            &remote,
+            &owner,
+            Some(&keys),
+            &mut state,
+            &FetchState::new(),
+            "main",
+            base,
+            false,
+        )
+        .unwrap();
+        let ours = save_child(
+            &mut repo,
+            &[(".private", b"secrets/\n"), ("secrets/token", b"ours")],
+        );
+        let theirs = on_top(&mut repo, base, &[("secrets/token", b"exposed")]);
+        let before = state.clone();
+        let race = Intercept {
+            remote: &remote,
+            reply: 0,
+            before_commit: std::sync::Mutex::new(Some(Box::new(|| {
+                let mut competing = before.clone();
+                publish_rev(
+                    &repo,
+                    &remote,
+                    &owner,
+                    Some(&keys),
+                    &mut competing,
+                    &FetchState::new(),
+                    "side",
+                    theirs,
+                    false,
+                )
+                .unwrap();
+            }))),
+        };
+        let result = publish(
+            repo.store().as_ref(),
+            &race,
+            &owner,
+            Some(&keys),
+            &mut state,
+            &FetchState::new(),
+            "main",
+            ours,
+            &PublishOptions {
+                acknowledge_leaked,
+                ..PublishOptions::default()
+            },
+        );
+        let path = RepoPath::new("secrets/token").unwrap();
+        if acknowledge_leaked {
+            let report = result.unwrap();
+            assert!(report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("secrets/token")));
+            assert!(state.ever_public.contains(&path));
+            assert_eq!(manifest(&remote).refs["main"], state.revisions[&ours]);
+        } else {
+            assert!(
+                matches!(result, Err(PublishError::AlreadyLeaked { paths }) if paths == vec![path])
+            );
+            assert_eq!(state, before);
+            assert_eq!(manifest(&remote).refs["main"], before.revisions[&base]);
+        }
+        assert!(manifest(&remote).refs.contains_key("side"));
+    }
+}
+
+#[test]
 fn busy_publish_keeps_local_state_unchanged() {
     let mut repo = repo();
     let rev = save(&mut repo, &[("public", b"base")]);
@@ -1555,6 +1636,33 @@ fn owner_keys(remote: &DirRemote, owner: &Identity) -> OwnerKeys {
         .1
 }
 
+/// Four writers publish three times each, so one call can lose to nine
+/// competing commits. Retry a bounded Busy once, preserving its local state.
+#[allow(clippy::too_many_arguments)]
+fn publish_contended(
+    repo: &Repo,
+    remote: &DirRemote,
+    identity: &Identity,
+    keys: Option<&OwnerKeys>,
+    state: &mut PublishState,
+    fetched: &FetchState,
+    bookmark: &str,
+    rev: ObjectId,
+) -> Result<usize, PublishError> {
+    let before = state.clone();
+    let result = publish_rev(
+        repo, remote, identity, keys, state, fetched, bookmark, rev, false,
+    );
+    if matches!(result, Err(PublishError::Busy)) {
+        assert_eq!(*state, before);
+        publish_rev(
+            repo, remote, identity, keys, state, fetched, bookmark, rev, false,
+        )
+    } else {
+        result
+    }
+}
+
 fn pin_from_fetch(state: &mut PublishState, fetched: &FetchState) {
     state.remote_id = fetched.remote_id;
     state.owner_signing = fetched.owner_signing;
@@ -1853,65 +1961,71 @@ fn concurrent_distinct_bookmarks_keep_every_pack() {
     let owner_signing = owner.public().signing;
     let remote_id = remote.remote_id();
     let mut names = vec!["owner".to_string()];
-    let mut threads = Vec::new();
-    for (index, member) in members.into_iter().enumerate() {
-        let bookmark = format!("m{index}");
-        names.push(bookmark.clone());
-        let path = path.clone();
-        threads.push(thread::spawn(move || {
-            let remote = DirRemote::open(&path).unwrap();
-            let mut repo = repo();
-            let mut state = PublishState::new();
-            state.remote_id = remote_id;
-            state.owner_signing = Some(owner_signing);
-            state.counter = 1;
-            let mut last = ObjectId([0; 32]);
-            for round in 0..3 {
-                let body = format!("member {index} round {round}\n");
-                let rev = if round == 0 {
-                    save(&mut repo, &[("src/main.rs", body.as_bytes()), (".env", ENV)])
-                } else {
-                    save_child(&mut repo, &[("src/main.rs", body.as_bytes())])
-                };
-                publish_rev(
-                    &repo,
-                    &remote,
-                    &member,
-                    None,
-                    &mut state,
-                    &FetchState::new(),
-                    &bookmark,
-                    rev,
-                    false,
-                )
-                .unwrap();
-                last = rev;
-            }
-            (bookmark, state.revisions[&last])
-        }));
-    }
-    // The owner keeps publishing their own bookmark alongside the members.
-    for round in 0..3 {
-        let body = format!("owner round {round}\n");
-        let rev = save_child(&mut owner_repo, &[("src/main.rs", body.as_bytes())]);
-        publish_rev(
-            &owner_repo,
-            &remote,
-            &owner,
-            Some(&keys),
-            &mut owner_pub,
-            &FetchState::new(),
-            "owner",
-            rev,
-            false,
-        )
-        .unwrap();
-    }
-    let mut tips = Vec::new();
-    tips.push(("owner".to_string(), manifest(&remote).refs["owner"]));
-    for thread in threads {
-        tips.push(thread.join().unwrap());
-    }
+    // Scoped threads finish before the temporary remote can be removed,
+    // including when a writer or a join reports a failure.
+    let tips = thread::scope(|scope| {
+        let mut threads = Vec::new();
+        for (index, member) in members.into_iter().enumerate() {
+            let bookmark = format!("m{index}");
+            names.push(bookmark.clone());
+            let path = path.clone();
+            threads.push(scope.spawn(move || {
+                let remote = DirRemote::open(&path).unwrap();
+                let mut repo = repo();
+                let mut state = PublishState::new();
+                state.remote_id = remote_id;
+                state.owner_signing = Some(owner_signing);
+                state.counter = 1;
+                let mut last = ObjectId([0; 32]);
+                for round in 0..3 {
+                    let body = format!("member {index} round {round}\n");
+                    let rev = if round == 0 {
+                        save(
+                            &mut repo,
+                            &[("src/main.rs", body.as_bytes()), (".env", ENV)],
+                        )
+                    } else {
+                        save_child(&mut repo, &[("src/main.rs", body.as_bytes())])
+                    };
+                    publish_contended(
+                        &repo,
+                        &remote,
+                        &member,
+                        None,
+                        &mut state,
+                        &FetchState::new(),
+                        &bookmark,
+                        rev,
+                    )
+                    .unwrap();
+                    last = rev;
+                }
+                (bookmark, state.revisions[&last])
+            }));
+        }
+        // The owner keeps publishing their own bookmark alongside the members.
+        for round in 0..3 {
+            let body = format!("owner round {round}\n");
+            let rev = save_child(&mut owner_repo, &[("src/main.rs", body.as_bytes())]);
+            publish_contended(
+                &owner_repo,
+                &remote,
+                &owner,
+                Some(&keys),
+                &mut owner_pub,
+                &FetchState::new(),
+                "owner",
+                rev,
+            )
+            .unwrap();
+        }
+        let mut tips = Vec::new();
+        tips.push(("owner".to_string(), manifest(&remote).refs["owner"]));
+        for thread in threads {
+            tips.push(thread.join().unwrap());
+        }
+        tips
+    });
     let final_manifest = manifest(&remote);
     for (bookmark, public_id) in &tips {
         assert_eq!(final_manifest.refs[bookmark.as_str()], *public_id, "{bookmark}");
@@ -1919,10 +2033,26 @@ fn concurrent_distinct_bookmarks_keep_every_pack() {
     let mut files = Vec::new();
     collect_packs(dir.path(), &mut files);
     assert!(!files.is_empty());
-    for bytes in files {
-        let id = *blake3::hash(&bytes).as_bytes();
-        assert!(final_manifest.packs.contains_key(&id), "pack missing from manifest");
+    let stored: std::collections::BTreeSet<_> = files
+        .iter()
+        .map(|bytes| *blake3::hash(bytes).as_bytes())
+        .collect();
+    for id in final_manifest.packs.keys() {
+        assert!(stored.contains(id), "committed pack missing from remote");
     }
+    // A fresh fetch must read every referenced revision, tree, blob and pack.
+    // Checking just bookmark ids would miss an incomplete concurrent upload.
+    let store = tig_core::MemoryStore::new();
+    let mut fetched = FetchState::new();
+    let report = fetch(
+        &remote,
+        &store,
+        Some(&owner),
+        &mut fetched,
+        &PublishState::new(),
+    )
+    .unwrap();
+    assert_eq!(report.refs.len(), tips.len());
 }
 
 #[test]
@@ -2273,4 +2403,33 @@ fn collect_packs(root: &Path, out: &mut Vec<Vec<u8>>) {
             }
         }
     }
+}
+
+
+#[test]
+fn role_initialization_rebuilds_ciphertext_after_a_public_only_head_race() {
+    let mut repo = repo();
+    let base = save(&mut repo, &[("public", b"base")]);
+    let temp = tempfile::tempdir().unwrap();
+    let remote = DirRemote::create(temp.path(), [74; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let keys = owner_keys(&remote, &owner);
+    let mut state = PublishState::new();
+    publish_rev(&repo, &remote, &owner, Some(&keys), &mut state, &FetchState::new(), "main", base, false).unwrap();
+    let tip = save_child(&mut repo, &[(".private", b"billing/ @billing\n"), ("billing/report", b"secret after role initialization")]);
+    let race = Intercept {
+        remote: &remote, reply: 0,
+        before_commit: std::sync::Mutex::new(Some(Box::new(|| {
+            let head = remote.read_head().unwrap();
+            let old = Manifest::decode(head.manifest.as_deref().unwrap()).unwrap();
+            let next = Manifest::signed(remote.remote_id(), old.sequence + 1, old.refs, old.packs, &owner).unwrap().encode().unwrap();
+            assert!(matches!(remote.commit_head(&head.version(), None, Some(&next)).unwrap(), CommitOutcome::Committed(_)));
+        }))),
+    };
+    publish(repo.store().as_ref(), &race, &owner, Some(&keys), &mut state, &FetchState::new(), "main", tip, &PublishOptions::default()).unwrap();
+    let fresh = tig_core::MemoryStore::new();
+    let report = fetch(&remote, &fresh, Some(&owner), &mut FetchState::new(), &PublishState::new()).unwrap();
+    let revision = fresh.get_revision(&report.refs["main"]).unwrap();
+    let leaf = tig_core::treeops::lookup(&fresh, &revision.tree, &RepoPath::new("billing/report").unwrap()).unwrap().unwrap();
+    assert_eq!(fresh.get_blob(&leaf.id()).unwrap(), b"secret after role initialization");
 }

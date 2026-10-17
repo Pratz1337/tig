@@ -1,0 +1,7 @@
+# The built-in privacy floor also applies when this file is absent.
+# Public localhost TLS test fixtures, already in GitHub history.
+# These keys must never be used outside the tests.
+!crates/tig-remote-http/src/testdata/cert.pem
+!crates/tig-remote-http/src/testdata/key.pem
+
+pending/private-demo/

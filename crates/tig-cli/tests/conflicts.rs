@@ -34,7 +34,7 @@ fn command(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env("TIG_AUTHOR_NAME", "Conflict test")
         .env("TIG_AUTHOR_EMAIL", "conflict@example.com")
-        .env("TIG_IDENTITY_FILE", root.join(".tig/test-identity"))
+        .env("TIG_IDENTITY_PASSPHRASE", "tig test identity passphrase").env("TIG_IDENTITY_FILE", root.join(".tig/test-identity"))
         .args(args)
         .output()
         .unwrap()
@@ -84,6 +84,8 @@ fn markers_drafts_resolution_and_undo_survive_reopening_and_rehash() {
     for _ in 0..3 {
         assert!(run(dir.path(), &["status"]).contains("C file"));
     }
+    assert_eq!(run(dir.path(), &["status", "--short"]), "C file\n");
+    assert_eq!(run(dir.path(), &["status", "-z"]), "C file\0");
     run(dir.path(), &["snapshot", "--rehash"]);
     assert_eq!(
         leaf(dir.path(), "file").id(),

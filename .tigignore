@@ -1,0 +1,4 @@
+# Keep the privacy demo in TIG while Git ignores local scratch files.
+!/pending/
+/pending/*
+!/pending/private-demo/

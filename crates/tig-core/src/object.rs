@@ -18,6 +18,8 @@ pub enum ObjectKind {
     Operation = 4,
     View = 5,
     Conflict = 6,
+    /// Manifest of ordered blob chunks. Files of at most one chunk stay [`ObjectKind::Blob`].
+    ChunkedBlob = 7,
 }
 
 impl ObjectKind {
@@ -29,6 +31,7 @@ impl ObjectKind {
             4 => ObjectKind::Operation,
             5 => ObjectKind::View,
             6 => ObjectKind::Conflict,
+            7 => ObjectKind::ChunkedBlob,
             _ => return Err(Error::decode("object kind", format!("unknown kind {b}"))),
         })
     }
@@ -41,7 +44,13 @@ impl ObjectKind {
             ObjectKind::Operation => "operation",
             ObjectKind::View => "view",
             ObjectKind::Conflict => "conflict",
+            ObjectKind::ChunkedBlob => "chunked blob",
         }
+    }
+
+    /// A file's bytes: one blob, or a manifest of blob chunks.
+    pub fn is_file_content(self) -> bool {
+        matches!(self, ObjectKind::Blob | ObjectKind::ChunkedBlob)
     }
 }
 
@@ -61,6 +70,7 @@ pub enum Object {
     Operation(Operation),
     View(View),
     Conflict(crate::conflict::Conflict),
+    ChunkedBlob(crate::blob::ChunkManifest),
 }
 
 impl Object {
@@ -72,6 +82,7 @@ impl Object {
             Object::Operation(_) => ObjectKind::Operation,
             Object::View(_) => ObjectKind::View,
             Object::Conflict(_) => ObjectKind::Conflict,
+            Object::ChunkedBlob(_) => ObjectKind::ChunkedBlob,
         }
     }
 
@@ -84,6 +95,7 @@ impl Object {
             Object::Operation(o) => o.encode(),
             Object::View(v) => v.encode(),
             Object::Conflict(c) => c.encode(),
+            Object::ChunkedBlob(m) => m.encode(),
         }
     }
 
@@ -95,6 +107,7 @@ impl Object {
             ObjectKind::Operation => Object::Operation(Operation::decode(body)?),
             ObjectKind::View => Object::View(View::decode(body)?),
             ObjectKind::Conflict => Object::Conflict(crate::conflict::Conflict::decode(body)?),
+            ObjectKind::ChunkedBlob => Object::ChunkedBlob(crate::blob::parse_manifest(body)?),
         })
     }
 

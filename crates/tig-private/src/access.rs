@@ -9,6 +9,7 @@
 //! `publish-state` move only after a commit lands; until then the pending
 //! keyring is the crash record.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -27,6 +28,8 @@ const STATE_FILE: &str = "publish-state";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccessError {
+    #[error(transparent)]
+    Key(#[from] crate::keys::KeyError),
     #[error(transparent)]
     Keyring(#[from] KeyringError),
     #[error(transparent)]
@@ -122,6 +125,70 @@ pub fn revoke(
     Err(AccessError::Busy)
 }
 
+/// Commits a keyring already built by [`crate::keyring::Keyring::commit_policy`].
+/// The pin is the root owner in `state`, not necessarily the current owner.
+/// `manifest` is installed in the same head when `Some`. Role rotation that
+/// removes publish rights must pass a manifest re-signed by someone who still
+/// may publish; this function does not choose that signer.
+pub fn commit_keyring(
+    remote: &dyn Remote,
+    local_dir: &Path,
+    state: &mut PublishState,
+    build: impl FnMut(&Keyring) -> Result<(Keyring, Option<Vec<u8>>), AccessError>,
+) -> Result<(), AccessError> {
+    let pin = state.owner_signing.ok_or_else(|| {
+        AccessError::Invalid("publish to this remote before changing roles".into())
+    })?;
+    if state.remote_id != remote.remote_id() {
+        return Err(AccessError::Invalid(
+            "publish state is for a different remote".into(),
+        ));
+    }
+    let mut base = loaded_with_pin(remote, pin, state)?;
+    let mut policy_floor = base.keyring.policy_checkpoint();
+    let mut reveals_floor = state.revealed.clone();
+    let mut build = build;
+    for _ in 0..ATTEMPTS {
+        base.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+        base.keyring.verify_policy_checkpoint(policy_floor.as_ref())?;
+        policy_floor = base.keyring.policy_checkpoint();
+        check_reveals(&base, &reveals_floor)?;
+        if let Some(bytes) = base.manifest.as_deref() {
+            reveals_floor.extend(Manifest::decode(bytes)?.reveals.keys().copied());
+        }
+        let (next, manifest) = build(&base.keyring)?;
+        next.verify(&pin, base.keyring.head.counter)?;
+        next.verify_policy_checkpoint(base.keyring.policy_checkpoint().as_ref())?;
+        if let Some(bytes) = manifest.as_deref().or(base.manifest.as_deref()) {
+            let proposed = Manifest::decode(bytes)?;
+            proposed.verify(remote.remote_id(), &next, base.sequence).map_err(|error| {
+                if matches!(error, manifest::ManifestError::BadSignature) {
+                    AccessError::Invalid("an authorized publisher must re-sign the current manifest before this role change".into())
+                } else {
+                    error.into()
+                }
+            })?;
+            if !reveals_floor.iter().all(|id| proposed.reveals.contains_key(id)) {
+                return Err(AccessError::Invalid("a previously revealed change was omitted".into()));
+            }
+        }
+        stage(local_dir, &next)?;
+        if commit(remote, &base, &next, manifest.as_deref())? {
+            accept(local_dir, state, &next, manifest.as_deref().or(base.manifest.as_deref()))?;
+            clear_pending(local_dir)?;
+            return Ok(());
+        }
+        base = decode_base(
+            remote.remote_id(),
+            remote.read_head()?,
+            pin,
+            base.keyring.head.counter,
+            base.sequence,
+        )?;
+    }
+    Err(AccessError::Busy)
+}
+
 /// Finishes an owner update that crashed after the local pending keyring was
 /// saved. A newer verified remote head is left in place. When the pending
 /// keyring moves the epoch, the manifest is re-signed into the same commit.
@@ -145,6 +212,24 @@ pub fn finish_pending(
         ));
     }
     let verified = pending.verify(&pin, 0)?;
+    if !pending.policy.is_empty() {
+        // Role proposals do not store raw epoch custody on the management
+        // client. A committed proposal is recoverable without owner-keys;
+        // an uncommitted one must be regenerated against the current head.
+        let base = decode_base(remote.remote_id(), remote.read_head()?, pin,
+            state.counter, state.manifest_seq)?;
+        base.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+        if base.keyring.head.counter >= pending.head.counter {
+            let same = base.keyring.head.counter != pending.head.counter
+                || base.keyring.encode()? == bytes;
+            accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
+            clear_pending(local_dir)?;
+            if same { return Ok(()); }
+            return Err(AccessError::Invalid("an interrupted role change was superseded; run it again".into()));
+        }
+        clear_pending(local_dir)?;
+        return Err(AccessError::Invalid("an interrupted role change was not committed; run it again".into()));
+    }
     let keys = load_keys(local_dir)?;
     if keys.remote != pending.remote || remote.remote_id() != pending.remote {
         return Err(AccessError::Invalid(
@@ -171,6 +256,8 @@ pub fn finish_pending(
         state.counter,
         state.manifest_seq,
     )?;
+    base.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    check_reveals(&base, &state.revealed)?;
     if base.keyring.head.counter > verified.counter() {
         accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
         clear_pending(local_dir)?;
@@ -178,6 +265,8 @@ pub fn finish_pending(
     }
     let moved = epochs_of(&base.keyring) != epochs_of(&pending);
     for _ in 0..ATTEMPTS {
+        base.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+        check_reveals(&base, &state.revealed)?;
         if base.keyring.head.counter > verified.counter() {
             accept(local_dir, state, &base.keyring, base.manifest.as_deref())?;
             clear_pending(local_dir)?;
@@ -252,13 +341,10 @@ fn loaded_with_pin(
     state: &PublishState,
 ) -> Result<Base, AccessError> {
     let head = remote.read_head()?;
-    decode_base(
-        remote.remote_id(),
-        head,
-        pin,
-        state.counter,
-        state.manifest_seq,
-    )
+    let base = decode_base(remote.remote_id(), head, pin, state.counter, state.manifest_seq)?;
+    base.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    check_reveals(&base, &state.revealed)?;
+    Ok(base)
 }
 
 /// The head after a lost race, never older than `floor`, the counter of the
@@ -313,6 +399,15 @@ fn decode_base(
     })
 }
 
+fn check_reveals(base: &Base, known: &BTreeSet<tig_core::ObjectId>) -> Result<(), AccessError> {
+    if known.is_empty() { return Ok(()); }
+    let manifest = base.manifest.as_deref().map(Manifest::decode).transpose()?;
+    if !known.iter().all(|id| manifest.as_ref().is_some_and(|m| m.reveals.contains_key(id))) {
+        return Err(AccessError::Invalid("the remote dropped a known reveal certificate".into()));
+    }
+    Ok(())
+}
+
 /// `true` when the commit landed.
 fn commit(
     remote: &dyn Remote,
@@ -341,9 +436,16 @@ fn accept(
     keyring: &Keyring,
     manifest: Option<&[u8]>,
 ) -> Result<(), AccessError> {
+    keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    let manifest = manifest.map(Manifest::decode).transpose()?;
+    if manifest.as_ref().is_some_and(|m| !state.revealed.iter().all(|id| m.reveals.contains_key(id))) {
+        return Err(AccessError::Invalid("the remote dropped a known reveal certificate".into()));
+    }
     state.counter = state.counter.max(keyring.head.counter);
-    if let Some(bytes) = manifest {
-        state.manifest_seq = state.manifest_seq.max(Manifest::decode(bytes)?.sequence);
+    state.policy_checkpoint = keyring.policy_checkpoint();
+    if let Some(manifest) = manifest {
+        state.manifest_seq = state.manifest_seq.max(manifest.sequence);
+        state.revealed.extend(manifest.reveals.keys().copied());
     }
     save_state(local_dir, state)
 }
@@ -385,7 +487,7 @@ fn save_state(dir: &Path, state: &PublishState) -> Result<(), AccessError> {
 
 fn clear_pending(dir: &Path) -> Result<(), AccessError> {
     match fs::remove_file(dir.join(PENDING_FILE)) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(tig_core::durability::sync_parent(&dir.join(PENDING_FILE))?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -416,6 +518,7 @@ fn write_file(dest: &Path, bytes: &[u8], secret: bool) -> Result<(), AccessError
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, dest)?;
+        tig_core::durability::sync_parent(dest)?;
         Ok(())
     })();
     if write.is_err() {

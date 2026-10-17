@@ -46,6 +46,36 @@ fn expect_ok(cmd: &mut Command) -> String {
 }
 
 #[test]
+fn short_status_lists_changes_without_labels_and_null_terminates_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    fs::write(repo.join("edit me.txt"), "original\n").unwrap();
+    fs::write(repo.join("remove.txt"), "remove\n").unwrap();
+    fs::write(repo.join(".env"), "LOCAL=1\n").unwrap();
+    expect_ok(tig(repo).args(["init"]));
+    expect_ok(tig(repo).args(["new", "-m", "next"]));
+
+    assert_eq!(expect_ok(tig(repo).args(["status", "--short"])), "");
+    assert_eq!(expect_ok(tig(repo).args(["status", "-z"])), "");
+    assert!(expect_ok(tig(repo).args(["status"])).contains("No changes."));
+
+    fs::write(repo.join("edit me.txt"), "edited content\n").unwrap();
+    fs::remove_file(repo.join("remove.txt")).unwrap();
+    fs::write(repo.join("résumé.txt"), "added\n").unwrap();
+    fs::write(repo.join(".env"), "LOCAL=changed\n").unwrap();
+    let lines = "M .env\nM edit me.txt\nD remove.txt\nA résumé.txt\n";
+    assert_eq!(expect_ok(tig(repo).args(["status", "--short"])), lines);
+    assert_eq!(expect_ok(tig(repo).args(["status", "-s"])), lines);
+    let nul = lines.replace('\n', "\0");
+    assert_eq!(expect_ok(tig(repo).args(["status", "-z"])), nul);
+    assert_eq!(expect_ok(tig(repo).args(["status", "--short", "--null"])), nul);
+    let normal = expect_ok(tig(repo).args(["status"]));
+    assert!(normal.starts_with("working change:"), "{normal}");
+    assert!(normal.contains("parent:"), "{normal}");
+    assert!(normal.ends_with(lines), "{normal}");
+}
+
+#[test]
 fn end_to_end_session() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

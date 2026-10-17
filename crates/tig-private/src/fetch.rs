@@ -23,20 +23,23 @@ use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{apply_edits, Leaf, MAX_TREE_DEPTH};
 use tig_core::{EntryKind, ObjectId, RepoPath, TreeEntry};
 
-use crate::keyring::{Keyring, KeyringError, VerifiedKeyring};
+use crate::keyring::{Keyring, KeyringError, PolicyCheckpoint, VerifiedKeyring};
 use crate::keys::{Identity, KeyError};
 use crate::manifest::{pack_id, Manifest, ManifestError};
 use crate::pack::{Pack, PackError, SealedRecord};
-use crate::project::PRIVATE_GROUP;
 use crate::publish::PublishState;
 use crate::remote::{Remote, RemoteError};
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 4;
 const MAX_STORED_REVISIONS: usize = 1_000_000;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_FETCH_REVISIONS: usize = 100_000;
-const MAX_FETCH_BYTES: usize = 512 * 1024 * 1024;
+// Content is installed one bounded batch at a time. Limit retained metadata
+// independently, rather than rejecting a large history by counting its bytes twice.
+const MAX_METADATA_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+const CONTENT_BATCH_IDS: usize = 4;
 /// Ids per `get_batch` request.
 const BATCH_IDS: usize = 1000;
 
@@ -80,6 +83,9 @@ pub struct FetchState {
     pub revisions: BTreeMap<ObjectId, ObjectId>,
     /// Highest publish manifest sequence accepted (rollback floor).
     pub manifest_seq: u64,
+    /// Reveals are cumulative; a later head may not hide a disclosed change.
+    pub revealed: BTreeSet<ObjectId>,
+    pub policy_checkpoint: Option<PolicyCheckpoint>,
 }
 
 impl Default for FetchState {
@@ -97,6 +103,8 @@ impl FetchState {
             counter: 0,
             revisions: BTreeMap::new(),
             manifest_seq: 0,
+            revealed: BTreeSet::new(),
+            policy_checkpoint: None,
         }
     }
 
@@ -105,7 +113,7 @@ impl FetchState {
             return Err(FetchError::Invalid("fetch state is too large".into()));
         }
         let mut w = Writer::new();
-        w.u8(VERSION);
+        w.u8(if self.policy_checkpoint.is_some() { VERSION } else { 3 });
         w.buf.extend_from_slice(&self.remote_id);
         match self.owner_signing {
             Some(pin) => {
@@ -121,6 +129,12 @@ impl FetchState {
             w.id(internal);
         }
         w.varint(self.manifest_seq);
+        w.varint(self.revealed.len() as u64);
+        for id in &self.revealed { w.id(id); }
+        if let Some(checkpoint) = self.policy_checkpoint {
+            w.varint(checkpoint.transitions);
+            w.buf.extend_from_slice(&checkpoint.digest);
+        }
         Ok(w.finish())
     }
 
@@ -163,6 +177,23 @@ impl FetchState {
         }
         // Version 1 predates publish manifests.
         let manifest_seq = if version >= 2 { r.varint()? } else { 0 };
+        let mut revealed = BTreeSet::new();
+        if version >= 3 {
+            let count = r.count(32)?;
+            if count > MAX_STORED_REVISIONS { return Err(FetchError::TooLarge); }
+            let mut previous = None;
+            for _ in 0..count {
+                let id = r.id()?;
+                if previous.is_some_and(|p| p >= id) { return Err(FetchError::Invalid("reveals are not canonical".into())); }
+                previous = Some(id);
+                revealed.insert(id);
+            }
+        }
+        let policy_checkpoint = if version >= 4 {
+            let transitions = r.varint()?;
+            if transitions == 0 || transitions > 10_000 { return Err(FetchError::Invalid("invalid policy checkpoint length".into())); }
+            Some(PolicyCheckpoint { transitions, digest: read_array(&mut r)? })
+        } else { None };
         r.finish()?;
         Ok(FetchState {
             remote_id,
@@ -170,6 +201,8 @@ impl FetchState {
             counter,
             revisions,
             manifest_seq,
+            revealed,
+            policy_checkpoint,
         })
     }
 }
@@ -202,11 +235,11 @@ struct Budget {
 }
 
 impl Budget {
-    fn bytes(&mut self, amount: usize) -> Result<(), FetchError> {
+    fn metadata(&mut self, amount: usize) -> Result<(), FetchError> {
         self.bytes = self
             .bytes
             .checked_add(amount)
-            .filter(|used| *used <= MAX_FETCH_BYTES)
+            .filter(|used| *used <= MAX_METADATA_BYTES)
             .ok_or(FetchError::TooLarge)?;
         Ok(())
     }
@@ -291,6 +324,8 @@ fn fetch_inner(
         ));
     }
     let verified = keyring.verify(&pin, state.counter.max(published.counter))?;
+    keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    keyring.verify_policy_checkpoint(published.policy_checkpoint.as_ref())?;
     let manifest = match head.manifest {
         Some(bytes) => Manifest::decode(&bytes)?,
         None => {
@@ -305,6 +340,9 @@ fn fetch_inner(
         state.manifest_seq.max(published.manifest_seq),
     )?;
 
+    if !state.revealed.iter().chain(&published.revealed).all(|id| manifest.reveals.contains_key(id)) {
+        return Err(FetchError::Invalid("a newer manifest dropped a known reveal certificate".into()));
+    }
     let refs = manifest.refs.clone();
     let tips: Vec<ObjectId> = refs.values().copied().collect();
     let mut budget = Budget {
@@ -337,6 +375,31 @@ fn fetch_inner(
     let mut still_sealed = 0usize;
     for public_id in order.iter().copied() {
         let previous = mapped.get(&public_id).copied();
+        if manifest.changes.contains_key(&public_id) {
+            if let Some(mut next) = open_private_change(remote, store, &manifest, &verified, identity, public_id, &mut budget)? {
+                next.tree = unseal(store, next.tree, &records, &mut budget)?.0;
+                next.parents = next.parents.iter().map(|p| map_parent(*p, &mapped)).collect::<Result<_, _>>()?;
+                if let Some(old) = previous {
+                    let before = store.get_revision(&old)?;
+                    next.predecessors = before.predecessors.clone();
+                    if next.encode() == before.encode() { continue; }
+                    next.predecessors = vec![old];
+                    let new = store.put(&Object::Revision(next))?;
+                    rewritten.insert(old, new);
+                    mapped.insert(public_id, new);
+                } else {
+                    mapped.insert(public_id, store.put(&Object::Revision(next))?);
+                }
+                unsealed += 1;
+                continue;
+            }
+            if previous.is_some() { continue; }
+            let mut opaque = store.get_revision(&public_id)?;
+            opaque.parents = opaque.parents.iter().map(|p| map_parent(*p, &mapped)).collect::<Result<_, _>>()?;
+            mapped.insert(public_id, store.put(&Object::Revision(opaque))?);
+            still_sealed += 1;
+            continue;
+        }
         if let Some(old) = previous {
             let before = store.get_revision(&old)?;
             let (tree, opened, closed) = unseal(store, before.tree, &records, &mut budget)?;
@@ -357,14 +420,14 @@ fn fetch_inner(
             };
             // A conflicting rebase is a projection mismatch, not malformed
             // remote content. Check it before scanning for unopened seals.
-            if !same_public_revision(store, &next, public_id, &mapped, &records, &mut budget)? {
+            if !same_public_revision(store, &next, public_id, &mapped, &records, &manifest, &mut budget)? {
                 projection_mismatches.push(old);
                 continue;
             }
             // Replay the local delta first, then open any inherited seals.
             next.tree = unseal(store, next.tree, &records, &mut budget)?.0;
             next.predecessors = vec![old];
-            if !same_public_revision(store, &next, public_id, &mapped, &records, &mut budget)? {
+            if !same_public_revision(store, &next, public_id, &mapped, &records, &manifest, &mut budget)? {
                 projection_mismatches.push(old);
                 continue;
             }
@@ -376,7 +439,7 @@ fn fetch_inner(
             continue;
         }
         let (internal, opened, closed) =
-            rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
+            rebuild_one(store, public_id, &mapped, &records, &manifest, &mut budget)?;
         if mapped.get(&public_id) == Some(&internal) {
             continue;
         }
@@ -397,7 +460,7 @@ fn fetch_inner(
                     copy_history(remote, store, &[*public], &mut budget)
                         .map_err(|error| tig_core::Error::Invalid(error.to_string()))?;
                 }
-                if !same_public_revision(store, next, *public, &mapped, &records, &mut budget)
+                if !same_public_revision(store, next, *public, &mapped, &records, &manifest, &mut budget)
                     .map_err(|error| tig_core::Error::Invalid(error.to_string()))?
                 {
                     projection_mismatches.push(old);
@@ -406,7 +469,7 @@ fn fetch_inner(
                 let (tree, opened, closed) = unseal(store, next.tree, &records, &mut budget)
                     .map_err(|error| tig_core::Error::Invalid(error.to_string()))?;
                 next.tree = tree;
-                if !same_public_revision(store, next, *public, &mapped, &records, &mut budget)
+                if !same_public_revision(store, next, *public, &mapped, &records, &manifest, &mut budget)
                     .map_err(|error| tig_core::Error::Invalid(error.to_string()))?
                 {
                     projection_mismatches.push(old);
@@ -438,7 +501,7 @@ fn fetch_inner(
                 continue;
             }
             let (internal, opened, closed) =
-                rebuild_one(store, public_id, &mapped, &records, &mut budget)?;
+                rebuild_one(store, public_id, &mapped, &records, &manifest, &mut budget)?;
             mapped.insert(public_id, internal);
             unsealed += opened;
             still_sealed += closed;
@@ -450,6 +513,8 @@ fn fetch_inner(
     state.owner_signing = Some(pin);
     state.counter = verified.counter();
     state.manifest_seq = manifest.sequence;
+    state.revealed.extend(manifest.reveals.keys().copied());
+    state.policy_checkpoint = keyring.policy_checkpoint();
     state.revisions = mapped;
     Ok(FetchReport {
         refs: reported,
@@ -475,7 +540,8 @@ fn resolve_pin(
             Ok((pin, None))
         }
         None => {
-            if state.counter != 0 || !state.revisions.is_empty() {
+            if state.counter != 0 || state.manifest_seq != 0 || !state.revisions.is_empty()
+                || !state.revealed.is_empty() || state.policy_checkpoint.is_some() {
                 return Err(FetchError::Invalid(
                     "fetch state is missing its owner pin".into(),
                 ));
@@ -483,20 +549,6 @@ fn resolve_pin(
             Ok((keyring.owner.signing, Some(keyring.owner.fingerprint())))
         }
     }
-}
-
-fn member_epochs(keyring: &Keyring, identity: &Identity) -> BTreeSet<u64> {
-    let me = identity.public();
-    keyring
-        .grants
-        .iter()
-        .filter(|grant| {
-            grant.context.remote == keyring.remote
-                && grant.context.group == PRIVATE_GROUP
-                && grant.recipient == me
-        })
-        .map(|grant| grant.context.epoch)
-        .collect()
 }
 
 fn local_of_published(published: &PublishState) -> BTreeMap<ObjectId, ObjectId> {
@@ -510,7 +562,7 @@ fn local_of_published(published: &PublishState) -> BTreeMap<ObjectId, ObjectId> 
 fn open_member_packs(
     remote: &dyn Remote,
     store: &dyn Store,
-    keyring: &Keyring,
+    _keyring: &Keyring,
     verified: &VerifiedKeyring,
     manifest: &Manifest,
     identity: Option<&Identity>,
@@ -521,46 +573,43 @@ fn open_member_packs(
     };
     let mut records = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    for epoch in member_epochs(keyring, identity) {
-        let key = match verified.key_for(PRIVATE_GROUP, epoch, identity) {
-            Ok(key) => key,
-            Err(KeyringError::NotMember) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        // Packs the manifest lists for this epoch, and the sealed records
-        // each must carry. Unlisted packs are still read.
-        let mut expected: BTreeMap<[u8; 32], &BTreeSet<SealedId>> = manifest
-            .packs
-            .iter()
-            .filter(|(_, entry)| entry.group == PRIVATE_GROUP && entry.epoch == epoch)
-            .map(|(id, entry)| (*id, &entry.sealed))
-            .collect();
-        for bytes in remote.list_packs(PRIVATE_GROUP, epoch)? {
-            budget.bytes(bytes.len())?;
+    for (group, epoch) in verified.granted_epochs(identity) {
+        let key = verified.key_for(&group, epoch, identity)?;
+        // The signed manifest is the complete list. Orphaned uploads are not
+        // part of published history and must not consume download memory.
+        for (id, listed) in manifest.packs.iter().filter(|(_, entry)| {
+            entry.group == group && entry.epoch == epoch
+        }) {
+            let bytes = remote.get_pack(&group, epoch, id)?
+                .ok_or(FetchError::WithheldPack { epoch, missing: 1 })?;
+            if bytes.len() > crate::pack::MAX_PACK_FILE {
+                return Err(FetchError::TooLarge);
+            }
+            if pack_id(&bytes) != *id {
+                return Err(FetchError::Invalid("pack does not match its manifest id".into()));
+            }
             let opened = Pack::open(&bytes, &key)?;
-            if let Some(listed) = expected.remove(&pack_id(&bytes)) {
-                let carried: BTreeSet<SealedId> =
-                    opened.sealed.iter().map(|record| record.sealed_id).collect();
-                if !listed.is_subset(&carried) {
-                    return Err(FetchError::WithheldPack { epoch, missing: 1 });
-                }
+            drop(bytes);
+            let carried: BTreeSet<SealedId> =
+                opened.sealed.iter().map(|record| record.sealed_id).collect();
+            if !listed.sealed.is_subset(&carried) {
+                return Err(FetchError::WithheldPack { epoch, missing: 1 });
             }
             for (kind, id, body) in opened.objects {
-                budget.bytes(body.len())?;
-                if !matches!(kind, ObjectKind::Blob | ObjectKind::Tree) {
-                    return Err(FetchError::Invalid(
-                        "pack contains an object that is not a blob or a tree".into(),
-                    ));
+                if !matches!(kind, ObjectKind::Blob | ObjectKind::Tree | ObjectKind::ChunkedBlob) {
+                    return Err(FetchError::Invalid("pack contains a forbidden object kind".into()));
                 }
                 if hash_object(kind, &body) != id {
-                    return Err(FetchError::Invalid(
-                        "pack object does not match its id".into(),
-                    ));
+                    return Err(FetchError::Invalid("pack object does not match its id".into()));
                 }
                 if !seen.insert(id) {
                     continue;
                 }
                 budget.object()?;
+                if kind != ObjectKind::Blob {
+                    budget.metadata(body.len())?;
+                    Object::decode(kind, &body)?;
+                }
                 if !store.has(&id)? {
                     store.put_raw(&id, kind, &body)?;
                 }
@@ -569,9 +618,6 @@ fn open_member_packs(
                 let salt = key.seal_salt(&record.path, record.kind, &record.target);
                 remember(budget, &mut records, AuthenticatedSeal { record, salt })?;
             }
-        }
-        if !expected.is_empty() {
-            return Err(FetchError::WithheldPack { epoch, missing: expected.len() });
         }
     }
     Ok(records)
@@ -590,6 +636,7 @@ fn remember(
         )),
         None => {
             budget.entry()?;
+            budget.metadata(record.path.as_str().len() + 128)?;
             records.insert(record.sealed_id, seal);
             Ok(())
         }
@@ -628,7 +675,7 @@ fn copy_history(
         let mut trees = Vec::new();
         for id in &batch {
             let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
-            budget.bytes(body.len())?;
+            budget.metadata(body.len())?;
             budget.object()?;
             if *kind != ObjectKind::Revision {
                 return Err(FetchError::Invalid(format!(
@@ -713,7 +760,7 @@ fn topo_parents_first(
 
 /// Requests `ids` in batches of [`BATCH_IDS`]. The remote is not trusted:
 /// an object that was not asked for, arrives twice, or does not hash to its
-/// id is refused, and one level may not exceed [`MAX_FETCH_BYTES`].
+/// id is refused, and one level may not exceed [`MAX_RESIDENT_BYTES`].
 fn fetch_objects(
     remote: &dyn Remote,
     ids: &[ObjectId],
@@ -730,7 +777,7 @@ fn fetch_objects(
             }
             bytes = bytes
                 .checked_add(body.len())
-                .filter(|used| *used <= MAX_FETCH_BYTES)
+                .filter(|used| *used <= MAX_RESIDENT_BYTES)
                 .ok_or(FetchError::TooLarge)?;
             if hash_object(kind, &body) != id {
                 return Err(FetchError::Invalid(format!(
@@ -755,7 +802,7 @@ fn ensure_root(
     }
     let got = fetch_objects(remote, &[id])?;
     if let Some((kind, body)) = got.get(&id) {
-        budget.bytes(body.len())?;
+        budget.metadata(body.len())?;
         budget.object()?;
         if *kind != ObjectKind::Revision {
             return Err(FetchError::Invalid("root object is not a revision".into()));
@@ -797,7 +844,7 @@ fn copy_tree_levels(
         let mut blobs = Vec::new();
         for id in &level {
             let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
-            budget.bytes(body.len())?;
+            budget.metadata(body.len())?;
             budget.object()?;
             if *kind != ObjectKind::Tree {
                 return Err(FetchError::Invalid(format!("object {id} is not a tree")));
@@ -831,24 +878,101 @@ fn copy_tree_levels(
                 }
             }
         }
-        if !blobs.is_empty() {
-            let got = fetch_objects(remote, &blobs)?;
-            for id in &blobs {
+        copy_content(remote, local, &blobs, budget, seen)?;
+        level = next;
+        depth += 1;
+    }
+    Ok(())
+}
+
+fn copy_content(
+    remote: &dyn Remote, local: &dyn Store, blobs: &[ObjectId],
+    budget: &mut Budget, seen: &mut BTreeSet<ObjectId>,
+) -> Result<(), FetchError> {
+        for batch in blobs.chunks(CONTENT_BATCH_IDS) {
+            let got = fetch_objects(remote, batch)?;
+            let mut chunks = Vec::new();
+            for id in batch {
                 let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
-                budget.bytes(body.len())?;
                 budget.object()?;
-                if *kind != ObjectKind::Blob {
-                    return Err(FetchError::Invalid(format!("object {id} is not a blob")));
+                if !matches!(kind, ObjectKind::Blob | ObjectKind::ChunkedBlob) {
+                    return Err(FetchError::Invalid(format!("object {id} is not file content")));
+                }
+                if *kind == ObjectKind::ChunkedBlob {
+                    budget.metadata(body.len())?;
+                    for chunk in tig_core::blob::linked_ids(*kind, body)? {
+                        if seen.insert(chunk) {
+                            chunks.push(chunk);
+                        }
+                    }
                 }
                 if !local.has(id)? {
                     local.put_raw(id, *kind, body)?;
                 }
             }
+            drop(got);
+            for batch in chunks.chunks(CONTENT_BATCH_IDS) {
+                let got = fetch_objects(remote, batch)?;
+                for id in batch {
+                    let (kind, body) = got.get(id).ok_or(tig_core::Error::NotFound(*id))?;
+                    if *kind != ObjectKind::Blob || body.len() > tig_core::blob::CHUNK_LEN {
+                        return Err(FetchError::Invalid("chunk is not a bounded blob".into()));
+                    }
+                    budget.object()?;
+                    if !local.has(id)? {
+                        local.put_raw(id, *kind, body)?;
+                    }
+                }
+            }
+            for id in batch {
+                tig_core::blob::for_each_content::<_, FetchError>(local, id, |_, _, _| Ok(()))?;
+            }
         }
-        level = next;
-        depth += 1;
-    }
     Ok(())
+}
+
+fn open_private_change(
+    remote: &dyn Remote, store: &dyn Store, manifest: &Manifest,
+    verified: &VerifiedKeyring, identity: Option<&Identity>, public: ObjectId,
+    budget: &mut Budget,
+) -> Result<Option<Revision>, FetchError> {
+    let entry = &manifest.changes[&public];
+    let key = identity.map(|actor| verified.key_for(&entry.group, entry.epoch, actor))
+        .transpose().or_else(|error| match error { KeyringError::NotMember => Ok(None), other => Err(other) })?;
+    if key.is_none() && !manifest.reveals.contains_key(&public) { return Ok(None); }
+    copy_content(remote, store, &[entry.capsule], budget, &mut BTreeSet::new())?;
+    let packs = if let Some(key) = &key {
+        if manifest.reveals.contains_key(&public) { Vec::new() } else {
+            let bytes = remote.get_pack(&entry.group, key.context().epoch, &entry.wrapper_pack)?
+                .ok_or(FetchError::WithheldPack { epoch: entry.epoch, missing: 1 })?;
+            if bytes.len() > crate::pack::PACK_BATCH_MAX { return Err(FetchError::TooLarge); }
+            vec![bytes]
+        }
+    } else { Vec::new() };
+    let mut correspondence = crate::changes::Correspondence::default();
+    let mut input = crate::changes::OpenInput {
+        store, manifest, skeleton_id: public, packs: &packs, role_key: key.as_ref(),
+        pinned_owner: &verified.snapshot().current_owner.signing,
+        correspondence: &mut correspondence, expects_access: key.is_some(),
+    };
+    match crate::changes::open_change(&mut input).map_err(|e| FetchError::Invalid(e.to_string()))? {
+        crate::changes::OpenOutcome::Opened { local_id, .. } | crate::changes::OpenOutcome::Already { local_id, .. } => Ok(Some(store.get_revision(&local_id)?)),
+        _ => Ok(None),
+    }
+}
+
+fn has_private_ancestor(store: &dyn Store, revision: &Revision, manifest: &Manifest) -> Result<bool, FetchError> {
+    if manifest.changes.is_empty() { return Ok(false); }
+    let mut pending = revision.parents.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if manifest.changes.contains_key(&id) { return Ok(true); }
+        if id != root_revision_id() && seen.insert(id) {
+            if seen.len() > MAX_FETCH_REVISIONS { return Err(FetchError::TooLarge); }
+            pending.extend(store.get_revision(&id)?.parents);
+        }
+    }
+    Ok(false)
 }
 
 fn rebuild_one(
@@ -856,6 +980,7 @@ fn rebuild_one(
     public_id: ObjectId,
     mapped: &BTreeMap<ObjectId, ObjectId>,
     records: &BTreeMap<SealedId, AuthenticatedSeal>,
+    manifest: &Manifest,
     budget: &mut Budget,
 ) -> Result<(ObjectId, usize, usize), FetchError> {
     let public = store.get_revision(&public_id)?;
@@ -870,7 +995,7 @@ fn rebuild_one(
     for parent in &public.parents {
         parents.push(map_parent(*parent, mapped)?);
     }
-    let internal = Revision {
+    let mut internal = Revision {
         tree,
         parents,
         change_id: public.change_id,
@@ -879,6 +1004,11 @@ fn rebuild_one(
         committer: public.committer.clone(),
         description: public.description.clone(),
     };
+    if internal.parents != public.parents && has_private_ancestor(store, &public, manifest)? {
+        let mut base = public.clone();
+        base.tree = tree;
+        internal = rebase_revision(store, &base, internal.parents)?;
+    }
     let id = store.put(&Object::Revision(internal))?;
     Ok((id, unsealed, still_sealed))
 }
@@ -889,10 +1019,21 @@ fn same_public_revision(
     public_id: ObjectId,
     mapped: &BTreeMap<ObjectId, ObjectId>,
     records: &BTreeMap<SealedId, AuthenticatedSeal>,
+    manifest: &Manifest,
     budget: &mut Budget,
 ) -> Result<bool, FetchError> {
     let public = store.get_revision(&public_id)?;
-    let Some(tree) = project_original_seals(store, internal.tree, public.tree, records, budget)?
+    if manifest.changes.contains_key(&public_id) {
+        let expected = store.get_revision(mapped.get(&public_id).ok_or_else(|| FetchError::Invalid("private change has no authenticated mapping".into()))?)?;
+        return Ok(internal.tree == expected.tree && internal.parents == expected.parents
+            && internal.change_id == expected.change_id && internal.author == expected.author
+            && internal.committer == expected.committer && internal.description == expected.description);
+    }
+    let mut inverse = internal.clone();
+    if has_private_ancestor(store, &public, manifest)? && inverse.parents != public.parents {
+        inverse = rebase_revision(store, &inverse, public.parents.clone())?;
+    }
+    let Some(tree) = project_original_seals(store, inverse.tree, public.tree, records, budget)?
     else {
         return Ok(false);
     };
@@ -1068,12 +1209,13 @@ fn sealed_leaves(
                     out.push((path, sid));
                 }
                 EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
-                    if store.kind(&entry.id())? != Some(ObjectKind::Blob) {
+                    if !matches!(store.kind(&entry.id())?, Some(ObjectKind::Blob | ObjectKind::ChunkedBlob)) {
                         return Err(FetchError::Invalid(format!(
                             "file target {} is missing or is not a blob",
                             entry.id()
                         )));
                     }
+                    tig_core::blob::for_each_content::<_, FetchError>(store, &entry.id(), |_, _, _| Ok(()))?;
                 }
                 EntryKind::Conflict => return Err(FetchError::Invalid("remote contains an unresolved conflict".into())),
             }
@@ -1098,7 +1240,7 @@ fn checked_leaf(store: &dyn Store, record: &SealedRecord) -> Result<Leaf, FetchE
         ObjectKind::Blob
     };
     match store.kind(&record.target)? {
-        Some(kind) if kind == expected => {}
+        Some(kind) if kind == expected || (expected == ObjectKind::Blob && kind == ObjectKind::ChunkedBlob) => {}
         Some(kind) => {
             return Err(FetchError::Invalid(format!(
                 "sealed target {} is a {}, expected a {}",
@@ -1113,6 +1255,9 @@ fn checked_leaf(store: &dyn Store, record: &SealedRecord) -> Result<Leaf, FetchE
                 record.target
             )))
         }
+    }
+    if record.kind.is_file_like() {
+        tig_core::blob::for_each_content::<_, FetchError>(store, &record.target, |_, _, _| Ok(()))?;
     }
     Ok(Leaf::new(record.kind, record.target)?)
 }
@@ -1280,7 +1425,7 @@ mod tests {
         assert!(FetchState::decode(&trailing).is_err());
 
         let mut bad_version = bytes.clone();
-        bad_version[0] = 3;
+        bad_version[0] = 5;
         assert!(matches!(
             FetchState::decode(&bad_version),
             Err(FetchError::Invalid(ref reason)) if reason.contains("version")

@@ -631,3 +631,83 @@ fn lost_unsynced_snapshot_head_is_recovered_from_disk() {
     assert_eq!(tracked(&repo, "a.txt").unwrap(), b"two", "re-snapshotted from disk");
     assert_eq!(file_bytes(&wc, "a.txt"), b"two");
 }
+
+#[test]
+fn event_snapshot_hashes_only_selected_files_and_keeps_unselected_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a"), b"one").unwrap();
+    fs::write(dir.path().join("b"), b"two").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    fs::write(dir.path().join("a"), b"new").unwrap();
+    let stats = wc.snapshot_paths(&mut repo, &[PathBuf::from("a")], false, true).unwrap();
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(stats.hashed, 1);
+    assert_eq!(tracked(&repo, "a").unwrap(), b"new");
+    assert_eq!(tracked(&repo, "b").unwrap(), b"two");
+    fs::remove_file(dir.path().join("a")).unwrap();
+    wc.snapshot_paths(&mut repo, &[PathBuf::from("a")], false, true).unwrap();
+    assert_eq!(tracked(&repo, "a"), None);
+    assert_eq!(tracked(&repo, "b").unwrap(), b"two");
+    assert_eq!(wc.snapshot_with_rehash(&mut repo, true).unwrap().changed, 0);
+}
+
+#[test]
+fn watcher_hints_survive_reopen_and_force_same_stat_content_rehash() {
+    use tig_cli::watcher::{record_dirty, load_dirty, WatchBatch};
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a"), b"one").unwrap();
+    let (repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    wc.enable_watcher().unwrap();
+    let meta = wc.workspace_meta_dir();
+    fs::write(dir.path().join("a"), b"two").unwrap();
+    record_dirty(&meta, &WatchBatch { paths: vec![PathBuf::from("a")], full_scan: false, baseline: false, restart: false }).unwrap();
+    drop(wc); drop(repo);
+    let (mut repo, mut wc) = WorkingCopy::open(dir.path(), settings()).unwrap();
+    let stats = wc.snapshot(&mut repo).unwrap();
+    assert!(stats.hashed >= 1);
+    assert_eq!(tracked(&repo, "a").unwrap(), b"two");
+    assert!(load_dirty(&meta).unwrap().is_empty());
+}
+
+#[test]
+fn missing_chunk_refuses_checkout_before_any_disk_deletion() {
+    use tig_core::encode::Writer;
+    use tig_core::object::{hash_object, ObjectKind};
+    use tig_core::ObjectId;
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("old"), b"preserve me").unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    let mut body = Writer::new();
+    body.u8(1);
+    body.varint(tig_core::blob::CHUNK_LEN as u64 + 1);
+    body.varint(2);
+    body.id(&ObjectId([81; 32])); body.varint(tig_core::blob::CHUNK_LEN as u64);
+    body.id(&ObjectId([82; 32])); body.varint(1);
+    let body = body.finish();
+    let broken = hash_object(ObjectKind::ChunkedBlob, &body);
+    repo.store().put_raw(&broken, ObjectKind::ChunkedBlob, &body).unwrap();
+    let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    ws.remove(&repo, &path("old")).unwrap();
+    ws.set(&repo, path("new"), Some(Leaf::file(broken))).unwrap();
+    ws.snapshot(&mut repo).unwrap();
+    assert!(wc.checkout(&repo).is_err());
+    assert_eq!(fs::read(dir.path().join("old")).unwrap(), b"preserve me");
+    assert!(!dir.path().join("new").exists());
+}
+
+#[test]
+fn rehash_preserves_identical_legacy_large_blob_id() {
+    let dir = TempDir::new().unwrap();
+    let (mut repo, mut wc) = WorkingCopy::init(dir.path(), settings()).unwrap();
+    let bytes = vec![19; tig_core::blob::CHUNK_LEN + 17];
+    let id = repo.store().put(&tig_core::Object::Blob(bytes.clone())).unwrap();
+    let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    ws.set(&repo, path("legacy.bin"), Some(Leaf::file(id))).unwrap();
+    ws.snapshot(&mut repo).unwrap();
+    wc.checkout(&repo).unwrap();
+    assert_eq!(wc.snapshot_with_rehash(&mut repo, true).unwrap().changed, 0);
+    let ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    let tree = repo.revision(&ws.working_revision()).unwrap().tree;
+    assert_eq!(tig_core::treeops::lookup(repo.store().as_ref(), &tree, &path("legacy.bin")).unwrap().unwrap().id(), id);
+    assert_eq!(fs::read(dir.path().join("legacy.bin")).unwrap(), bytes);
+}

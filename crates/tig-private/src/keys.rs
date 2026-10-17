@@ -39,6 +39,8 @@ pub enum KeyError {
     Encrypt,
     #[error("no randomness available: {0}")]
     Random(String),
+    #[error("invalid protected identity")]
+    Identity,
 }
 
 fn random32() -> Result<Zeroizing<[u8; 32]>, KeyError> {
@@ -63,7 +65,7 @@ impl PublicIdentity {
         let mut bytes = [0; 64];
         bytes[..32].copy_from_slice(&self.encryption);
         bytes[32..].copy_from_slice(&self.signing);
-        hex::encode(blake3::derive_key(domain::IDENTITY_FINGERPRINT, &bytes))[..16].to_owned()
+        hex::encode(blake3::derive_key(domain::IDENTITY_FINGERPRINT, &bytes))[..32].to_owned()
     }
 }
 
@@ -80,6 +82,44 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Password-protected storage: fixed Argon2id parameters, random salt,
+    /// and XChaCha20-Poly1305. The version fixes the KDF cost and encoding.
+    pub fn encrypt(&self, passphrase: &[u8]) -> Result<Vec<u8>, KeyError> {
+        if passphrase.is_empty() { return Err(KeyError::Identity); }
+        let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 24];
+        getrandom::getrandom(&mut salt).map_err(|e| KeyError::Random(e.to_string()))?;
+        getrandom::getrandom(&mut nonce).map_err(|e| KeyError::Random(e.to_string()))?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        argon2::Argon2::default().hash_password_into(passphrase, &salt, &mut *key)
+            .map_err(|_| KeyError::Identity)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&*key).map_err(|_| KeyError::Identity)?;
+        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce),
+            Payload { msg: &*self.to_bytes(), aad: domain::IDENTITY_FILE_AAD })
+            .map_err(|_| KeyError::Identity)?;
+        let mut out = b"TIGI\x01".to_vec();
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Opens only the fixed version-1 envelope; wrong passwords and damage
+    /// are errors and never generate replacement identity material.
+    pub fn decrypt(bytes: &[u8], passphrase: &[u8]) -> Result<Self, KeyError> {
+        if bytes.len() != 125 || !bytes.starts_with(b"TIGI\x01") || passphrase.is_empty() {
+            return Err(KeyError::Identity);
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        argon2::Argon2::default().hash_password_into(passphrase, &bytes[5..21], &mut *key)
+            .map_err(|_| KeyError::Identity)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&*key).map_err(|_| KeyError::Identity)?;
+        let plaintext = Zeroizing::new(cipher.decrypt(XNonce::from_slice(&bytes[21..45]),
+            Payload { msg: &bytes[45..], aad: domain::IDENTITY_FILE_AAD })
+            .map_err(|_| KeyError::Identity)?);
+        Ok(Self::from_bytes(plaintext.as_slice().try_into().map_err(|_| KeyError::Identity)?))
+    }
+
     pub fn generate() -> Result<Self, KeyError> {
         Ok(Identity {
             secret: StaticSecret::from(*random32()?),
@@ -569,6 +609,24 @@ pub fn open_grant(
 mod tests {
     use super::*;
 
+    #[test]
+    fn protected_identity_is_random_authenticated_and_preserves_public_keys() {
+        let identity = Identity::from_bytes([37; 64]);
+        let protected = identity.encrypt(b"test passphrase").unwrap();
+        assert_ne!(protected, identity.encrypt(b"test passphrase").unwrap());
+        assert!(!protected.windows(64).any(|b| b == *identity.to_bytes()));
+        assert_eq!(Identity::decrypt(&protected, b"test passphrase").unwrap().public(), identity.public());
+        assert_eq!(identity.public().fingerprint().len(), 32);
+        assert!(Identity::decrypt(&protected, b"wrong passphrase").is_err());
+        for offset in [0, 4, 5, 21, 45, protected.len() - 1] {
+            let mut damaged = protected.clone(); damaged[offset] ^= 1;
+            assert!(Identity::decrypt(&damaged, b"test passphrase").is_err());
+        }
+        assert!(Identity::decrypt(&protected[..64], b"test passphrase").is_err());
+        assert!(identity.encrypt(b"").is_err());
+    }
+
+
     fn group() -> GroupEpoch {
         // Fixed remote so the golden vectors below stay reproducible.
         GroupEpoch {
@@ -918,7 +976,7 @@ mod tests {
         ] {
             assert_eq!(hex::encode(*key.subkey(label)), expected, "{label}");
         }
-        assert_eq!(owner.public().fingerprint(), "11937e1ac7824421");
+        assert_eq!(owner.public().fingerprint(), "11937e1ac7824421bc2010e36e743598");
         assert_eq!(
             hex::encode(
                 key.seal_salt(&path(".env"), EntryKind::File, &id)

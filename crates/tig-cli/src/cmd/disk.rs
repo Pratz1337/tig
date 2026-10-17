@@ -40,9 +40,12 @@ fn write_atomic(dest: &Path, bytes: &[u8], secret: bool, replace: bool) -> Resul
     drop(file);
     if replace {
         place_replace(&guard.0, dest)?;
+        tig_core::durability::sync_parent(dest)?;
         Ok(true)
     } else {
-        place_new(&guard.0, dest)
+        let created = place_new(&guard.0, dest)?;
+        if created { tig_core::durability::sync_parent(dest)?; }
+        Ok(created)
     }
 }
 

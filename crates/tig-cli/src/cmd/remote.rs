@@ -286,6 +286,8 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
                 return Err(CliError::msg("pending keyring is for a different remote"));
             }
             pending.verify(&pin, 0)?;
+            pending.verify_policy_checkpoint(published.policy_checkpoint.as_ref())?;
+            pending.verify_policy_checkpoint(fetched.policy_checkpoint.as_ref())?;
             counter = counter.max(pending.head.counter);
         }
         published.remote_id = remote_id;
@@ -294,11 +296,35 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
         fetched.owner_signing = Some(pin);
         published.counter = counter;
         fetched.counter = counter;
+        let checkpoint = match (published.policy_checkpoint, fetched.policy_checkpoint) {
+            (Some(left), Some(right)) if left.transitions == right.transitions && left != right =>
+                return Err(CliError::msg("fetch and publish state disagree about the accepted role policy")),
+            (Some(left), Some(right)) => Some(if left.transitions >= right.transitions { left } else { right }),
+            (left, right) => left.or(right),
+        };
+        published.policy_checkpoint = checkpoint;
+        fetched.policy_checkpoint = checkpoint;
+        let revealed = published.revealed.union(&fetched.revealed).copied().collect();
+        published.revealed = revealed;
+        fetched.revealed = published.revealed.clone();
         let sequence = published.manifest_seq.max(fetched.manifest_seq);
         published.manifest_seq = sequence;
         fetched.manifest_seq = sequence;
     }
     Ok((published, fetched))
+}
+
+/// Check both persisted prefixes before a merged state chooses the newer one.
+pub(super) fn verify_policy_checkpoints(dir: &Path, keyring: &Keyring) -> Result<()> {
+    if let Some(bytes) = read_optional(&dir.join("publish-state"))? {
+        let state = PublishState::decode(&bytes)?;
+        keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    }
+    if let Some(bytes) = read_optional(&dir.join("fetch-state"))? {
+        let state = FetchState::decode(&bytes)?;
+        keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    }
+    Ok(())
 }
 
 pub(super) fn save_publish_state(dir: &Path, state: &PublishState) -> Result<()> {
@@ -362,6 +388,8 @@ pub(super) fn load_owner(cfg: &RemoteCfg, identity: &Identity) -> Result<OwnerBu
         return Err(CliError::msg("publish state is for a different remote"));
     }
     keyring.verify(&pin, state.counter)?;
+    keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    verify_policy_checkpoints(&cfg.dir, &keyring)?;
     Ok(OwnerBundle {
         remote,
         keyring,
@@ -379,6 +407,14 @@ pub(super) fn finish_keyring_update(cfg: &RemoteCfg, owner: &Identity) -> Result
     let remote = connect(cfg, Some(owner), false)?;
     // Recovery checks committed floors; the pending counter has not landed yet.
     let mut state = load_states(&cfg.dir, false)?.0;
+    let head = remote.read_head()?;
+    if let Some(bytes) = head.keyring.as_deref() {
+        let keyring = Keyring::decode(bytes)?;
+        let pin = state.owner_signing.ok_or_else(|| CliError::msg("pending keyring has no owner pin"))?;
+        if keyring.remote != remote.remote_id() { return Err(CliError::msg("keyring is for a different remote")); }
+        keyring.verify(&pin, state.counter)?;
+        verify_policy_checkpoints(&cfg.dir, &keyring)?;
+    }
     tig_private::access::finish_pending(remote.as_ref(), &cfg.dir, owner, &mut state)?;
     Ok(())
 }
@@ -409,6 +445,13 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+/// Pending grants and frozen groups. Fingerprints only; no key material.
+pub(super) fn describe_roles(keyring: &tig_private::keyring::Keyring) -> Result<String> {
+    let snapshot = keyring.policy_snapshot()?;
+    let pending = tig_private::roles::pending_access(&snapshot, &keyring.head.epochs, &keyring.grants);
+    Ok(tig_private::roles::format_pending(&pending))
 }
 
 fn path_text(path: &Path) -> Result<String> {

@@ -6,7 +6,8 @@
 //!
 //! The caller keeps [`PublishState`] and prepares and saves [`OwnerKeys`]
 //! before the first publish. The owner passes those keys back on later
-//! publishes and never takes an epoch key from the remote.
+//! publishes. The original private epoch is checked against those saved keys;
+//! additional role groups may use their verified, authorized grants.
 //!
 //! Empty remote, keys already saved: pass `Some(owner_keys)` when the
 //! keyring file is absent. Publish builds the keyring from that epoch
@@ -17,10 +18,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use tig_core::blob::leak_ids;
 use tig_core::encode::{Reader, Writer};
 use tig_core::object::{hash_object, Object, ObjectKind, Tree};
-use tig_core::repo::{root_revision, root_revision_id};
-use tig_core::seal::SealedId;
+use tig_core::repo::{rebase_revision, root_revision, root_revision_id};
 use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{Leaf, MAX_TREE_DEPTH};
 use tig_core::{EntryKind, ObjectId, RepoPath};
@@ -29,11 +30,11 @@ use crate::fetch::FetchState;
 use crate::keyring::{Keyring, KeyringError, OwnerKeys};
 use crate::keys::{EpochKey, Identity, KeyError, WireId};
 use crate::manifest::{pack_id, Manifest, ManifestError, PackEntry};
-use crate::pack::{PackBuilder, PackError};
-use crate::project::{project_tree, public_revision, Projection, SealedRoot, PRIVATE_GROUP};
+use crate::pack::{Pack, PackBatch, PackError};
+use crate::project::{access_group, project_grouped, public_revision, Projection, PRIVATE_GROUP};
 use crate::remote::{CommitOutcome, Remote, RemoteError};
 
-const VERSION: u8 = 4;
+const VERSION: u8 = 6;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_PATHS: usize = 1_000_000;
 const MAX_WIRES: usize = 1_000_000;
@@ -138,6 +139,8 @@ pub struct PublishState {
     pub owner_signing: Option<[u8; 32]>,
     /// Highest keyring counter this state has accepted.
     pub counter: u64,
+    /// Accepted role-policy prefix; ownership transfer cannot be omitted later.
+    pub policy_checkpoint: Option<crate::keyring::PolicyCheckpoint>,
     pub revisions: BTreeMap<ObjectId, ObjectId>,
     /// Every file path published as public to this remote, plus Git exposure
     /// evidence seeded by import before the first publish. This evidence alone
@@ -150,10 +153,14 @@ pub struct PublishState {
     /// bytes may not reappear in a public file unless declassified, even
     /// after the private file was renamed or deleted.
     pub ever_private: BTreeSet<ObjectId>,
+    /// Historical evidence includes canonical chunks of legacy blobs.
+    pub legacy_chunk_evidence: bool,
     /// Blobs the user explicitly declassified with `declassify`.
     pub declassified: BTreeSet<ObjectId>,
     /// Highest publish manifest sequence seen or written (rollback floor).
     pub manifest_seq: u64,
+    /// Public disclosures cannot be omitted by a later signed head.
+    pub revealed: BTreeSet<ObjectId>,
 }
 
 impl Default for PublishState {
@@ -169,13 +176,16 @@ impl PublishState {
             remote_id: [0; 16],
             owner_signing: None,
             counter: 0,
+            policy_checkpoint: None,
             revisions: BTreeMap::new(),
             ever_public: BTreeSet::new(),
             confirmed_negations: BTreeSet::new(),
             sent: BTreeMap::new(),
             ever_private: BTreeSet::new(),
+            legacy_chunk_evidence: true,
             declassified: BTreeSet::new(),
             manifest_seq: 0,
+            revealed: BTreeSet::new(),
         }
     }
 
@@ -220,6 +230,16 @@ impl PublishState {
         write_ids(&mut w, &self.ever_private)?;
         write_ids(&mut w, &self.declassified)?;
         w.varint(self.manifest_seq);
+        match self.policy_checkpoint {
+            Some(checkpoint) => {
+                w.u8(1);
+                w.varint(checkpoint.transitions);
+                w.buf.extend_from_slice(&checkpoint.digest);
+            }
+            None => w.u8(0),
+        }
+        write_ids(&mut w, &self.revealed)?;
+        w.u8(u8::from(self.legacy_chunk_evidence));
         Ok(w.finish())
     }
 
@@ -308,6 +328,21 @@ impl PublishState {
         };
         // Version 3 adds the manifest floor.
         let manifest_seq = if version >= 3 { r.varint()? } else { 0 };
+        let (policy_checkpoint, revealed) = if version >= 5 {
+            let checkpoint = match r.u8()? {
+                0 => None,
+                1 => Some(crate::keyring::PolicyCheckpoint { transitions: r.varint()?, digest: read_array(&mut r)? }),
+                _ => return Err(PublishError::Invalid("invalid policy checkpoint flag".into())),
+            };
+            (checkpoint, read_ids(&mut r)?)
+        } else { (None, BTreeSet::new()) };
+        let legacy_chunk_evidence = if version >= 6 {
+            match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(PublishError::Invalid("invalid legacy chunk evidence flag".into())),
+            }
+        } else { false };
         r.finish()?;
         // Earlier projections used the narrower embedded-** privacy policy.
         // Keep exposure evidence and rollback floors, but reclassify history.
@@ -318,13 +353,16 @@ impl PublishState {
             remote_id,
             owner_signing,
             counter,
+            policy_checkpoint,
             revisions,
             ever_public,
             confirmed_negations,
             sent,
             ever_private,
+            legacy_chunk_evidence,
             declassified,
             manifest_seq,
+            revealed,
         })
     }
 }
@@ -350,7 +388,9 @@ struct Plan {
 }
 
 struct Session {
-    epoch_key: EpochKey,
+    epoch_keys: BTreeMap<String, EpochKey>,
+    frozen: BTreeSet<String>,
+    edit_rules: bool,
     counter: u64,
     pin: [u8; 32],
     /// Keyring not yet written. Held until refusal checks have passed.
@@ -364,8 +404,9 @@ struct Session {
 /// The first call on an empty remote (no keyring) makes `identity` the owner
 /// and pins that signing key. The caller must pass keys it already saved,
 /// whose remote id matches (see the module docs). Later
-/// calls check the pinned key and `state.counter`, then encrypt with the
-/// owner's local key or, for a member, with
+/// calls check the pinned key and `state.counter`, then encrypt with a saved
+/// owner key, or a verified role/member grant. Only simple mode requires the
+/// original owner's private-group epoch key to remain locally saved. See
 /// [`crate::keyring::VerifiedKeyring::current_key`].
 ///
 /// On `Err`, `state` is unchanged. Refusal checks and the fast-forward check
@@ -405,18 +446,35 @@ pub fn publish(
             ));
         }
         pin = Some(fetched_pin);
-    } else if fetched.counter != 0 || fetched.manifest_seq != 0 || !fetched.revisions.is_empty() {
+    } else if fetched.counter != 0 || fetched.manifest_seq != 0 || !fetched.revisions.is_empty() || fetched.policy_checkpoint.is_some() {
         return Err(PublishError::Invalid(
             "fetch state is missing its owner pin".into(),
         ));
     }
     let mut prep: Option<Prep> = None;
+    let mut prep_keyring = None;
+    let mut prep_changes = None;
+    let mut next_head = None;
+    let mut history = PublicHistory::default();
+    let mut ever_public = state.ever_public.clone();
+    let mut checked = None;
+    let local_ids = local_of_public(state, fetched);
+    let known = published_ids(state, fetched);
+    let mut requested_roles = BTreeSet::new();
+    for id in parent_first(store, &[rev], |id| id == root_revision_id() || known.contains_key(&id))? {
+        requested_roles.extend(crate::project::rules_of(store, &store.get_revision(&id)?.tree)?.roles());
+    }
     // Rollback floors for this call. Local state moves only after a commit.
     let mut counter_floor = state.counter.max(fetched.counter);
+    let mut policy_floor = None;
+    let mut revealed_floor: BTreeSet<_> = state.revealed.union(&fetched.revealed).copied().collect();
     let mut sequence_floor = state.manifest_seq.max(fetched.manifest_seq);
     for _ in 0..PUBLISH_ATTEMPTS {
-        let head = remote.read_head()?;
-        let session = open_session(
+        let head = match next_head.take() {
+            Some(head) => head,
+            None => remote.read_head()?,
+        };
+        let mut session = open_session(
             remote.remote_id(),
             head.keyring.as_deref(),
             identity,
@@ -424,16 +482,13 @@ pub fn publish(
             pin,
             counter_floor,
         )?;
+        session.keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+        session.keyring.verify_policy_checkpoint(fetched.policy_checkpoint.as_ref())?;
+        session.keyring.verify_policy_checkpoint(policy_floor.as_ref())?;
+        policy_floor = session.keyring.policy_checkpoint();
         counter_floor = counter_floor.max(session.counter);
         if session.fresh.is_none() {
             pin = Some(session.pin);
-        }
-        let epoch = session.epoch_key.context().epoch;
-        let reuse = prep
-            .as_ref()
-            .is_some_and(|prep| prep.epoch == epoch && prep.counter == session.counter);
-        if !reuse {
-            prep = Some(project(store, remote.public_store(), &session, state, fetched, rev)?);
         }
         let previous = read_manifest(
             remote.remote_id(),
@@ -441,6 +496,28 @@ pub fn publish(
             &session.keyring,
             sequence_floor,
         )?;
+        if revealed_floor.iter().any(|id| !previous.as_ref().is_some_and(|manifest| manifest.reveals.contains_key(id))) {
+            return Err(PublishError::Invalid("the remote omitted a previously accepted reveal".into()));
+        }
+        if let Some(manifest) = &previous { revealed_floor.extend(manifest.reveals.keys().copied()); }
+        initialize_roles(&mut session, &requested_roles, identity, owner_keys)?;
+        // Proposed role keys are freshly random. A public-only CAS race can
+        // leave the remote keyring unchanged; its bytes alone cannot key the
+        // projection cache for this unpublished policy.
+        let projection_keyring = match &session.fresh {
+            Some(keyring) => Some(keyring.encode()?),
+            None => head.keyring.clone(),
+        };
+        let reuse = prep.as_ref().is_some_and(|prep| {
+            prep.counter == session.counter && prep_keyring == projection_keyring
+                && prep_changes.as_ref().map(|(changes, reveals)| (changes, reveals))
+                    == previous.as_ref().map(|manifest| (&manifest.changes, &manifest.reveals))
+        });
+        if !reuse {
+            prep = Some(project(store, remote.public_store(), &session, state, fetched, rev, previous.as_ref())?);
+            prep_keyring = projection_keyring;
+            prep_changes = previous.as_ref().map(|manifest| (manifest.changes.clone(), manifest.reveals.clone()));
+        }
         if let Some(manifest) = &previous {
             sequence_floor = sequence_floor.max(manifest.sequence);
         }
@@ -448,14 +525,22 @@ pub fn publish(
             Some(manifest) => manifest.refs.clone(),
             None => remote.read_legacy_refs()?.unwrap_or_default(),
         };
-        let mut ever_public = state.ever_public.clone();
-        ever_public.extend(remote_public_paths(remote.public_store(), &refs)?);
-        let checked = check_refusals(
-            state,
-            &ever_public,
-            &prep.as_ref().expect("projection was just built").plans,
-            options,
-        )?;
+        let paths_changed = remote_public_paths(remote.public_store(), &refs, &mut history)?;
+        let reveal_paths_changed = revealed_public_paths(store, remote, &local_ids, previous.as_ref(),
+            &session.keyring.policy_snapshot()?.current_owner.signing, &mut history)?;
+        let paths_changed = paths_changed || reveal_paths_changed;
+        if paths_changed {
+            ever_public.extend(history.paths.iter().cloned());
+        }
+        if !reuse || checked.is_none() || paths_changed {
+            checked = Some(check_refusals(
+                store,
+                state,
+                &ever_public,
+                &prep.as_ref().expect("projection was just built").plans,
+                options,
+            )?);
+        }
         let tip = public_parent(
             &prep.as_ref().expect("projection was just built").public_ids,
             rev,
@@ -466,17 +551,13 @@ pub fn publish(
             bookmark,
             refs.get(bookmark).copied(),
             tip,
-            &local_of_public(state, fetched),
+            &local_ids,
             options.force,
-        )?;
-        let metadata_warnings = metadata_mentions(
-            store,
-            &prep.as_ref().expect("projection was just built").plans,
         )?;
         {
             let prep = prep.as_mut().expect("projection was just built");
             if !prep.uploaded {
-                if let Err(error) = upload(remote, prep) {
+                if let Err(error) = upload(store, remote, prep) {
                     // The remote refuses a pack for an epoch a revoke just
                     // replaced. Start over under the new keyring.
                     if remote.read_head()?.keyring != head.keyring {
@@ -490,16 +571,8 @@ pub fn publish(
         let prep = prep.as_ref().expect("projection was just built");
         refs.insert(bookmark.to_string(), tip);
         let mut packs = previous.as_ref().map(|m| m.packs.clone()).unwrap_or_default();
-        if let Some((id, sealed)) = &prep.pack {
-            packs
-                .entry(*id)
-                .or_insert_with(|| PackEntry {
-                    group: prep.group.clone(),
-                    epoch,
-                    sealed: BTreeSet::new(),
-                })
-                .sealed
-                .extend(sealed);
+        for pack in &prep.packs {
+            packs.entry(pack.id).or_insert_with(|| pack.entry.clone());
         }
         let sequence = previous
             .as_ref()
@@ -507,8 +580,12 @@ pub fn publish(
             .max(sequence_floor)
             .checked_add(1)
             .ok_or_else(|| PublishError::Invalid("manifest sequence overflow".into()))?;
-        let manifest =
-            Manifest::signed(remote.remote_id(), sequence, refs, packs, identity)?.encode()?;
+        let manifest = Manifest::signed_with_changes(
+            remote.remote_id(), sequence, refs, packs,
+            previous.as_ref().map(|m| m.changes.clone()).unwrap_or_default(),
+            previous.as_ref().map(|m| m.reveals.clone()).unwrap_or_default(),
+            identity,
+        )?.encode()?;
         let fresh = match &session.fresh {
             Some(keyring) => Some(keyring.encode()?),
             None => None,
@@ -517,13 +594,15 @@ pub fn publish(
             CommitOutcome::Stale(current) => {
                 // The next attempt verifies this head (pin and counter floor).
                 // A changed counter restarts projection under the new epoch.
-                let _ = current;
+                next_head = Some(current);
                 continue;
             }
             CommitOutcome::Committed(_) => {
+                let checked = checked.expect("refusal checks passed before upload");
                 state.remote_id = remote.remote_id();
                 state.owner_signing = Some(session.pin);
                 state.counter = session.counter;
+                state.policy_checkpoint = session.keyring.policy_checkpoint();
                 for plan in &prep.plans {
                     let public_id = prep.public_ids[&plan.internal];
                     state.revisions.insert(plan.internal, public_id);
@@ -532,14 +611,12 @@ pub fn publish(
                 state.ever_public = ever_public;
                 state.confirmed_negations.extend(checked.confirmed);
                 state.ever_private.extend(checked.new_private);
+                state.legacy_chunk_evidence = true;
                 state.declassified.extend(checked.new_declassified);
                 state.manifest_seq = sequence;
-                if !prep.new_wires.is_empty() {
-                    state
-                        .sent
-                        .entry((prep.group.clone(), epoch))
-                        .or_default()
-                        .extend(prep.new_wires.iter().copied());
+                state.revealed = revealed_floor;
+                for (context, wires) in &prep.new_wires {
+                    state.sent.entry(context.clone()).or_default().extend(wires);
                 }
                 return Ok(PublishReport {
                     revisions_published: prep.plans.len(),
@@ -550,7 +627,7 @@ pub fn publish(
                     warnings: {
                         let mut warnings = rewrites;
                         warnings.extend(checked.warnings);
-                        warnings.extend(metadata_warnings);
+                        warnings.extend(prep.metadata_warnings.iter().cloned());
                         let compatibility: BTreeSet<_> = prep
                             .plans
                             .iter()
@@ -566,24 +643,27 @@ pub fn publish(
     Err(PublishError::Busy)
 }
 
+struct PackUpload {
+    id: [u8; 32],
+    entry: PackEntry,
+    local: ObjectId,
+}
+
 struct Prep {
     plans: Vec<Plan>,
+    metadata_warnings: Vec<String>,
     public_ids: BTreeMap<ObjectId, ObjectId>,
-    pack: Option<([u8; 32], BTreeSet<SealedId>)>,
-    new_wires: BTreeSet<WireId>,
-    objects: Vec<(ObjectId, ObjectKind, Vec<u8>)>,
-    pack_bytes: Option<Vec<u8>>,
+    packs: Vec<PackUpload>,
+    new_wires: BTreeMap<(String, u64), BTreeSet<WireId>>,
+    objects: Vec<(ObjectId, ObjectKind, usize)>,
     uploaded: bool,
     written: usize,
     sealed_objects: usize,
     sealed_roots: usize,
-    epoch: u64,
     counter: u64,
-    group: String,
 }
 
-/// Projects locally. The only remote use is `has` on the public store, so a
-/// later refusal has nothing to undo.
+/// Projects and spools locally. Only bounded batches hold transfer bodies.
 fn project(
     store: &dyn Store,
     public: &dyn Store,
@@ -591,68 +671,153 @@ fn project(
     state: &PublishState,
     fetched: &FetchState,
     rev: ObjectId,
+    manifest: Option<&Manifest>,
 ) -> Result<Prep, PublishError> {
     let known = published_ids(state, fetched);
     let ancestors = parent_first(store, &[rev], |id| {
         id == root_revision_id() || known.contains_key(&id)
     })?;
+    let keys = session.epoch_keys.iter().map(|(group, key)| (group.clone(), key)).collect();
+    let embargoed = embargoed_content(store, state, fetched, manifest)?;
     let mut plans = Vec::with_capacity(ancestors.len());
-    for internal in ancestors {
-        let revision = store.get_revision(&internal)?;
-        let projection = project_tree(store, &revision.tree, &session.epoch_key)?;
-        plans.push(Plan {
-            internal,
-            projection,
-            description: revision.description,
-        });
-    }
-    let mut outbox = Outbox::new(public);
+    let mut outbox = Outbox::new(store, public);
     write_canonical(&mut outbox, &Object::Tree(Tree::empty()))?;
     write_canonical(&mut outbox, &Object::Revision(root_revision()))?;
     let mut public_ids = known;
-    for plan in &plans {
-        let revision = store.get_revision(&plan.internal)?;
-        let mut parents = Vec::with_capacity(revision.parents.len());
-        for parent in &revision.parents {
-            parents.push(public_parent(&public_ids, *parent)?);
+    let rules = RepoPath::new(crate::project::RULES_FILE)?;
+    for internal in ancestors {
+        let revision = store.get_revision(&internal)?;
+        if !session.edit_rules {
+            let current = tig_core::treeops::lookup(store, &revision.tree, &rules)?;
+            if revision.parents.is_empty() && current.is_some() {
+                return Err(PublishError::Invalid("changing .private requires EDIT_PRIVATE".into()));
+            }
+            for parent in &revision.parents {
+                let parent = store.get_revision(parent)?;
+                if tig_core::treeops::lookup(store, &parent.tree, &rules)? != current {
+                    return Err(PublishError::Invalid("changing .private requires EDIT_PRIVATE".into()));
+                }
+            }
         }
-        let public_rev = public_revision(&revision, plan.projection.public_tree, parents);
-        write_public_tree(store, &mut outbox, &plan.projection.public_tree)?;
+        if manifest.is_some_and(|manifest| manifest.changes.values().any(|entry| entry.change_id == revision.change_id)) {
+            return Err(PublishError::Invalid("a sealed change is immutable; start a new change instead of rewriting it".into()));
+        }
+        let parents = revision.parents.iter().map(|id| public_parent(&public_ids, *id)).collect::<Result<Vec<_>, _>>()?;
+        let mut projected_source = revision.clone();
+        if revision.parents != parents && has_embargoed_ancestor(store, &revision.parents, &public_ids, manifest)? {
+            projected_source = rebase_revision(store, &revision, parents.clone())?;
+            let restored = rebase_revision(store, &projected_source, revision.parents.clone())?;
+            if restored.tree != revision.tree {
+                return Err(PublishError::Invalid("this descendant changes an embargoed fix; seal it separately or reveal its parent first".into()));
+            }
+            if revision.parents.len() == 1 && manifest.is_some_and(|manifest| manifest.changes.contains_key(&parents[0])) {
+                let manifest = manifest.expect("private parent has a manifest");
+                let opened = store.get_revision(&revision.parents[0])?;
+                let child = public_revision(&revision, projected_source.tree, parents.clone());
+                crate::changes::descendant_public_bytes(&crate::changes::DescendantCheck {
+                    store, manifest, skeleton_id: parents[0], opened_id: revision.parents[0],
+                    opened: &opened, child: &child, upgraded: &revision,
+                }).map_err(|error| PublishError::Invalid(format!("private descendant does not preserve its public projection: {error}")))?;
+            }
+        }
+        let projection = project_grouped(store, &projected_source.tree, &keys)?;
+        for (path, leaf) in &projection.public_files {
+            if leaf.is_file_like() && leak_ids(store, &leaf.id())?.iter().any(|id| embargoed.contains(id)) {
+                return Err(PublishError::Invalid(format!("{path} repeats an unrevealed private change; only an owner reveal can release those bytes")));
+            }
+        }
+        for root in &projection.sealed {
+            let group = access_group(&root.readers);
+            if session.frozen.contains(&group) {
+                return Err(PublishError::Invalid(format!("group `{group}` must be rotated after removing readers")));
+            }
+        }
+        let public_rev = public_revision(&revision, projection.public_tree, parents);
+        write_public_tree(store, &mut outbox, &projection.public_tree)?;
         let obj = Object::Revision(public_rev);
         let public_id = obj.id();
         write_canonical(&mut outbox, &obj)?;
-        public_ids.insert(plan.internal, public_id);
+        public_ids.insert(internal, public_id);
+        plans.push(Plan { internal, projection, description: revision.description });
     }
-    let (sealed_objects, sealed_roots, new_wires, pack_bytes, pack) =
-        build_pack(store, &session.epoch_key, state, &plans)?;
+    let mut packs = Vec::new();
+    let mut new_wires = BTreeMap::new();
+    let mut sealed_objects = 0;
+    let mut sealed_roots = 0;
+    for (group, key) in &session.epoch_keys {
+        let (objects, roots, wires) = build_pack(store, key, state, &plans, &mut packs)?;
+        sealed_objects += objects;
+        sealed_roots += roots;
+        if !wires.is_empty() { new_wires.insert((group.clone(), key.context().epoch), wires); }
+    }
+    let metadata_warnings = metadata_mentions(store, &plans)?;
     Ok(Prep {
-        plans,
-        public_ids,
-        pack,
-        new_wires,
-        objects: outbox.pending,
-        pack_bytes,
-        uploaded: false,
-        written: 0,
-        sealed_objects,
-        sealed_roots,
-        epoch: session.epoch_key.context().epoch,
-        counter: session.counter,
-        group: session.epoch_key.context().group.clone(),
+        plans, metadata_warnings, public_ids, packs, new_wires,
+        objects: outbox.pending, uploaded: false, written: 0,
+        sealed_objects, sealed_roots, counter: session.counter,
     })
 }
 
-fn upload(remote: &dyn Remote, prep: &mut Prep) -> Result<(), PublishError> {
+/// Reuse authenticated local correspondence; ciphertext and keys never enter the outbox.
+fn embargoed_content(
+    store: &dyn Store,
+    state: &PublishState,
+    fetched: &FetchState,
+    manifest: Option<&Manifest>,
+) -> Result<BTreeSet<ObjectId>, PublishError> {
+    let Some(manifest) = manifest.filter(|manifest| !manifest.changes.is_empty()) else {
+        return Ok(BTreeSet::new());
+    };
+    let local = local_of_public(state, fetched);
+    let mut hidden = BTreeSet::new();
+    for (public, _) in manifest.changes.iter().filter(|(id, _)| !manifest.reveals.contains_key(id)) {
+        let Some(internal) = local.get(public) else { continue; };
+        let revision = store.get_revision(internal)?;
+        let baseline = store.get_revision(public)?;
+        let mut public_content = BTreeSet::new();
+        for (_, leaf) in tig_core::treeops::walk(store, &baseline.tree, &RepoPath::root())? {
+            if leaf.is_file_like() { public_content.extend(leak_ids(store, &leaf.id())?); }
+        }
+        for (_, leaf) in tig_core::treeops::walk(store, &revision.tree, &RepoPath::root())? {
+            if leaf.is_file_like() {
+                hidden.extend(leak_ids(store, &leaf.id())?.into_iter().filter(|id| !public_content.contains(id)));
+            }
+        }
+    }
+    Ok(hidden)
+}
+
+fn has_embargoed_ancestor(
+    store: &dyn Store,
+    parents: &[ObjectId],
+    public_ids: &BTreeMap<ObjectId, ObjectId>,
+    manifest: Option<&Manifest>,
+) -> Result<bool, PublishError> {
+    let Some(manifest) = manifest.filter(|manifest| !manifest.changes.is_empty()) else {
+        return Ok(false);
+    };
+    let mut pending = parents.to_vec();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        let public = public_ids.get(&id).unwrap_or(&id);
+        if manifest.changes.contains_key(public) && !manifest.reveals.contains_key(public) { return Ok(true); }
+        if id != root_revision_id() && seen.insert(id) {
+            if seen.len() > MAX_HISTORY { return Err(PublishError::Invalid("history is too long to publish".into())); }
+            pending.extend(store.get_revision(&id)?.parents);
+        }
+    }
+    Ok(false)
+}
+
+fn upload(store: &dyn Store, remote: &dyn Remote, prep: &mut Prep) -> Result<(), PublishError> {
     let mut written = 0usize;
     let mut start = 0usize;
     while start < prep.objects.len() {
         let mut end = start;
         let mut bytes = 0usize;
-        while end < prep.objects.len() && end - start < BATCH_OBJECTS && bytes <= BATCH_BYTES {
-            let next = prep.objects[end].2.len();
-            if end > start && bytes.saturating_add(next) > BATCH_BYTES {
-                break;
-            }
+        while end < prep.objects.len() && end - start < BATCH_OBJECTS {
+            let next = prep.objects[end].2;
+            if end > start && bytes.saturating_add(next) > BATCH_BYTES { break; }
             bytes = bytes.saturating_add(next);
             end += 1;
         }
@@ -662,24 +827,24 @@ fn upload(remote: &dyn Remote, prep: &mut Prep) -> Result<(), PublishError> {
         let mut missing = BTreeSet::new();
         for id in remote.missing(&ids)? {
             if !asked.contains(&id) || !missing.insert(id) {
-                return Err(PublishError::Invalid(format!(
-                    "the remote listed {id} as missing, which was not asked or was listed twice"
-                )));
+                return Err(PublishError::Invalid(format!("the remote listed {id} as missing, which was not asked or was listed twice")));
             }
         }
-        let send: Vec<_> = chunk
-            .iter()
-            .filter(|(id, _, _)| missing.contains(id))
-            .cloned()
-            .collect();
-        written += send.len();
-        if !send.is_empty() {
-            remote.put_batch(&send)?;
+        let mut send = Vec::new();
+        for (id, kind, _) in chunk {
+            if missing.contains(id) {
+                let (stored, body) = store.get_raw(id)?.ok_or(tig_core::Error::NotFound(*id))?;
+                if stored != *kind { return Err(PublishError::Invalid("spooled public object has the wrong kind".into())); }
+                send.push((*id, *kind, body));
+            }
         }
+        written += send.len();
+        if !send.is_empty() { remote.put_batch(&send)?; }
         start = end;
     }
-    if let Some(bytes) = &prep.pack_bytes {
-        remote.put_pack(bytes)?;
+    for pack in &prep.packs {
+        let bytes = store.get_kind(&pack.local, ObjectKind::Blob)?;
+        remote.put_pack(&bytes)?;
     }
     prep.written = written;
     Ok(())
@@ -907,6 +1072,26 @@ fn read_manifest(
     }
 }
 
+// Build locally so policy activation and the new bookmark share one CAS.
+fn initialize_roles(session: &mut Session, names: &BTreeSet<String>, identity: &Identity, owner_keys: Option<&OwnerKeys>) -> Result<(), PublishError> {
+    let mut next = session.keyring.clone();
+    let mut changed = false;
+    for name in names {
+        if next.policy_snapshot()?.roles.contains_key(name) { continue; }
+        if next.policy_snapshot()?.current_owner != identity.public() {
+            return Err(PublishError::Invalid("the owner must initialize new roles".into()));
+        }
+        next.create_role(identity, name, 1, 0)?;
+        changed = true;
+    }
+    if changed {
+        let mut updated = open_session(next.remote, Some(&next.encode()?), identity, owner_keys, Some(session.pin), session.counter)?;
+        updated.fresh = Some(next);
+        *session = updated;
+    }
+    Ok(())
+}
+
 fn open_session(
     remote_id: [u8; 16],
     keyring_bytes: Option<&[u8]>,
@@ -939,9 +1124,11 @@ fn open_session(
             let keyring = Keyring::from_saved_owner(identity, saved)?;
             let pin = identity.public().signing;
             keyring.verify(&pin, 0)?;
-            let epoch_key = owner_epoch_key(saved, remote_id, 1)?;
+            let epoch_key = owner_epoch_key(saved, remote_id, PRIVATE_GROUP, 1)?;
             Ok(Session {
-                epoch_key,
+                epoch_keys: BTreeMap::from([(PRIVATE_GROUP.into(), epoch_key)]),
+                frozen: BTreeSet::new(),
+                edit_rules: true,
                 counter: keyring.head.counter,
                 pin,
                 keyring: keyring.clone(),
@@ -965,27 +1152,33 @@ fn open_session(
                     )),
                 };
             let verified = keyring.verify(&pin, counter_floor)?;
-            let epoch = keyring
-                .head
-                .epochs
-                .get(PRIVATE_GROUP)
-                .copied()
-                .ok_or_else(|| PublishError::Invalid("keyring has no private epoch".into()))?;
-            let epoch_key = if identity.public() == keyring.owner {
-                let keys = owner_keys.ok_or_else(|| {
-                    PublishError::Invalid(
-                        "the owner must pass local epoch keys; they are not read from the remote"
-                            .into(),
-                    )
-                })?;
-                let key = owner_epoch_key(keys, remote_id, epoch)?;
-                keyring.check_owner_key(&key)?;
-                key
-            } else {
-                verified.current_key(PRIVATE_GROUP, identity)?
-            };
+            if !crate::manifest::allowed_signers(&keyring).contains(&identity.public().signing) {
+                if keyring.policy.is_empty() { return Err(KeyringError::NotMember.into()); }
+                return Err(PublishError::Invalid("this identity does not have publish permission".into()));
+            }
+            let edit_rules = keyring.policy.is_empty() || verified.snapshot().has(&identity.public(), crate::roles::EDIT_PRIVATE);
+            let mut epoch_keys = BTreeMap::new();
+            let mut frozen = BTreeSet::new();
+            for (group, epoch) in &keyring.head.epochs {
+                if !verified.reads_now(&identity.public(), group) { continue; }
+                if verified.group_frozen(group) { frozen.insert(group.clone()); }
+                let local_owner = identity.public() == keyring.owner
+                    && verified.snapshot().is_current_owner(&identity.public().signing);
+                let saved = owner_keys.filter(|keys| keys.keys.contains_key(&(group.clone(), *epoch)));
+                let key = if local_owner && (saved.is_some() || (group == PRIVATE_GROUP && keyring.policy.is_empty())) {
+                    let keys = saved.ok_or_else(|| PublishError::Invalid("the owner must pass local epoch keys; they are not read from the remote".into()))?;
+                    let key = owner_epoch_key(keys, remote_id, group, *epoch)?;
+                    keyring.check_owner_key(&key)?;
+                    key
+                } else {
+                    verified.current_key(group, identity)?
+                };
+                epoch_keys.insert(group.clone(), key);
+            }
             Ok(Session {
-                epoch_key,
+                epoch_keys,
+                frozen,
+                edit_rules,
                 counter: verified.counter(),
                 pin,
                 fresh: None,
@@ -1009,7 +1202,9 @@ fn saved_pin(state: &PublishState, remote_id: [u8; 16]) -> Result<Option<[u8; 32
             let unused = state.counter == 0
                 && state.revisions.is_empty()
                 && state.confirmed_negations.is_empty()
-                && state.sent.is_empty();
+                && state.sent.is_empty()
+                && state.policy_checkpoint.is_none()
+                && state.revealed.is_empty();
             if unused {
                 Ok(None)
             } else {
@@ -1024,6 +1219,7 @@ fn saved_pin(state: &PublishState, remote_id: [u8; 16]) -> Result<Option<[u8; 32
 fn owner_epoch_key(
     keys: &OwnerKeys,
     remote_id: [u8; 16],
+    group: &str,
     epoch: u64,
 ) -> Result<EpochKey, PublishError> {
     if keys.remote != remote_id {
@@ -1033,10 +1229,10 @@ fn owner_epoch_key(
     }
     let stored = keys
         .keys
-        .get(&(PRIVATE_GROUP.to_string(), epoch))
+        .get(&(group.to_string(), epoch))
         .ok_or_else(|| PublishError::Invalid("owner has no key for this epoch".into()))?;
     let expect = stored.context();
-    if expect.remote != remote_id || expect.group != PRIVATE_GROUP || expect.epoch != epoch {
+    if expect.remote != remote_id || expect.group != group || expect.epoch != epoch {
         return Err(PublishError::Invalid(
             "stored epoch key has the wrong context".into(),
         ));
@@ -1116,23 +1312,70 @@ struct Checked {
 
 /// A different publisher or branch may have exposed a path before this
 /// caller's state existed. Include the remote's reachable public history.
+#[derive(Default)]
+struct PublicHistory {
+    revisions: BTreeSet<ObjectId>,
+    trees: BTreeSet<(ObjectId, RepoPath)>,
+    paths: BTreeSet<RepoPath>,
+    entries: usize,
+    revealed: BTreeSet<ObjectId>,
+}
+
+fn revealed_public_paths(
+    store: &dyn Store,
+    remote: &dyn Remote,
+    local_ids: &BTreeMap<ObjectId, ObjectId>,
+    manifest: Option<&Manifest>,
+    current_owner: &[u8; 32],
+    history: &mut PublicHistory,
+) -> Result<bool, PublishError> {
+    let Some(manifest) = manifest else { return Ok(false); };
+    let mut changed = false;
+    for id in manifest.reveals.keys().filter(|id| !history.revealed.contains(id)) {
+        let local = local_ids.get(id).map(|id| store.get_revision(id)).transpose()?;
+        let baseline = remote.public_store().get_revision(id)?;
+        let paths = if let Some(local) = local.filter(|local| local.tree != baseline.tree) {
+            crate::project::classify_with_roles(store, &local.tree)?.public_files.into_iter()
+                .filter(|(_, leaf)| leaf.is_file_like()).map(|(path, _)| path).collect()
+        } else {
+            crate::changes::revealed_paths(remote, manifest, id, current_owner)
+                .map_err(|error| PublishError::Invalid(error.to_string()))?
+        };
+        for path in paths { changed |= history.paths.insert(path); }
+    }
+    history.revealed.extend(manifest.reveals.keys().copied());
+    Ok(changed)
+}
+
+/// Extends this call's exposure evidence, reading only newly reachable history.
+/// The prefix is part of the tree cache key: one subtree can appear at several paths.
 fn remote_public_paths(
     store: &dyn Store,
     refs: &BTreeMap<String, ObjectId>,
-) -> Result<BTreeSet<RepoPath>, PublishError> {
+    history: &mut PublicHistory,
+) -> Result<bool, PublishError> {
     let tips: Vec<_> = refs.values().copied().collect();
-    let revisions = parent_first(store, &tips, |id| id == root_revision_id())?;
-    let mut paths = BTreeSet::new();
-    let mut entries = 0usize;
+    let revisions = parent_first(store, &tips, |id| {
+        id == root_revision_id() || history.revisions.contains(&id)
+    })?;
+    if history.revisions.len().saturating_add(revisions.len()) > MAX_HISTORY {
+        return Err(PublishError::Invalid(
+            "history is too long to publish".into(),
+        ));
+    }
+    let mut changed = false;
     for id in revisions {
         let mut stack = vec![(store.get_revision(&id)?.tree, RepoPath::root(), 0usize)];
         while let Some((tree, prefix, depth)) = stack.pop() {
             if depth > MAX_TREE_DEPTH {
                 return Err(PublishError::Invalid("remote tree is too deep".into()));
             }
+            if !history.trees.insert((tree, prefix.clone())) {
+                continue;
+            }
             for entry in store.get_tree(&tree)?.entries() {
-                entries += 1;
-                if entries > MAX_PATHS {
+                history.entries += 1;
+                if history.entries > MAX_PATHS {
                     return Err(PublishError::Invalid(
                         "remote history has too many paths".into(),
                     ));
@@ -1141,15 +1384,17 @@ fn remote_public_paths(
                 if entry.kind() == EntryKind::Tree {
                     stack.push((entry.id(), path, depth + 1));
                 } else if entry.kind().is_file_like() {
-                    paths.insert(path);
+                    changed |= history.paths.insert(path);
                 }
             }
         }
+        history.revisions.insert(id);
     }
-    Ok(paths)
+    Ok(changed)
 }
 
 fn check_refusals(
+    store: &dyn Store,
     state: &PublishState,
     ever_public: &BTreeSet<RepoPath>,
     plans: &[Plan],
@@ -1159,25 +1404,28 @@ fn check_refusals(
     // Everything private in this batch plus everything ever sealed to this
     // remote: a rename or delete inside an unpublished window, or after an
     // earlier publish, must not let those bytes out.
-    let mut new_private = BTreeSet::new();
+    let mut new_private = if state.legacy_chunk_evidence { BTreeSet::new() }
+        else { expand_legacy_evidence(store, &state.ever_private)? };
+    let upgraded_declassified = if state.legacy_chunk_evidence { None }
+        else { Some(expand_legacy_evidence(store, &state.declassified)?) };
+    let old_declassified = upgraded_declassified.as_ref().unwrap_or(&state.declassified);
     for plan in plans {
         for (_, leaf) in &plan.projection.private_files {
             if leaf.is_file_like() && leaf.id() != empty {
-                new_private.insert(leaf.id());
+                new_private.extend(leak_ids(store, &leaf.id())?);
             }
         }
     }
     let mut previously_private = BTreeSet::new();
-    let mut new_declassified = BTreeSet::new();
+    let mut new_declassified = upgraded_declassified.clone().unwrap_or_default();
     for plan in plans {
         for (path, leaf) in &plan.projection.public_files {
             let id = leaf.id();
-            if !leaf.is_file_like() || id == empty || state.declassified.contains(&id) {
-                continue;
-            }
-            if new_private.contains(&id) || state.ever_private.contains(&id) {
+            if !leaf.is_file_like() || id == empty { continue; }
+            let ids = leak_ids(store, &id)?;
+            if ids.iter().any(|id| !old_declassified.contains(id) && (new_private.contains(id) || state.ever_private.contains(id))) {
                 if options.declassify.contains(path) {
-                    new_declassified.insert(id);
+                    new_declassified.extend(ids);
                 } else {
                     previously_private.insert(path.clone());
                 }
@@ -1195,7 +1443,7 @@ fn check_refusals(
                 leaked.insert(path.clone());
             }
         }
-        pastes.extend(pastes_in(&plan.projection, empty));
+        pastes.extend(pastes_in(store, &plan.projection, empty)?);
         for path in &plan.projection.negated {
             if !seen_public.contains(path) && !state.confirmed_negations.contains(path) {
                 negations.insert(path.clone());
@@ -1250,6 +1498,25 @@ fn check_refusals(
     })
 }
 
+/// Older caches can contain a computed whole-blob id without storing that
+/// representation. Resolve those aliases from the stored chunked object;
+/// refuse missing historical content rather than dropping leak evidence.
+fn expand_legacy_evidence(store: &dyn Store, ids: &BTreeSet<ObjectId>) -> Result<BTreeSet<ObjectId>, PublishError> {
+    let mut expanded = BTreeSet::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        if store.has(id)? {
+            expanded.extend(leak_ids(store, id)?);
+        } else {
+            missing.push(*id);
+        }
+    }
+    if let Some(id) = missing.into_iter().find(|id| !expanded.contains(id)) {
+        return Err(tig_core::Error::NotFound(id).into());
+    }
+    Ok(expanded)
+}
+
 fn hidden_now(path: &RepoPath, projection: &Projection) -> bool {
     projection
         .private_files
@@ -1261,13 +1528,13 @@ fn hidden_now(path: &RepoPath, projection: &Projection) -> bool {
             .any(|root| path.starts_with(&root.path))
 }
 
-fn pastes_in(projection: &Projection, empty: ObjectId) -> BTreeSet<Paste> {
+fn pastes_in(store: &dyn Store, projection: &Projection, empty: ObjectId) -> Result<BTreeSet<Paste>, PublishError> {
     let mut private_blobs: BTreeMap<ObjectId, RepoPath> = BTreeMap::new();
     for (path, leaf) in &projection.private_files {
         if leaf.is_file_like() && leaf.id() != empty {
-            private_blobs
-                .entry(leaf.id())
-                .or_insert_with(|| path.clone());
+            for id in leak_ids(store, &leaf.id())? {
+                private_blobs.entry(id).or_insert_with(|| path.clone());
+            }
         }
     }
     let mut found = BTreeSet::new();
@@ -1275,14 +1542,13 @@ fn pastes_in(projection: &Projection, empty: ObjectId) -> BTreeSet<Paste> {
         if !leaf.is_file_like() || leaf.id() == empty {
             continue;
         }
-        if let Some(private_path) = private_blobs.get(&leaf.id()) {
-            found.insert(Paste {
-                public_path: path.clone(),
-                private_path: private_path.clone(),
-            });
+        for id in leak_ids(store, &leaf.id())? {
+            if let Some(private_path) = private_blobs.get(&id) {
+                found.insert(Paste { public_path: path.clone(), private_path: private_path.clone() });
+            }
         }
     }
-    found
+    Ok(found)
 }
 
 fn empty_blob() -> ObjectId {
@@ -1303,14 +1569,16 @@ fn public_parent(
 }
 
 struct Outbox<'a> {
+    local: &'a dyn Store,
     public: &'a dyn Store,
-    pending: Vec<(ObjectId, ObjectKind, Vec<u8>)>,
+    pending: Vec<(ObjectId, ObjectKind, usize)>,
     seen: BTreeSet<ObjectId>,
 }
 
 impl<'a> Outbox<'a> {
-    fn new(public: &'a dyn Store) -> Self {
+    fn new(local: &'a dyn Store, public: &'a dyn Store) -> Self {
         Outbox {
+            local,
             public,
             pending: Vec::new(),
             seen: BTreeSet::new(),
@@ -1321,7 +1589,8 @@ impl<'a> Outbox<'a> {
         if !self.seen.insert(id) {
             return Ok(());
         }
-        self.pending.push((id, kind, body));
+        if !self.local.has(&id)? { self.local.put_raw(&id, kind, &body)?; }
+        self.pending.push((id, kind, body.len()));
         Ok(())
     }
 }
@@ -1379,16 +1648,9 @@ fn write_public_tree(
             match entry.kind() {
                 EntryKind::Tree => children.push(entry.id()),
                 EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
-                    let blob_id = entry.id();
-                    let (blob_kind, blob) = local
-                        .get_raw(&blob_id)?
-                        .ok_or(tig_core::Error::NotFound(blob_id))?;
-                    if blob_kind != ObjectKind::Blob {
-                        return Err(PublishError::Invalid(format!(
-                            "public file {blob_id} is not a blob"
-                        )));
-                    }
-                    remote.push(blob_id, ObjectKind::Blob, blob)?;
+                    tig_core::blob::for_each_content(local, &entry.id(), |kind, id, body| {
+                        remote.push(id, kind, body.to_vec())
+                    })?;
                 }
                 EntryKind::Sealed => {}
                 EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in public tree".into())),
@@ -1417,123 +1679,55 @@ fn build_pack(
     key: &EpochKey,
     state: &PublishState,
     plans: &[Plan],
-) -> Result<BuiltPack, PublishError> {
-    let epoch = key.context().epoch;
-    let already = state
-        .sent
-        .get(&(key.context().group.clone(), epoch))
-        .cloned()
-        .unwrap_or_default();
-    let mut builder = PackBuilder::new(key);
-    let mut added: BTreeSet<ObjectId> = BTreeSet::new();
+    packs: &mut Vec<PackUpload>,
+) -> Result<(usize, usize, BTreeSet<WireId>), PublishError> {
+    let already = state.sent.get(&(key.context().group.clone(), key.context().epoch)).cloned().unwrap_or_default();
+    let mut builder = PackBatch::new(key);
+    let mut added = BTreeSet::new();
     let mut new_wires = BTreeSet::new();
-    let mut sealed_roots = 0usize;
-    let mut sealed_ids = BTreeSet::new();
+    let mut roots = 0;
+    let mut emit = |bytes: &[u8]| -> Result<(), PackError> {
+        let opened = Pack::open(bytes, key)?;
+        let entry = PackEntry {
+            group: key.context().group.clone(), epoch: key.context().epoch,
+            sealed: opened.sealed.iter().map(|record| record.sealed_id).collect(),
+        };
+        let local = hash_object(ObjectKind::Blob, bytes);
+        if !store.has(&local)? { store.put_raw(&local, ObjectKind::Blob, bytes)?; }
+        packs.push(PackUpload { id: pack_id(bytes), entry, local });
+        Ok(())
+    };
     for plan in plans {
         for root in &plan.projection.sealed {
-            let sealed_id = seal_root(
-                store,
-                key,
-                root,
-                &already,
-                &mut added,
-                &mut new_wires,
-                &mut builder,
-            )?;
-            sealed_ids.insert(sealed_id);
-            sealed_roots += 1;
-        }
-    }
-    let sealed_objects = new_wires.len();
-    if sealed_objects == 0 && sealed_roots == 0 {
-        return Ok((0, 0, new_wires, None, None));
-    }
-    let bytes = builder.finish()?;
-    let id = pack_id(&bytes);
-    Ok((
-        sealed_objects,
-        sealed_roots,
-        new_wires,
-        Some(bytes),
-        Some((id, sealed_ids)),
-    ))
-}
-
-/// Sealed objects, sealed roots, new wire ids, pack bytes, and the pack id
-/// with the sealed ids its records name.
-type BuiltPack = (
-    usize,
-    usize,
-    BTreeSet<WireId>,
-    Option<Vec<u8>>,
-    Option<([u8; 32], BTreeSet<SealedId>)>,
-);
-
-fn seal_root(
-    store: &dyn Store,
-    key: &EpochKey,
-    root: &SealedRoot,
-    already: &BTreeSet<WireId>,
-    added: &mut BTreeSet<ObjectId>,
-    new_wires: &mut BTreeSet<WireId>,
-    builder: &mut PackBuilder<'_>,
-) -> Result<SealedId, PublishError> {
-    let sealed_id = key.seal(&root.path, root.leaf.kind(), &root.leaf.id());
-    builder.add_sealed(
-        sealed_id,
-        root.path.clone(),
-        root.leaf.kind(),
-        root.leaf.id(),
-    )?;
-    let mut pending = vec![(root.leaf, root.path.components().count())];
-    let mut walked = BTreeSet::new();
-    while let Some((leaf, depth)) = pending.pop() {
-        if depth > MAX_TREE_DEPTH {
-            return Err(PublishError::Core(tig_core::Error::Invalid(format!(
-                "tree deeper than MAX_TREE_DEPTH ({MAX_TREE_DEPTH})"
-            ))));
-        }
-        if !walked.insert(leaf.id()) {
-            continue;
-        }
-        match leaf.kind() {
-            EntryKind::Tree => {
-                queue_object(
-                    store,
-                    key,
-                    ObjectKind::Tree,
-                    leaf.id(),
-                    already,
-                    added,
-                    new_wires,
-                    builder,
-                )?;
-                let tree = store.get_tree(&leaf.id())?;
-                for entry in tree.entries() {
-                    if entry.kind() == EntryKind::Sealed {
-                        continue;
+            if access_group(&root.readers) != key.context().group { continue; }
+            let sealed = key.seal(&root.path, root.leaf.kind(), &root.leaf.id());
+            builder.add_sealed(sealed, root.path.clone(), root.leaf.kind(), root.leaf.id(), &mut emit)?;
+            roots += 1;
+            let mut pending = vec![(root.leaf, root.path.components().count())];
+            let mut walked = BTreeSet::new();
+            while let Some((leaf, depth)) = pending.pop() {
+                if depth > MAX_TREE_DEPTH { return Err(too_deep()); }
+                if !walked.insert(leaf.id()) { continue; }
+                match leaf.kind() {
+                    EntryKind::Tree => {
+                        queue_object(store, key, ObjectKind::Tree, leaf.id(), &already, &mut added, &mut new_wires, &mut builder, &mut emit)?;
+                        for entry in store.get_tree(&leaf.id())?.entries() {
+                            if entry.kind() != EntryKind::Sealed { pending.push((Leaf::new(entry.kind(), entry.id())?, depth + 1)); }
+                        }
                     }
-                    let child = Leaf::new(entry.kind(), entry.id())?;
-                    pending.push((child, depth + 1));
+                    EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
+                        tig_core::blob::for_each_content(store, &leaf.id(), |kind, id, _body| {
+                            queue_object(store, key, kind, id, &already, &mut added, &mut new_wires, &mut builder, &mut emit)
+                        })?;
+                    }
+                    EntryKind::Sealed => {}
+                    EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in private tree".into())),
                 }
             }
-            EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
-                queue_object(
-                    store,
-                    key,
-                    ObjectKind::Blob,
-                    leaf.id(),
-                    already,
-                    added,
-                    new_wires,
-                    builder,
-                )?;
-            }
-            EntryKind::Sealed => {}
-            EntryKind::Conflict => return Err(PublishError::Invalid("unresolved conflict in private tree".into())),
         }
     }
-    Ok(sealed_id)
+    builder.finish(&mut emit)?;
+    Ok((new_wires.len(), roots, new_wires))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1545,21 +1739,16 @@ fn queue_object(
     already: &BTreeSet<WireId>,
     added: &mut BTreeSet<ObjectId>,
     new_wires: &mut BTreeSet<WireId>,
-    builder: &mut PackBuilder<'_>,
+    builder: &mut PackBatch<'_>,
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
 ) -> Result<(), PublishError> {
     let wire = key.wire_id(&id);
-    if already.contains(&wire) || !added.insert(id) {
-        return Ok(());
-    }
+    if already.contains(&wire) || !added.insert(id) { return Ok(()); }
     let (stored_kind, body) = store.get_raw(&id)?.ok_or(tig_core::Error::NotFound(id))?;
     if stored_kind != kind {
-        return Err(PublishError::Invalid(format!(
-            "object {id} has kind {} but the tree says {}",
-            stored_kind.name(),
-            kind.name()
-        )));
+        return Err(PublishError::Invalid(format!("object {id} has kind {} but the tree says {}", stored_kind.name(), kind.name())));
     }
-    builder.add_object(kind, id, &body)?;
+    builder.add_object(kind, id, &body, emit)?;
     new_wires.insert(wire);
     Ok(())
 }
@@ -1655,6 +1844,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_evidence_upgrade_recovers_aliases_and_refuses_missing_history() {
+        let store = tig_core::MemoryStore::new();
+        let bytes = vec![59; tig_core::blob::CHUNK_LEN + 17];
+        let id = store.put_blob(&bytes).unwrap();
+        let legacy = hash_object(ObjectKind::Blob, &bytes);
+        assert!(!store.has(&legacy).unwrap());
+        let mut evidence: BTreeSet<_> = tig_core::blob::content_ids(&store, &id).unwrap().into_iter().collect();
+        evidence.insert(legacy);
+        let count = store.len();
+        assert_eq!(expand_legacy_evidence(&store, &evidence).unwrap(), evidence);
+        assert_eq!(store.len(), count);
+        let missing = ObjectId([199; 32]);
+        evidence.insert(missing);
+        assert!(matches!(expand_legacy_evidence(&store, &evidence),
+            Err(PublishError::Core(tig_core::Error::NotFound(got))) if got == missing));
+    }
+
+    #[test]
+    fn remote_history_retry_reads_only_new_revisions_and_trees() {
+        struct CountingStore {
+            inner: tig_core::MemoryStore,
+            reads: std::sync::Mutex<BTreeMap<ObjectId, usize>>,
+        }
+        impl Store for CountingStore {
+            fn get_raw(&self, id: &ObjectId) -> tig_core::Result<Option<(ObjectKind, Vec<u8>)>> {
+                *self.reads.lock().unwrap().entry(*id).or_default() += 1;
+                self.inner.get_raw(id)
+            }
+            fn put_raw(
+                &self,
+                id: &ObjectId,
+                kind: ObjectKind,
+                body: &[u8],
+            ) -> tig_core::Result<()> {
+                self.inner.put_raw(id, kind, body)
+            }
+            fn has(&self, id: &ObjectId) -> tig_core::Result<bool> {
+                self.inner.has(id)
+            }
+        }
+        let store = CountingStore {
+            inner: tig_core::MemoryStore::new(),
+            reads: std::sync::Mutex::new(BTreeMap::new()),
+        };
+        let blob = store.put_blob(b"public").unwrap();
+        let subtree = store
+            .put(&Object::Tree(
+                Tree::new(vec![tig_core::object::TreeEntry::new(
+                    "file",
+                    EntryKind::File,
+                    blob,
+                )
+                .unwrap()])
+                .unwrap(),
+            ))
+            .unwrap();
+        let tree = store
+            .put(&Object::Tree(
+                Tree::new(vec![tig_core::object::TreeEntry::new(
+                    "a",
+                    EntryKind::Tree,
+                    subtree,
+                )
+                .unwrap()])
+                .unwrap(),
+            ))
+            .unwrap();
+        let mut revision = root_revision();
+        revision.tree = tree;
+        revision.parents = vec![root_revision_id()];
+        let base = store.put(&Object::Revision(revision.clone())).unwrap();
+        let mut refs = BTreeMap::from([("main".into(), base)]);
+        let mut history = PublicHistory::default();
+        assert!(remote_public_paths(&store, &refs, &mut history).unwrap());
+        let paths = history.paths.clone();
+        assert!(paths.contains(&RepoPath::new("a/file").unwrap()));
+        let before = store.reads.lock().unwrap().clone();
+        assert!(!remote_public_paths(&store, &refs, &mut history).unwrap());
+        assert_eq!(history.paths, paths);
+        assert_eq!(
+            *store.reads.lock().unwrap(),
+            before,
+            "unchanged history was read again"
+        );
+
+        // A new revision reuses one subtree and mounts it at another prefix.
+        revision.tree = store
+            .put(&Object::Tree(
+                Tree::new(vec![
+                    tig_core::object::TreeEntry::new("a", EntryKind::Tree, subtree).unwrap(),
+                    tig_core::object::TreeEntry::new("b", EntryKind::Tree, subtree).unwrap(),
+                ])
+                .unwrap(),
+            ))
+            .unwrap();
+        revision.parents = vec![base];
+        let child = store.put(&Object::Revision(revision)).unwrap();
+        refs.insert("main".into(), child);
+        assert!(remote_public_paths(&store, &refs, &mut history).unwrap());
+        assert!(history.paths.contains(&RepoPath::new("b/file").unwrap()));
+        let after = store.reads.lock().unwrap();
+        assert_eq!(after[&base], before[&base]);
+        assert_eq!(after[&tree], before[&tree]);
+    }
+
+    #[test]
     fn fast_forward_walk_refuses_excessive_edges() {
         let store = tig_core::MemoryStore::new();
         store.put(&Object::Revision(root_revision())).unwrap();
@@ -1686,13 +1981,39 @@ mod tests {
 
         let mut legacy = bytes.clone();
         legacy[0] = 3;
+        legacy.truncate(legacy.len() - 3); // No checkpoint, reveals or evidence flag.
         let mut migrated = state.clone();
         migrated.revisions.clear();
+        migrated.legacy_chunk_evidence = false;
         assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        legacy[0] = 4;
+        migrated.revisions = state.revisions.clone();
+        assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        legacy[0] = 5;
+        legacy.extend_from_slice(&[0, 0]); // Empty checkpoint and reveals.
+        assert_eq!(PublishState::decode(&legacy).unwrap(), migrated);
+        assert_eq!(PublishState::decode(&migrated.encode().unwrap()).unwrap(), migrated);
+
+        let mut protected = state.clone();
+        protected.revealed.insert(ObjectId([3; 32]));
+        let revealed_only = protected.encode().unwrap();
+        assert_eq!(revealed_only[0], VERSION);
+        assert_eq!(PublishState::decode(&revealed_only).unwrap(), protected);
+        protected.policy_checkpoint = Some(crate::keyring::PolicyCheckpoint {
+            transitions: 3, digest: [4; 32],
+        });
+        let protected_bytes = protected.encode().unwrap();
+        assert_eq!(PublishState::decode(&protected_bytes).unwrap(), protected);
+        for end in bytes.len()..protected_bytes.len() {
+            assert!(PublishState::decode(&protected_bytes[..end]).is_err());
+        }
 
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(PublishState::decode(&trailing).is_err());
+        let mut bad_flag = bytes.clone();
+        *bad_flag.last_mut().unwrap() = 2;
+        assert!(PublishState::decode(&bad_flag).is_err());
 
         // Swap the two revision records (64 bytes each) so the keys decrease.
         let mut unsorted = bytes.clone();

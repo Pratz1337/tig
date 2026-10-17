@@ -354,7 +354,7 @@ fn file_ophead_serializes_writers_and_keeps_existing_temp_names() {
             .map(|handle| usize::from(handle.join().unwrap()))
             .sum::<usize>()
     });
-    // Check the persisted winner and that no lock/random temp survives.
+    // Check the persisted winner, retained OS lock, and no random temp files.
     assert_eq!(wins, 1);
     assert!(head.get().unwrap().is_some());
     assert_eq!(std::fs::read(&planted).unwrap(), b"keep");
@@ -367,6 +367,7 @@ fn file_ophead_serializes_writers_and_keeps_existing_temp_names() {
         names,
         [
             std::ffi::OsString::from("op_head"),
+            std::ffi::OsString::from("op_head.lock"),
             std::ffi::OsString::from("op_head.tmp")
         ]
     );

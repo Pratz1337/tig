@@ -155,7 +155,9 @@ pub(crate) fn varint_len(mut value: usize) -> usize {
 /// "Crypto and wire rules" 2, and unresolved conflicts stay local).
 pub(crate) fn check_public_kind(kind: ObjectKind) -> Result<(), String> {
     match kind {
-        ObjectKind::Blob | ObjectKind::Tree | ObjectKind::Revision => Ok(()),
+        ObjectKind::Blob | ObjectKind::ChunkedBlob | ObjectKind::Tree | ObjectKind::Revision => {
+            Ok(())
+        }
         _ => Err(format!("object kind {kind:?} cannot cross the wire")),
     }
 }
@@ -259,7 +261,9 @@ pub(crate) fn check_group(group: &str) -> Result<(), String> {
         && group.len() <= crate::limits::MAX_GROUP_LEN
         && group
             .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'+'))
+        && group.split('+').all(|part| !part.is_empty())
+        && group.split('+').zip(group.split('+').skip(1)).all(|(a, b)| a < b);
     if ok {
         Ok(())
     } else {
@@ -296,6 +300,22 @@ mod tests {
             w.bytes(&[]);
             assert!(decode_objects(&w.finish()).is_err());
         }
+        let manifest = {
+            let mut body = Writer::new();
+            body.u8(1);
+            body.varint((4 * 1024 * 1024 + 1) as u64);
+            body.varint(2);
+            body.id(&ObjectId([1; 32]));
+            body.varint(4 * 1024 * 1024);
+            body.id(&ObjectId([2; 32]));
+            body.varint(1);
+            body.finish()
+        };
+        let encoded = encode_objects(&[(ObjectId([9; 32]), ObjectKind::ChunkedBlob, &manifest)]).unwrap();
+        assert_eq!(
+            decode_objects(&encoded).unwrap(),
+            vec![(ObjectId([9; 32]), ObjectKind::ChunkedBlob, manifest)]
+        );
         let mut w = Writer::new();
         w.varint(1);
         w.id(&ObjectId([0; 32]));

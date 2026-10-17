@@ -520,7 +520,7 @@ impl Trees<'_> {
         }
         if !self.rules.contains_key(&id) {
             let file = match id {
-                Some(id) => text(&self.git.find_blob(id).map_err(git_error)?.data, ".private")?,
+                Some(id) => text(&bounded_blob(self.git, id)?.data, ".private")?,
                 None => String::new(),
             };
             self.rules.insert(
@@ -646,8 +646,8 @@ impl Trees<'_> {
                 let id = match self.blobs.get(&git_id) {
                     Some(id) => *id,
                     None => {
-                        let blob = self.git.find_blob(git_id).map_err(git_error)?;
-                        let id = self.store.put_blob(&blob.data)?;
+                        let blob = bounded_blob(self.git, git_id)?;
+                        let id = tig_core::blob::put_bytes(self.store, &blob.data)?;
                         self.blobs.insert(git_id, id);
                         id
                     }
@@ -669,4 +669,13 @@ impl Trees<'_> {
             .cloned()
             .ok_or_else(|| git_error("root tree was not imported"))
     }
+}
+
+fn bounded_blob(git: &gix::Repository, id: gix::ObjectId) -> Result<gix::Blob<'_>, ImportError> {
+    // gitoxide's packed-object API materializes the decoded blob. Refuse
+    // oversized inputs from their header before asking it to allocate.
+    if git.find_header(id).map_err(git_error)?.size() > tig_core::blob::MAX_MATERIALIZE {
+        return Err(git_error("Git import does not yet stream blobs above 256 MiB"));
+    }
+    git.find_blob(id).map_err(git_error)
 }

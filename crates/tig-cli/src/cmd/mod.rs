@@ -5,6 +5,7 @@
 mod abandon;
 mod bookmark;
 mod cat;
+mod changes;
 mod clone;
 mod describe;
 mod diff;
@@ -22,6 +23,8 @@ mod new_change;
 mod op;
 mod publish;
 mod remote;
+mod role;
+mod env;
 mod resolve;
 mod revoke;
 mod settings;
@@ -30,6 +33,7 @@ mod snapshot;
 mod status;
 mod undo;
 mod why;
+mod watch;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -47,13 +51,25 @@ use crate::wc::WorkingCopy;
 #[derive(Debug)]
 pub struct CliError {
     message: String,
+    child_exit: Option<i32>,
 }
 
 impl CliError {
     pub(super) fn msg(message: impl Into<String>) -> Self {
         CliError {
             message: message.into(),
+            child_exit: None,
         }
+    }
+
+    pub fn child_exit_code(&self) -> Option<i32> {
+        self.child_exit
+    }
+}
+
+impl From<tig_private::changes::ChangeError> for CliError {
+    fn from(err: tig_private::changes::ChangeError) -> Self {
+        CliError::msg(err.to_string())
     }
 }
 
@@ -296,7 +312,8 @@ pub fn run() -> Result<()> {
             force,
             verbose,
         } => export_git::run(repository, &path, bookmark, declassify, force, verbose)?,
-        Cmd::Status => status::run(repository)?,
+        Cmd::Status { short, null } => status::run(repository, short, null)?,
+        Cmd::Watch => watch::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
         Cmd::Log { limit } => log::run(repository, limit)?,
@@ -316,6 +333,18 @@ pub fn run() -> Result<()> {
         Cmd::Why { path } => why::run(repository, &path)?,
         Cmd::Identity { show } => identity::run(show)?,
         Cmd::Remote { action } => remote::run(repository, action)?,
+        Cmd::Role(args) => role::run(repository, args)?,
+        Cmd::Env(args) => {
+            let status = env::run(repository, args)?;
+            if !status.success() {
+                return Err(CliError {
+                    message: String::new(),
+                    child_exit: Some(status.code().unwrap_or(1)),
+                });
+            }
+        }
+        Cmd::Seal { remote, bookmark, revision, role } => changes::seal(repository, remote, bookmark, revision, role)?,
+        Cmd::Reveal { remote, revision } => changes::reveal(repository, remote, revision)?,
         Cmd::Publish {
             remote,
             bookmark,
@@ -362,6 +391,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Snapshot filesystem changes from native events
+    Watch,
+    /// Manage ranked roles and their access groups
+    Role(role::Args),
+    /// Run a command with secrets authorized for a role
+    Env(env::Args),
+    /// Publish an opaque change that can be opened in place
+    Seal {
+        remote: String,
+        bookmark: String,
+        #[arg(short = 'r', long, value_name = "REV")]
+        revision: Option<String>,
+        #[arg(long)]
+        role: String,
+    },
+    /// Reveal an opaque change without rewriting its public history
+    Reveal {
+        remote: String,
+        #[arg(short = 'r', long, value_name = "REV")]
+        revision: String,
+    },
     /// Import complete Git history into this repository (creates an empty destination)
     ImportGit {
         /// Source Git working tree or bare repository
@@ -401,7 +451,14 @@ enum Cmd {
     },
     /// Show the working change and what differs from its parent
     #[command(alias = "st")]
-    Status,
+    Status {
+        /// Print only change letters and paths; clean changes produce no output
+        #[arg(short, long)]
+        short: bool,
+        /// End each path with NUL instead of newline; implies --short
+        #[arg(short = 'z', long = "null")]
+        null: bool,
+    },
     /// Show a revision against its first parent
     Diff {
         /// Revision to diff. Defaults to `@`.

@@ -1,7 +1,11 @@
 //! `tig identity`
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
+
+mod protection;
 
 use tig_private::keys::Identity;
 
@@ -36,7 +40,7 @@ pub(super) fn load_or_create() -> Result<Identity> {
         }
     }
     let identity = Identity::generate()?;
-    let bytes = identity.to_bytes();
+    let bytes = protection::seal(&identity)?;
     let created = super::disk::write_new(&path, &bytes[..], true)?;
     if created {
         Ok(identity)
@@ -45,8 +49,8 @@ pub(super) fn load_or_create() -> Result<Identity> {
     }
 }
 
-/// The identity when the file already exists. Missing is `None`; a short or
-/// long file is an error. Fetch uses this so an outsider needs no identity.
+/// The identity when the file already exists. Missing is `None`; malformed
+/// or locked envelopes are errors. Fetch uses this so an outsider needs no identity.
 pub(super) fn load_if_present() -> Result<Option<Identity>> {
     let path = identity_path()?;
     if path.try_exists()? {
@@ -63,17 +67,21 @@ fn print_identity(identity: &Identity) {
 }
 
 fn read_identity(path: &std::path::Path) -> Result<Identity> {
-    let bytes = fs::read(path)
+    let mut bytes = Zeroizing::new(Vec::new());
+    fs::File::open(path).and_then(|file| file.take(16 * 1024 + 1).read_to_end(&mut bytes))
         .map_err(|err| CliError::msg(format!("cannot read {}: {err}", ui::show_path(path))))?;
-    if bytes.len() != 64 {
-        return Err(CliError::msg(format!(
-            "{} must be 64 bytes",
-            ui::show_path(path)
-        )));
+    if bytes.len() > 16 * 1024 {
+        return Err(CliError::msg("protected identity file is too large"));
     }
-    let mut stored = [0u8; 64];
-    stored.copy_from_slice(&bytes);
-    Ok(Identity::from_bytes(stored))
+    if bytes.len() == 64 && !bytes.starts_with(b"TIGI") {
+        let mut stored = [0u8; 64];
+        stored.copy_from_slice(&bytes);
+        let identity = Identity::from_bytes(stored);
+        let protected = protection::seal(&identity)?;
+        super::disk::write_replace(path, &protected, true)?;
+        return Ok(identity);
+    }
+    protection::open(&bytes)
 }
 
 fn identity_path() -> Result<PathBuf> {

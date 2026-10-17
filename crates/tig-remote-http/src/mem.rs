@@ -160,6 +160,30 @@ impl Remote for MemRemote {
         Ok(self.head.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        check_group(group).map_err(RemoteError::Invalid)?;
+        let packs = self.packs.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(packs) = packs.get(&(group.to_string(), epoch)) else {
+            return Ok(Vec::new());
+        };
+        if packs.len() > MAX_LISTED_PACKS {
+            return Err(RemoteError::Invalid("too many packs".into()));
+        }
+        Ok(packs.keys().copied().collect())
+    }
+
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        check_group(group).map_err(RemoteError::Invalid)?;
+        let packs = self.packs.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(packs.get(&(group.to_string(), epoch)).and_then(|packs| packs.get(id)).cloned())
+    }
+
+    fn pack_size(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        check_group(group).map_err(RemoteError::Invalid)?;
+        let packs = self.packs.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(Some(packs.get(&(group.to_string(), epoch)).and_then(|packs| packs.get(id)).map_or(0, Vec::len)))
+    }
+
     fn commit_head(
         &self,
         expected: &HeadVersion,

@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 /// Same cap as `DirRemote` pack files, and as the bytes of one epoch's packs.
-pub(crate) const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_PACK_FILE: usize = tig_private::pack::MAX_PACK_FILE;
 /// Same cap as `DirRemote` keyring files.
 pub(crate) const MAX_KEYRING_FILE: u64 = 64 * 1024 * 1024;
 /// Same cap as `DirRemote` manifest files.

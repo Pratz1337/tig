@@ -38,13 +38,14 @@ use tig_core::{ObjectId, ObjectKind};
 use crate::keyring::Keyring;
 use crate::pack::Pack;
 
-const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
+const MAX_PACK_FILE: usize = crate::pack::MAX_PACK_FILE;
 const MAX_KEYRING_FILE: u64 = 64 * 1024 * 1024;
 const MAX_REFS_FILE: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_FILE: u64 = 256 * 1024 * 1024;
 const MAX_LISTED_PACKS: usize = 100_000;
 const MAX_REFS: usize = 100_000;
 const MAX_BOOKMARK: usize = 1024;
+const MAX_GROUP_NAME: usize = 1024;
 const MAX_BATCH_OBJECTS: usize = 1000;
 const MAX_BATCH_BYTES: usize = 512 * 1024 * 1024;
 const REFS_VERSION: u8 = 1;
@@ -146,6 +147,34 @@ pub trait Remote: Send + Sync {
 
     /// Pack bytes for one group and epoch, ordered by pack id.
     fn list_packs(&self, group: &str, epoch: u64) -> Result<Vec<Vec<u8>>, RemoteError>;
+
+    /// Ordered pack ids, without buffering an epoch's ciphertext.
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        let mut ids: Vec<_> = self.list_packs(group, epoch)?.iter()
+            .map(|bytes| *blake3::hash(bytes).as_bytes()).collect();
+        ids.sort();
+        if ids.len() > MAX_LISTED_PACKS || ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RemoteError::Invalid("invalid pack listing".into()));
+        }
+        Ok(ids)
+    }
+
+    /// One immutable pack; absent packs are reported without reading others.
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        for bytes in self.list_packs(group, epoch)? {
+            if blake3::hash(&bytes).as_bytes() == id {
+                verify_pack_request(&bytes, self.remote_id(), group, epoch, id)?;
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Known ciphertext size for reserving a server response before reading it.
+    /// Backends without cheap metadata return None; servers reserve the pack cap.
+    fn pack_size(&self, _group: &str, _epoch: u64, _id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        Ok(None)
+    }
 
     fn read_head(&self) -> Result<RemoteHead, RemoteError>;
 
@@ -321,6 +350,68 @@ impl DirRemote {
         Ok(out)
     }
 
+    pub fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        check_group(group)?;
+        let dir = self.root.join("packs").join(group).join(epoch.to_string());
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".pack")) else {
+                continue;
+            };
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let id = name
+                .parse::<ObjectId>()
+                .map_err(|_| RemoteError::Invalid("invalid stored pack id".into()))?;
+            if id.to_hex() != name {
+                return Err(RemoteError::Invalid("noncanonical stored pack id".into()));
+            }
+            ids.push(id.0);
+            if ids.len() > MAX_LISTED_PACKS {
+                return Err(RemoteError::Invalid("too many packs".into()));
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    pub fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        check_group(group)?;
+        let path = self.root.join("packs").join(group).join(epoch.to_string())
+            .join(format!("{}.pack", hex::encode(id)));
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !meta.is_file() || meta.len() > MAX_PACK_FILE as u64 {
+            return Err(RemoteError::Invalid("pack is too large or not a file".into()));
+        }
+        let bytes = read_limited(&path, meta.len())?;
+        verify_pack_request(&bytes, self.remote_id, group, epoch, id)?;
+        Ok(Some(bytes))
+    }
+
+    pub fn pack_size(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        check_group(group)?;
+        let path = self.root.join("packs").join(group).join(epoch.to_string())
+            .join(format!("{}.pack", hex::encode(id)));
+        match fs::metadata(path) {
+            Ok(meta) if meta.is_file() && meta.len() <= MAX_PACK_FILE as u64 => Ok(Some(meta.len() as usize)),
+            Ok(_) => Err(RemoteError::Invalid("pack is too large or not a file".into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(0)),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn read_keyring(&self) -> Result<Vec<u8>, RemoteError> {
         match self.read_head()?.keyring {
             Some(bytes) => Ok(bytes),
@@ -371,17 +462,19 @@ impl DirRemote {
             };
             let pending = encode_pending(new_keyring.as_deref(), new_manifest.as_deref())?;
             atomic_write(guard.root, &guard.root.join(PENDING_NAME), &pending, true)?;
+            #[cfg(test)]
+            crash_pause(guard.root, "after-pending");
             install_part(guard.root, &guard.root.join("keyring"), new_keyring.as_deref())?;
+            #[cfg(test)]
+            crash_pause(guard.root, "after-keyring");
             install_part(
                 guard.root,
                 &guard.root.join("manifest"),
                 new_manifest.as_deref(),
             )?;
-            match fs::remove_file(guard.root.join(PENDING_NAME)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            #[cfg(test)]
+            crash_pause(guard.root, "after-manifest");
+            remove_pending(&guard.root.join(PENDING_NAME))?;
             Ok(CommitOutcome::Committed(HeadVersion::of(
                 new_keyring.as_deref(),
                 new_manifest.as_deref(),
@@ -527,6 +620,9 @@ fn check_pack_epoch(keyring: Option<&[u8]>, group: &str, epoch: u64) -> Result<(
         Some(current) => Err(RemoteError::Invalid(format!(
             "pack is for epoch {epoch} of {group}, but the remote is at epoch {current}; publish again"
         ))),
+        // New groups stage epoch-one ciphertext before their policy/manifest CAS.
+        // Existing groups still require the current epoch.
+        None if epoch == 1 => Ok(()),
         None => Err(RemoteError::Invalid(format!(
             "the remote keyring has no group {group}"
         ))),
@@ -569,7 +665,7 @@ enum Pending {
 
 fn remove_pending(path: &Path) -> Result<(), RemoteError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(tig_core::durability::sync_parent(path)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -579,7 +675,7 @@ fn install_part(root: &Path, dest: &Path, bytes: Option<&[u8]>) -> Result<(), Re
     match bytes {
         Some(bytes) => atomic_write(root, dest, bytes, true),
         None => match fs::remove_file(dest) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(tig_core::durability::sync_parent(dest)?),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         },
@@ -699,6 +795,18 @@ impl Remote for DirRemote {
         DirRemote::list_packs(self, group, epoch)
     }
 
+    fn list_pack_ids(&self, group: &str, epoch: u64) -> Result<Vec<[u8; 32]>, RemoteError> {
+        DirRemote::list_pack_ids(self, group, epoch)
+    }
+
+    fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
+        DirRemote::get_pack(self, group, epoch, id)
+    }
+
+    fn pack_size(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<usize>, RemoteError> {
+        DirRemote::pack_size(self, group, epoch, id)
+    }
+
     fn read_head(&self) -> Result<RemoteHead, RemoteError> {
         DirRemote::read_head(self)
     }
@@ -717,11 +825,25 @@ impl Remote for DirRemote {
     }
 }
 
+fn verify_pack_request(bytes: &[u8], remote: [u8; 16], group: &str, epoch: u64, id: &[u8; 32]) -> Result<(), RemoteError> {
+    if blake3::hash(bytes).as_bytes() != id {
+        return Err(RemoteError::Invalid("pack bytes do not match the pack id".into()));
+    }
+    let header = Pack::peek_header(bytes)?;
+    if header.remote != remote || header.group != group || header.epoch != epoch {
+        return Err(RemoteError::Invalid("pack context does not match the request".into()));
+    }
+    Ok(())
+}
+
 fn check_group(group: &str) -> Result<(), RemoteError> {
     let ok = !group.is_empty()
+        && group.len() <= MAX_GROUP_NAME
         && group
             .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'+'))
+        && group.split('+').all(|part| !part.is_empty())
+        && group.split('+').zip(group.split('+').skip(1)).all(|(a, b)| a < b);
     if ok {
         Ok(())
     } else {
@@ -830,6 +952,8 @@ fn atomic_write(root: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result
         fs::create_dir_all(parent)?;
     }
     let tmp = write_temp(root, bytes)?;
+    #[cfg(test)]
+    if dest.file_name().is_some_and(|name| name == PENDING_NAME) { crash_pause(root, "before-pending-rename"); }
     publish(&tmp.0, dest, bytes, replace)
 }
 
@@ -870,7 +994,7 @@ fn publish(tmp: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result<(), R
             return same_bytes(dest, bytes);
         }
         match fs::rename(tmp, dest) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(tig_core::durability::sync_parent(dest)?),
             Err(error) => {
                 if !replace && dest.try_exists()? {
                     return same_bytes(dest, bytes);
@@ -899,8 +1023,57 @@ fn same_bytes(dest: &Path, bytes: &[u8]) -> Result<(), RemoteError> {
 }
 
 #[cfg(test)]
+fn crash_pause(root: &Path, phase: &str) {
+    if std::env::var_os("TIG_TEST_REMOTE_DIR").is_some_and(|path| Path::new(&path) == root)
+        && std::env::var("TIG_TEST_REMOTE_PHASE").ok().as_deref() == Some(phase)
+    {
+        println!("TIG_REMOTE_WRITE_READY");
+        std::io::stdout().flush().unwrap();
+        loop { std::thread::park(); }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_mid_remote_write_recovers_a_complete_keyring_and_manifest() {
+        if let Some(root) = std::env::var_os("TIG_TEST_REMOTE_DIR") {
+            let remote = DirRemote::open(root).unwrap();
+            remote.commit_head(&remote.read_head().unwrap().version(), Some(b"new keyring"), Some(b"new manifest")).unwrap();
+            panic!("writer was not interrupted");
+        }
+        for phase in ["before-pending-rename", "after-pending", "after-keyring", "after-manifest"] {
+            let temp = tempfile::tempdir().unwrap();
+            let remote = DirRemote::create(temp.path(), [9; 16]).unwrap();
+            remote.commit_head(&remote.read_head().unwrap().version(), Some(b"old keyring"), Some(b"old manifest")).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "remote::tests::kill_mid_remote_write_recovers_a_complete_keyring_and_manifest", "--nocapture"])
+                .env("TIG_TEST_REMOTE_DIR", temp.path()).env("TIG_TEST_REMOTE_PHASE", phase)
+                .stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+                    if line == "TIG_REMOTE_WRITE_READY" { let _ = send.send(()); break; }
+                }
+            });
+            let ready = receive.recv_timeout(Duration::from_secs(15));
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            ready.expect("child did not reach the transaction boundary");
+            assert!(!status.success());
+            let expected = if phase == "before-pending-rename" { (b"old keyring".to_vec(), b"old manifest".to_vec()) }
+                else { (b"new keyring".to_vec(), b"new manifest".to_vec()) };
+            let recovered = remote.read_head().unwrap();
+            assert_eq!((recovered.keyring, recovered.manifest), (Some(expected.0), Some(expected.1)), "{phase}");
+            assert!(!temp.path().join(PENDING_NAME).exists());
+            assert!(matches!(remote.commit_head(&remote.read_head().unwrap().version(), Some(b"next keyring"), Some(b"next manifest")).unwrap(), CommitOutcome::Committed(_)));
+        }
+    }
+
 
     #[test]
     fn listed_packs_have_an_aggregate_byte_limit() {

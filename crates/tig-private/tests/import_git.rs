@@ -64,6 +64,26 @@ fn commit(dir: &Path, message: &str) -> gix::ObjectId {
 }
 
 #[test]
+fn oversized_git_blob_is_refused_from_its_header_without_changing_import_state() {
+    use std::io::Read;
+    use gix::objs::Write as GitWrite;
+    let source = init();
+    let git_repo = gix::open(source.path()).unwrap();
+    let size = tig_core::blob::MAX_MATERIALIZE + 1;
+    let blob = git_repo.objects.write_stream(gix::objs::Kind::Blob, size,
+        &mut std::io::repeat(0).take(size)).unwrap();
+    let tree = input(source.path(), &["mktree"], format!("100644 blob {blob}\tlarge.bin\n").as_bytes());
+    let commit = input(source.path(), &["commit-tree", &tree], b"large blob\n");
+    git(source.path(), &["update-ref", "refs/heads/main", &commit]);
+    let store = MemoryStore::new();
+    let mut state = ImportState::new(false).unwrap();
+    let before = state.encode();
+    let error = import_git(source.path(), &store, &mut state).err().expect("oversized import must fail");
+    assert!(error.to_string().contains("256 MiB"), "{error}");
+    assert_eq!(state.encode(), before);
+}
+
+#[test]
 fn linear_merge_rename_metadata_and_incremental_identity() {
     let source = init();
     let dir = source.path();

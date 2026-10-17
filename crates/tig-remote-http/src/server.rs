@@ -23,7 +23,6 @@ use tig_core::object::hash_object;
 use tig_core::{ObjectId, ObjectKind};
 use tig_private::keyring::Keyring;
 use tig_private::keys::PublicIdentity;
-use tig_private::project::PRIVATE_GROUP;
 use tig_private::remote::{CommitOutcome, DirRemote, Remote, RemoteError, RemoteHead};
 
 use crate::auth::{
@@ -816,7 +815,7 @@ fn dispatch(state: &State, request: &Incoming, reservation: &mut Reservation<'_>
         ("PUT", "/v1/packs") => put_pack(state, request, reservation),
         ("GET", "/v1/head") => get_head(state, reservation),
         ("PUT", "/v1/head") => put_head(state, request, reservation),
-        ("GET", _) if path.starts_with("/v1/packs/") => get_packs(state, path),
+        ("GET", _) if path.starts_with("/v1/packs/") => get_packs(state, path, reservation),
         _ => Err(refuse(404, "not found")),
     };
     match outcome {
@@ -988,23 +987,19 @@ fn put_pack(
     Ok(response(200, "ok", Vec::new(), "-", "-"))
 }
 
-/// One group and epoch of packs, by pack id. Packs never change, so a
-/// reload keeps the copies already held.
+/// One group and epoch of pack ids. Ciphertext is read one pack at a time.
 #[derive(Default)]
 struct PackCache {
     key: Option<(String, u64)>,
     loaded: Option<Instant>,
-    packs: BTreeMap<[u8; 32], Arc<Vec<u8>>>,
+    ids: Vec<[u8; 32]>,
 }
 
-/// The cache lock is held while reading, so at most one epoch's packs
-/// (`MAX_PACK_FILE` in total) are being loaded at a time.
-fn load_packs(
+fn load_pack_ids(
     state: &State,
     group: &str,
     epoch: u64,
-    want: Option<&[u8; 32]>,
-) -> Result<BTreeMap<[u8; 32], Arc<Vec<u8>>>, Response> {
+) -> Result<Vec<[u8; 32]>, Response> {
     let mut cache = lock(&state.packs);
     let same = cache
         .key
@@ -1014,38 +1009,22 @@ fn load_packs(
         && cache
             .loaded
             .is_some_and(|at| at.elapsed() < PACK_CACHE_FRESH);
-    let hit = same && want.is_some_and(|id| cache.packs.contains_key(id));
-    if !(fresh || hit) {
-        let old = if same {
-            std::mem::take(&mut cache.packs)
-        } else {
-            BTreeMap::new()
-        };
+    if !fresh {
         cache.key = None;
-        cache.packs.clear();
-        let listed = state.remote.list_packs(group, epoch).map_err(backend)?;
-        if listed.len() > MAX_LISTED_PACKS {
+        cache.ids.clear();
+        let ids = state.remote.list_pack_ids(group, epoch).map_err(backend)?;
+        if ids.len() > MAX_LISTED_PACKS || ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(refuse(500, "stored pack listing is too large"));
-        }
-        let mut remaining = MAX_PACK_FILE;
-        let mut packs = BTreeMap::new();
-        for bytes in listed {
-            remaining = remaining
-                .checked_sub(bytes.len())
-                .ok_or_else(|| refuse(500, "stored pack listing is too large"))?;
-            let id = *blake3::hash(&bytes).as_bytes();
-            let shared = old.get(&id).cloned().unwrap_or_else(|| Arc::new(bytes));
-            packs.insert(id, shared);
         }
         cache.key = Some((group.to_string(), epoch));
         cache.loaded = Some(Instant::now());
-        cache.packs = packs;
+        cache.ids = ids;
     }
-    Ok(cache.packs.clone())
+    Ok(cache.ids.clone())
 }
 
 /// `/v1/packs/<group>/<epoch>` lists pack ids; `.../<pack id>` is one pack.
-fn get_packs(state: &State, path: &str) -> Result<Response, Response> {
+fn get_packs(state: &State, path: &str, reservation: &mut Reservation<'_>) -> Result<Response, Response> {
     let rest = path.strip_prefix("/v1/packs/").unwrap_or("");
     let parts: Vec<&str> = rest.split('/').collect();
     let (group, epoch, pack) = match parts.as_slice() {
@@ -1065,18 +1044,27 @@ fn get_packs(state: &State, path: &str) -> Result<Response, Response> {
         .ok_or_else(|| refuse(400, "bad epoch"))?;
     match pack {
         None => {
-            let packs = load_packs(state, group, epoch, None)?;
-            let ids: Vec<ObjectId> = packs.keys().map(|id| ObjectId(*id)).collect();
+            if !reservation.grow(MAX_ID_HTTP.saturating_mul(2)) {
+                return Err(refuse(503, "server is busy"));
+            }
+            let ids: Vec<ObjectId> = load_pack_ids(state, group, epoch)?.into_iter().map(ObjectId).collect();
             let body = encode_ids(&ids).map_err(|e| refuse(500, &e))?;
             Ok(response(200, "ok", body, "-", "-"))
         }
         Some(hex_id) => {
             let id: [u8; 32] = parse_fixed_hex(hex_id).ok_or_else(|| refuse(400, "bad pack id"))?;
-            match load_packs(state, group, epoch, Some(&id))?.remove(&id) {
+            let size = state.remote.pack_size(group, epoch, &id).map_err(backend)?.unwrap_or(MAX_PACK_FILE);
+            // Loose reads can double their vector capacity; parsing also builds
+            // wire-id sets and ranges, including for malformed stored packs.
+            if size > MAX_PACK_FILE || !reservation.grow(size.saturating_mul(6)) {
+                return Err(refuse(503, "server is busy"));
+            }
+            match state.remote.get_pack(group, epoch, &id).map_err(backend)? {
                 Some(bytes) => {
-                    let mut out = response(200, "ok", Vec::new(), "-", "-");
-                    out.body = bytes;
-                    Ok(out)
+                    if bytes.len() > size {
+                        return Err(refuse(500, "stored pack changed while reading"));
+                    }
+                    Ok(response(200, "ok", bytes, "-", "-"))
                 }
                 None => Err(refuse(404, "missing pack")),
             }
@@ -1157,34 +1145,52 @@ fn put_head(
     }
 }
 
-/// Only the pinned owner changes the keyring, to one that verifies against
-/// that owner with a strictly higher counter. A member therefore cannot
-/// install garbage (locking every writer out) or roll back to an old
-/// keyring that still lists a revoked member.
+/// Accept only an authenticated extension of the current policy and grants.
+/// Administrative batch actors may move a role head; transfer acceptance
+/// requires the successor's signature while the root trust pin stays fixed.
 fn check_keyring_change(
     state: &State,
     signer: &PublicIdentity,
     current: Option<&[u8]>,
     next: &[u8],
 ) -> Result<(), Response> {
-    if signer != &state.owner {
-        return Err(refuse(403, "only the owner may change the keyring"));
-    }
-    let floor = match current {
-        None => 0,
-        Some(bytes) => verified_keyring(bytes, &state.owner, state.remote.remote_id(), 0)
-            .map_err(|e| {
-                eprintln!("tig-server stored keyring does not verify: {e}");
-                refuse(500, "stored keyring does not verify")
-            })?
-            .head
-            .counter
-            .checked_add(1)
-            .ok_or_else(|| refuse(400, "keyring counter overflow"))?,
+    let previous = current.map(|bytes| verified_keyring(bytes, &state.owner, state.remote.remote_id(), 0))
+        .transpose().map_err(|_| refuse(500, "stored keyring does not verify"))?;
+    let floor = previous.as_ref().map_or(Ok(0), |ring| ring.head.counter.checked_add(1)
+        .ok_or_else(|| refuse(400, "keyring counter overflow")))?;
+    let proposed = verified_keyring(next, &state.owner, state.remote.remote_id(), floor)
+        .map_err(|e| refuse(400, &format!("keyring refused: {e}")))?;
+    let Some(previous) = previous else {
+        return if signer == &state.owner && proposed.policy.is_empty() { Ok(()) }
+            else { Err(refuse(403, "only the configured owner may initialize the keyring")) };
     };
-    verified_keyring(next, &state.owner, state.remote.remote_id(), floor)
-        .map(|_| ())
-        .map_err(|e| refuse(400, &format!("keyring refused: {e}")))
+    let before = previous.policy_snapshot().map_err(|_| refuse(500, "stored role policy is invalid"))?;
+    let after = proposed.policy_snapshot().map_err(|_| refuse(400, "proposed role policy is invalid"))?;
+    if proposed.policy.is_empty() {
+        return if previous.policy.is_empty() && signer == &before.current_owner { Ok(()) }
+            else { Err(refuse(403, "role policy cannot be removed")) };
+    }
+    if proposed.head.counter != floor
+        || !proposed.policy.transitions.starts_with(&previous.policy.transitions)
+        || proposed.policy.transitions.len() == previous.policy.transitions.len()
+        || !previous.grants.iter().all(|grant| proposed.grants.contains(grant))
+    {
+        return Err(refuse(403, "keyring change does not extend current policy and grants"));
+    }
+    let baseline = if previous.policy.is_empty() {
+        previous.grants.iter().map(|grant| grant.signature).collect()
+    } else { previous.policy.baseline.clone() };
+    if proposed.policy.baseline != baseline {
+        return Err(refuse(403, "historical grant baseline cannot be changed"));
+    }
+    let batch = &proposed.policy.transitions[previous.policy.transitions.len()..];
+    if batch.iter().any(|transition| transition.counter_after != floor) {
+        return Err(refuse(403, "policy batch has an unexpected counter"));
+    }
+    if signer == &before.current_owner || signer == &after.current_owner
+        || batch.iter().any(|transition| transition.signer == signer.signing)
+    { Ok(()) } else { Err(refuse(403, "request signer did not authorize this keyring change")) }
+
 }
 
 fn verified_keyring(
@@ -1258,9 +1264,10 @@ fn authenticate(
     );
     verify_signature(&auth.identity.signing, &message, &auth.signature)
         .map_err(|()| refuse(401, "bad signature"))?;
-    if !writer_allowed(state, &auth.identity, reservation)? {
-        return Err(refuse(403, "not the owner or a current member"));
-    }
+    let allowed = if request.path == "/v1/head" {
+        head_writer_allowed(state, request, &auth.identity, reservation)?
+    } else { writer_allowed(state, &auth.identity, reservation)? };
+    if !allowed { return Err(refuse(403, "request signer is not authorized for this operation")); }
     lock(&state.consumed)
         .consume(auth.issued, &auth.nonce, state.nonce_key.now_ms())
         .map_err(|error| match error {
@@ -1271,9 +1278,32 @@ fn authenticate(
     Ok(auth.identity)
 }
 
-/// Before any keyring exists only the configured owner may write. After
-/// that: the keyring's owner (which must be the configured owner) or the
-/// recipient of a grant for the current `private` epoch.
+/// Administrative heads may carry a valid policy transition without upload
+/// permission. Transfer acceptance is signed by the new owner and conditional
+/// on the exact prior head; it grants no separate object-upload permission.
+fn head_writer_allowed(
+    state: &State, request: &Incoming, who: &PublicIdentity,
+    reservation: &mut Reservation<'_>,
+) -> Result<bool, Response> {
+    if writer_allowed(state, who, reservation)? { return Ok(true); }
+    let current = read_remote_head(state, reservation)?;
+    let (keyring, manifest) = decode_head(&request.body).map_err(|e| refuse(400, &e))?;
+    let Some(next) = keyring.as_deref() else { return Ok(false); };
+    if request.header("if-match").and_then(parse_etag) != Some(current.version()) { return Ok(false); }
+    check_keyring_change(state, who, current.keyring.as_deref(), next)?;
+    if let Some(bytes) = manifest.as_deref() {
+        if current.manifest.as_deref() != Some(bytes) {
+            let next = Keyring::decode(next).map_err(|_| refuse(400, "invalid keyring"))?;
+            let policy = next.policy_snapshot().map_err(|_| refuse(400, "invalid role policy"))?;
+            if !policy.has(who, tig_private::roles::PUBLISH) { return Ok(false); }
+        }
+    }
+    Ok(true)
+}
+
+/// The configured owner initializes simple mode. Current grant holders can
+/// publish in simple mode; role mode requires the current PUBLISH permission.
+/// A former root owner receives no authority merely from the trust pin.
 fn writer_allowed(
     state: &State,
     who: &PublicIdentity,
@@ -1288,15 +1318,11 @@ fn writer_allowed(
             eprintln!("tig-server stored keyring does not verify: {e}");
             refuse(500, "stored keyring does not verify")
         })?;
-    if who == &keyring.owner {
-        return Ok(true);
-    }
-    let Some(&epoch) = keyring.head.epochs.get(PRIVATE_GROUP) else {
-        return Ok(false);
-    };
+    let policy = keyring.policy_snapshot().map_err(|_| refuse(500, "stored role policy is invalid"))?;
+    if policy.explicit { return Ok(policy.has(who, tig_private::roles::PUBLISH)); }
+    if who == &policy.current_owner { return Ok(true); }
     Ok(keyring.grants.iter().any(|grant| {
-        grant.context.group == PRIVATE_GROUP
-            && grant.context.epoch == epoch
+        keyring.head.epochs.get(&grant.context.group) == Some(&grant.context.epoch)
             && grant.recipient == *who
     }))
 }
@@ -1458,6 +1484,35 @@ mod tests {
             "response lost its memory reservation"
         );
         drop(held);
+        assert_eq!(*lock(&state.bodies.used), 0);
+    }
+
+    #[test]
+    fn legacy_pack_reserves_memory_before_reading_ciphertext() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let remote = tig_private::remote::DirRemote::create(dir.path(), [94; 16]).unwrap();
+        let pack_dir = dir.path().join("packs/private/1");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let id = [8; 32];
+        let size = 17 * 1024 * 1024;
+        let file = fs::File::create(pack_dir.join(format!("{}.pack", hex::encode(id)))).unwrap();
+        file.set_len(size as u64).unwrap();
+        drop(file);
+        let owner = tig_private::keys::Identity::generate().unwrap();
+        let state = State {
+            remote: Arc::new(remote), owner: owner.public(),
+            nonce_key: NonceKey::generate().unwrap(), consumed: Mutex::new(ConsumedNonces::default()),
+            head_lock: Mutex::new(()), head_dir: Some(dir.path().to_path_buf()),
+            bodies: Budget { used: Mutex::new(0), cap: size * 6 - 1 },
+            packs: Mutex::new(PackCache::default()),
+        };
+        let mut held = state.bodies.reserve(0).unwrap();
+        // Reading the deliberately invalid body would produce a backend error.
+        let response = get_packs(&state, &format!("/v1/packs/private/1/{}", hex::encode(id)), &mut held)
+            .err().unwrap();
+        assert_eq!(response.status, 503);
         assert_eq!(*lock(&state.bodies.used), 0);
     }
 
