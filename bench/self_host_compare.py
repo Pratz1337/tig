@@ -81,7 +81,7 @@ def main():
         "median_ms": {name: {mode: statistics.median(rows) for mode, rows in values.items()}
                       for name, values in samples.items()},
     }
-    args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(json.dumps({"files": files, "runs": args.runs, "median_ms": result["median_ms"]}, indent=2))
 
 

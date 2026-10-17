@@ -87,3 +87,5 @@ the native bookmark instead of rewriting it.
 Run `bench/compare.py` against a release binary and retain the raw samples.
 `bench/RESULTS.md` includes workloads where TIG is slower. Faster than Git is a
 measurement goal for each operation and workload, not a universal guarantee.
+See [`bench/SELF_HOSTING.md`](bench/SELF_HOSTING.md) for this checkout's validation
+and real-source comparison, including the raw timing samples.
