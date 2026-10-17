@@ -227,10 +227,11 @@ pub struct Tree {
     has_conflicts: bool,
 }
 
-/// True if `name` would be treated as the `.tig` metadata directory by some
+/// True if `name` would be treated as the named metadata directory by some
 /// filesystem: any case, and with the zero-width characters that macOS HFS+
 /// ignores removed (git guards `.git` the same way).
-fn is_metadata_dir(name: &str) -> bool {
+#[inline]
+pub fn is_metadata_alias(name: &str, metadata: &str) -> bool {
     const IGNORABLE: &[char] = &[
         '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}',
         '\u{202D}', '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}',
@@ -239,10 +240,10 @@ fn is_metadata_dir(name: &str) -> bool {
     // Hot path (every path the walk builds): a plain ASCII name cannot hide
     // ignorable characters, so compare without allocating.
     if name.is_ascii() {
-        return name.eq_ignore_ascii_case(".tig");
+        return name.eq_ignore_ascii_case(metadata);
     }
-    let visible: String = name.chars().filter(|c| !IGNORABLE.contains(c)).collect();
-    visible.eq_ignore_ascii_case(".tig")
+    name.chars().filter(|c| !IGNORABLE.contains(c)).map(|c| c.to_ascii_lowercase())
+        .eq(metadata.chars().map(|c| c.to_ascii_lowercase()))
 }
 
 /// Validates one path component.
@@ -283,7 +284,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     if name.ends_with('.') || name.ends_with(' ') {
         return bad("name ends with '.' or ' ' (Windows would rename it)");
     }
-    if is_metadata_dir(name) {
+    if is_metadata_alias(name, ".tig") {
         return bad("'.tig' is reserved for repository metadata");
     }
     Ok(())

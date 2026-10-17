@@ -205,8 +205,11 @@ fn next_job(shared: &Mutex<Shared>, wake: &Condvar) -> Option<Dir> {
     }
 }
 
-fn is_vcs_metadata(name: &OsStr) -> bool {
-    [".git", ".hg", ".svn", ".jj"].iter().any(|vcs| name == OsStr::new(vcs))
+pub(crate) fn is_vcs_metadata(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        [".git", ".hg", ".svn", ".jj"].iter()
+            .any(|vcs| tig_core::object::is_metadata_alias(name, vcs))
+    })
 }
 
 /// Lists one directory: visits its files, returns its subdirectories.

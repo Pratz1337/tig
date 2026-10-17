@@ -932,7 +932,7 @@ impl WorkingCopy {
         if !(self.trusted && cached_seen == self.state.cache.len()) {
             let _t = crate::trace::span("    scan: deletions");
             let seen: BTreeSet<RepoPath> = seen.into_iter().collect();
-            self.drop_absent(repo, ws, &mut cache, &mut stats, &seen, &baseline, include_tracked)?;
+            self.drop_absent(repo, ws, &mut cache, &mut stats, &seen, &baseline, include_tracked, warnings)?;
         }
         Ok((stats, cache))
     }
@@ -948,6 +948,7 @@ impl WorkingCopy {
         seen: &BTreeSet<RepoPath>,
         baseline: &BTreeMap<RepoPath, Leaf>,
         include_tracked: bool,
+        warnings: &mut Vec<String>,
     ) -> Result<()> {
         // The walker skips ignored paths. A path still on disk is not a
         // deletion: drop it only when it is gone. Tracked ignored files keep
@@ -970,6 +971,14 @@ impl WorkingCopy {
             );
         }
         for path in absent {
+            if path.components().any(|name| crate::walk::is_vcs_metadata(OsStr::new(name))) {
+                ws.remove(repo, &path)?;
+                cache.remove(&path);
+                warnings.push(format!(
+                    "stopped tracking repository metadata {path}; earlier history may contain credentials; rotate them if shared"
+                ));
+                continue;
+            }
             let disk = disk_path(&self.root, &path);
             match symlink_metadata_kind(&disk)? {
                 None => {
@@ -1312,6 +1321,11 @@ fn split_diff(diff: &[DiffEntry]) -> (Vec<&DiffEntry>, Vec<&DiffEntry>) {
 /// Refuses the checkout before any write.
 fn preflight(root: &Path, paths: &BTreeSet<RepoPath>, diff: &[DiffEntry]) -> Result<()> {
     for change in diff {
+        if change.path.components().any(|name| crate::walk::is_vcs_metadata(OsStr::new(name))) {
+            return Err(Error::Msg(format!(
+                "refusing to check out {}: version-control metadata", change.path
+            )));
+        }
         ensure_file_leaf(change.old.as_ref(), &change.path)?;
         ensure_file_leaf(change.new.as_ref(), &change.path)?;
     }
@@ -2374,7 +2388,7 @@ fn ensure_not_metadata_alias(path: &Path) -> Result<()> {
         if resolved
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case(".tig"))
+            .is_some_and(|name| name.eq_ignore_ascii_case(".tig") || crate::walk::is_vcs_metadata(OsStr::new(name)))
         {
             return Err(Error::Msg(format!(
                 "refusing metadata alias {}",
@@ -2473,6 +2487,39 @@ fn state_is_ahead(repo: &Repo, recorded: ObjectId, current: ObjectId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_vcs_metadata_is_removed_without_reading_new_credentials() {
+        for trusted in [false, true] {
+            for rehash in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut repo, mut wc) = WorkingCopy::init(dir.path(), Settings::default()).unwrap();
+                let path = RepoPath::new(".git/config").unwrap();
+                let old = b"legacy metadata";
+                let new = b"updated credentials must stay outside the object store";
+                let mut ws = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+                ws.write(&repo, &path, old).unwrap();
+                ws.snapshot(&mut repo).unwrap();
+                wc.state.working = ws.working_revision();
+                wc.state.tree = repo.revision(&wc.state.working).unwrap().tree;
+                wc.state.cache.insert(path.clone(), FileState {
+                    size: old.len() as u64, mtime: (0, 0), ctime: None,
+                    kind: EntryKind::File, id: hash_object(ObjectKind::Blob, old),
+                    racy: false, symlink_stand_in: false,
+                });
+                wc.trusted = trusted;
+                fs::create_dir(dir.path().join(".git")).unwrap();
+                fs::write(dir.path().join(".git/config"), new).unwrap();
+
+                let stats = wc.snapshot_with_rehash(&mut repo, rehash).unwrap();
+                let current = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+                assert!(current.leaf(&repo, &path).unwrap().is_none());
+                assert!(!repo.store().has(&hash_object(ObjectKind::Blob, new)).unwrap());
+                assert_eq!(fs::read(dir.path().join(".git/config")).unwrap(), new);
+                assert!(stats.warnings.iter().any(|warning| warning.contains("earlier history")));
+            }
+        }
+    }
 
     fn rp(text: &str) -> RepoPath {
         RepoPath::new(text).unwrap()
