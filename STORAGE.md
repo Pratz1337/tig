@@ -5,7 +5,9 @@ files use a version-1 kind-7 manifest naming ordered 4 MiB blob chunks; only
 the last chunk may be shorter. Identical chunks deduplicate. The current
 manifest limit is 64 GiB per file.
 
-Snapshots read regular files a chunk at a time. Checkout and `tig cat` stream
+Snapshots read regular files a chunk at a time, growing the read buffer only
+as bytes arrive so small files do not allocate and zero-fill a full chunk.
+Checkout and `tig cat` stream
 the content; checkout validates the complete chunk closure before modifying
 disk files. Missing, mistyped, incorrectly sized or corrupt chunks are errors.
 Rehashing identical legacy large blobs preserves their IDs and history.
