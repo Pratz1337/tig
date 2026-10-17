@@ -45,6 +45,8 @@ flowchart LR
 
 ## Quick start
 
+To develop this repository with TIG on Windows, follow the [GitHub-to-TIG setup](SELF_HOSTING.md#set-up-a-fresh-windows-workspace-from-github).
+
 ```sh
 cargo build --release -p tig-cli
 

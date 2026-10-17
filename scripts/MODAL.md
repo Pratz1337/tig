@@ -14,6 +14,11 @@
 
 The upload is the working tree, including uncommitted edits. It skips `target/`, `bin/`, `.git/`, any `.tig/` directory, and `pending/`. Registry, git, and build outputs persist on the Modal volume `tig-cargo-cache`.
 
+For a fresh machine, install the pinned build dependency with
+`python -m pip install -r scripts/requirements-build.txt`, then authenticate with
+`python -m modal setup`. The complete Windows bootstrap is in
+[`SELF_HOSTING.md`](../SELF_HOSTING.md#set-up-a-fresh-windows-workspace-from-github).
+
 Tests gated with `#[cfg(windows)]` do not run on Modal (Linux). Run those locally only when Windows-specific code changes, for example `cargo test -p tig-cli -- <windows test names>`.
 
 ## Parallel agents
