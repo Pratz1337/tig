@@ -124,6 +124,8 @@ flowchart TB
 
 About 27k lines of Rust. See [`DESIGN.md`](DESIGN.md) for the full design contract.
 
+This repository now uses TIG locally. See [`SELF_HOSTING.md`](SELF_HOSTING.md) for compact status output, the privacy demo and the GitHub export bridge.
+
 ## Speed
 
 Synthetic trees on Linux, median wall time, git on default settings:

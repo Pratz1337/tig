@@ -84,6 +84,8 @@ fn markers_drafts_resolution_and_undo_survive_reopening_and_rehash() {
     for _ in 0..3 {
         assert!(run(dir.path(), &["status"]).contains("C file"));
     }
+    assert_eq!(run(dir.path(), &["status", "--short"]), "C file\n");
+    assert_eq!(run(dir.path(), &["status", "-z"]), "C file\0");
     run(dir.path(), &["snapshot", "--rehash"]);
     assert_eq!(
         leaf(dir.path(), "file").id(),

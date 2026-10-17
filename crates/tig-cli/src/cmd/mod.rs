@@ -312,7 +312,7 @@ pub fn run() -> Result<()> {
             force,
             verbose,
         } => export_git::run(repository, &path, bookmark, declassify, force, verbose)?,
-        Cmd::Status => status::run(repository)?,
+        Cmd::Status { short, null } => status::run(repository, short, null)?,
         Cmd::Watch => watch::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
         Cmd::Diff { revision, stat } => diff::run(repository, revision.as_deref(), stat)?,
@@ -451,7 +451,14 @@ enum Cmd {
     },
     /// Show the working change and what differs from its parent
     #[command(alias = "st")]
-    Status,
+    Status {
+        /// Print only change letters and paths; clean changes produce no output
+        #[arg(short, long)]
+        short: bool,
+        /// End each path with NUL instead of newline; implies --short
+        #[arg(short = 'z', long = "null")]
+        null: bool,
+    },
     /// Show a revision against its first parent
     Diff {
         /// Revision to diff. Defaults to `@`.
