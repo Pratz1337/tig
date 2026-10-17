@@ -1,3 +1,72 @@
+# VCS metadata boundary review — 2026-10-18
+
+Scope: filesystem scanning, tracked-file fallback and checkout. The object,
+walker and working-copy modules and the new integration test were read in full.
+This is a focused source review with regression and runtime evidence.
+
+## Findings fixed
+
+All three findings have high confidence and failed before the fix.
+
+| Severity | Location | Failure and fix |
+|---|---|---|
+| HIGH | `crates/tig-cli/src/walk.rs`, `crates/tig-core/src/object.rs` | Exact lowercase exclusions admitted `.GIT/config` and other metadata aliases into snapshots and plaintext public exports. Reuse the portable metadata-name comparison for full and event-selected scans; ASCII comparisons allocate nothing. |
+| HIGH | `crates/tig-cli/src/wc.rs::preflight`, `ensure_not_metadata_alias` | An incoming tree could write VCS metadata, including hook paths. Refuse `.git`, `.hg`, `.svn` and `.jj` components, case/HFS+ aliases and resolved Windows aliases before any checkout mutation. |
+| HIGH | `crates/tig-cli/src/wc.rs::drop_absent` | Rehash and cache recovery could read newly changed credentials from previously tracked metadata despite the walker exclusion. Drop those paths from the current tree/cache before reading disk contents, preserve the physical files, and warn about old history. |
+
+## Verification
+
+- Regression first: both new integration tests failed against the old scanner
+  and checkout; the internal legacy-cache test also failed before its fix.
+  The old Windows executable demonstrably tracked and exported a benign marker
+  from `.GIT/config`.
+- Modal targeted working-copy tests: **57 passed, 0 failed, 1 existing ignored**.
+- Modal `python -X utf8 scripts/modal_build.py test`: **537 passed, 0 failed,
+  3 existing ignored**; includes the large encrypted-file transfers.
+- Modal `python -X utf8 scripts/modal_build.py clippy`: passed with
+  `-D warnings`; Windows GNU release cross-build: passed.
+- Live Windows release checks: six case/HFS+ metadata aliases were neither
+  snapshotted nor present in reachable exported object bodies; five crafted
+  metadata trees were refused without partial checkout. An actual NTFS `GIT~1`
+  alias resolving to `.git` was also refused. Clean/add/edit/delete status,
+  UTF-8/spaces, NUL output and stored-conflict checks passed.
+
+The [raw performance samples](bench/metadata-real-source-2026-10-18.json) compare
+the same 168-file public TIG source tree across Git, the retained prior TIG
+binary and the fixed release. There are 15 alternating-order samples per cell;
+preparation is outside timings and no build/test driver ran during measurement.
+The procedure is in [the self-hosting benchmark notes](bench/SELF_HOSTING.md).
+
+| Median milliseconds | Git | Previous TIG | Fixed TIG | Fixed TIG `--short` |
+|---|---:|---:|---:|---:|
+| Clean status | 38.10 | 17.40 | 16.79 | 16.39 |
+| Edited status | 43.30 | 28.87 | 25.11 | 26.08 |
+| Record change | 90.06 | 45.95 | 41.31 | 44.79* |
+
+\* Record uses ordinary `new` in both TIG fixtures. This is another sample of
+the same command, not a short-output recording feature. Desktop background
+services remained active. These results show no measured regression in this
+workload; they do not establish a causal speedup or universal superiority. The
+previous [10k-file edited-status loss](bench/RESULTS.md) remains a target.
+
+Checked and sound within this scope: ordinary `.gitignore` stays content;
+stored names, encodings and hash labels are unchanged; metadata refusal occurs
+before checkout writes or deletes; and the snapshot fallback preserves disk
+files. Path injection, disclosure and state transitions were checked; existing
+path-based TOCTOU limits remain. No crypto, permission matching, remote
+authentication or authorization changed. SQL/template injection, web XSS,
+cookies, session fixation and CSRF are inapplicable to these filesystem paths.
+The alias matcher is bounded by the supplied component length and adds no I/O.
+
+Limits: earlier revisions and operation history still contain any metadata
+already recorded; this is not history redaction. Rotate credentials if that
+history was shared. Event-selected snapshots defer cleanup of unselected legacy
+rows until an authoritative full scan. Actual macOS/HFS+ execution and concurrent
+filesystem substitution attacks were not tested. The separate store-directory
+and crash-durability gaps in DESIGN.md remain outside this fix.
+
+---
+
 # Integrated publish/fetch review — 2026-10-12
 
 Threat model: attacker controls the public directory remote, including keyring, refs, loose objects and packs. Local identity, owner keys and pins remain trusted. Review covers library projection/pack/keyring/publish/fetch and CLI persistence, clone and working-copy integration. This is a targeted source review and adversarial regression suite, not a formal proof or a hardware power-loss experiment.
