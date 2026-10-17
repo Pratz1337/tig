@@ -1,9 +1,41 @@
 # Developing TIG with TIG
 
 This checkout uses TIG for local changes, snapshots, bookmarks, merges and undo.
-The original `.git` directory remains available for GitHub transport and recovery.
+GitHub holds the source, setup scripts, build dependencies and `.private` policy.
+Generated `.tig` state and private keys stay on the developer's machine.
 Use `bin/tig.exe` on Windows: the `tig` bundled with Git is a different program.
 Builds and tests run through `scripts/modal_build.py`; see `scripts/MODAL.md`.
+
+## Set up a fresh Windows workspace from GitHub
+
+Install Python 3.11 or later and Git, then run in PowerShell:
+
+```powershell
+git clone https://github.com/Pratz1337/tig.git tig-source
+cd tig-source
+python -m pip install -r scripts/requirements-build.txt
+python -m modal setup
+python scripts/modal_build.py release
+python scripts/setup_tig.py ../tig-work
+cd ../tig-work
+bin/tig.exe status
+```
+
+The build uses your authenticated Modal account. If you already have the TIG
+binary, pass `--tig <path>` to `setup_tig.py` and skip the build. The setup command
+imports the full committed GitHub history into a fresh TIG workspace and copies
+the executable into its ignored `bin/` directory. Source files, scripts and policy
+come from the imported history. It refuses a dirty source clone or a nonempty
+destination, so existing work is preserved. A GitHub source ZIP has no history and
+cannot be used for this full-history bootstrap.
+
+The source clone stays separate. The new workspace uses `.tig`; there is no Git
+index or staging step for local work. The original development checkout also
+retains its older `.git` directory for recovery. Both use the optional GitHub
+transport adapter below. Internet hosting for a native TIG server is separate
+and is not required for this local-workflow setup.
+
+## Daily local work
 
 ```
 bin/tig.exe status
@@ -52,6 +84,8 @@ and is described in `DESIGN.md`.
 ## GitHub bridge
 
 GitHub accepts Git, so the exported bare repository is a transport adapter.
+In a bootstrapped TIG workspace, `.git/tig-public.git` is only this adapter;
+the `.git` parent directory does not contain a working-copy index.
 Historical privacy filtering can change imported commit IDs. Preserve GitHub's
 existing history by making a bridge merge whose tree is exactly TIG's public
 export and whose parents are the observed GitHub tip and the exported TIG tip.
