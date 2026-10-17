@@ -499,7 +499,7 @@ impl Remote for HttpRemote {
     }
 
     fn get_pack(&self, group: &str, epoch: u64, id: &[u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
-        self.read_pack(group, epoch, id, tig_private::pack::PACK_BATCH_MAX)
+        self.read_pack(group, epoch, id, MAX_PACK_FILE)
     }
 
     fn read_head(&self) -> Result<RemoteHead, RemoteError> {

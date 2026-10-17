@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tig_core::ophead::MemoryOpHead;
 use tig_core::repo::{Repo, Settings, DEFAULT_WORKSPACE};
-use tig_core::store::StoreExt;
+use tig_core::store::{Store, StoreExt};
 use tig_core::treeops::{lookup, Leaf};
 use tig_core::workspace::Workspace;
 use tig_core::{EntryKind, MemoryStore, RepoPath};
@@ -17,6 +17,71 @@ use tig_private::publish::{publish, PublishError, PublishOptions, PublishState};
 use tig_private::remote::DirRemote;
 
 const MIB: u64 = 1024 * 1024;
+
+#[test]
+fn legacy_pack_object_limit_includes_aead_overhead() {
+    let key = tig_private::keys::EpochKey::generate(tig_private::keys::GroupEpoch {
+        remote: [171; 16], group: "private".into(), epoch: 1,
+    }).unwrap();
+    let mut bytes = vec![101; 256 * MIB as usize + 1];
+    let mut builder = tig_private::pack::PackBuilder::new(&key);
+    assert!(builder.add_object(tig_core::ObjectKind::Blob, tig_core::ObjectId([0; 32]), &bytes).is_err());
+    bytes.pop();
+    let id = tig_core::object::hash_object(tig_core::ObjectKind::Blob, &bytes);
+    builder.add_object(tig_core::ObjectKind::Blob, id, &bytes).unwrap();
+    let pack = builder.finish().unwrap();
+    let opened = tig_private::pack::Pack::open(&pack, &key).unwrap();
+    assert_eq!(opened.objects.len(), 1);
+    assert_eq!(opened.objects[0].1, id);
+    assert_eq!(&opened.objects[0].2[..], &bytes);
+}
+
+#[test]
+fn legacy_private_blob_above_batch_target_preserves_ids_and_history() {
+    let mut repo = Repo::init(Arc::new(MemoryStore::new()), Arc::new(MemoryOpHead::new()), Settings::default()).unwrap();
+    let bytes = vec![83; 17 * MIB as usize];
+    let private_id = repo.store().put(&tig_core::Object::Blob(bytes.clone())).unwrap();
+    let mut workspace = Workspace::open(&repo, DEFAULT_WORKSPACE).unwrap();
+    workspace.write(&repo, &RepoPath::new(".private").unwrap(), b"secrets/\n").unwrap();
+    workspace.set(&repo, RepoPath::new("secrets/legacy.bin").unwrap(), Some(Leaf::file(private_id))).unwrap();
+    workspace.snapshot(&mut repo).unwrap();
+    let original = workspace.working_revision();
+    let dir = tempfile::tempdir().unwrap();
+    let remote = DirRemote::create(dir.path(), [172; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let (_, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    let mut published = PublishState::new();
+    publish(repo.store().as_ref(), &remote, &owner, Some(&keys), &mut published,
+        &FetchState::new(), "main", original, &PublishOptions::default()).unwrap();
+    let manifest = Manifest::decode(&remote.read_head().unwrap().manifest.unwrap()).unwrap();
+    let mut large_packs = 0;
+    for (id, entry) in &manifest.packs {
+        let pack = remote.get_pack(&entry.group, entry.epoch, id).unwrap().unwrap();
+        if pack.len() > tig_private::pack::PACK_BATCH_MAX {
+            large_packs += 1;
+            let opened = tig_private::pack::Pack::open(&pack, &keys.keys[&(entry.group.clone(), entry.epoch)]).unwrap();
+            assert_eq!(opened.objects.len(), 1);
+            assert_eq!(opened.objects[0].1, private_id);
+            assert_eq!(opened.objects[0].0, tig_core::ObjectKind::Blob);
+        }
+    }
+    assert_eq!(large_packs, 1);
+    assert!(!remote.public_store().has(&private_id).unwrap());
+    let dest = MemoryStore::new();
+    let report = fetch(&remote, &dest, Some(&owner), &mut FetchState::new(), &PublishState::new()).unwrap();
+    let original_revision = repo.store().get_revision(&original).unwrap();
+    // Fetch preserves the public history, which omits local undo predecessors.
+    let expected = tig_private::project::public_revision(&original_revision,
+        original_revision.tree, original_revision.parents.clone());
+    assert_eq!(dest.get_revision(&report.refs["main"]).unwrap(), expected);
+    assert_eq!(dest.get_blob(&private_id).unwrap(), bytes);
+    assert_eq!(dest.kind(&private_id).unwrap(), Some(tig_core::ObjectKind::Blob));
+    let outsider = MemoryStore::new();
+    let report = fetch(&remote, &outsider, None, &mut FetchState::new(), &PublishState::new()).unwrap();
+    let tree = outsider.get_revision(&report.refs["main"]).unwrap().tree;
+    assert_eq!(lookup(&outsider, &tree, &RepoPath::new("secrets").unwrap()).unwrap().unwrap().kind(), EntryKind::Sealed);
+    assert!(!outsider.has(&private_id).unwrap());
+}
 
 /// Each 4 MiB region has different bytes, so the large-file test cannot
 /// accidentally exercise only one deduplicated chunk.

@@ -13,7 +13,7 @@ Whole-buffer library helpers refuse content above 256 MiB; callers use
 `tig_core::blob::ContentReader` or `write_content` for larger files. Large-file
 diffs report content and size changes without loading the entire file as text.
 
-Private content is encrypted in independent packs capped at 16 MiB. Each
+New chunked private content is encrypted in independent packs capped at 16 MiB. Each
 file's manifest and chunk closure travel together. Publish and Git export
 include canonical 4 MiB chunk IDs and the complete-content blob ID in the
 private-content paste check for both legacy and chunked files. This includes
@@ -26,11 +26,14 @@ Git export streams
 content directly into the object database. Git import chunks the blob after
 gitoxide reads it. Packed Git import still materializes a Git blob and refuses
 blobs above 256 MiB from their headers before allocating the body.
-Legacy kind-1 storage reads also retain their existing whole-object behavior.
-A legacy private blob larger than 16 MiB cannot be freshly uploaded in the
-new bounded pack path, and fetching an older pack larger than 16 MiB is
-refused before allocation. Such history needs a separate migration or legacy
-transport solution; local rehash deliberately preserves its old IDs.
+Legacy kind-1 storage reads retain their existing whole-object behavior.
+Private legacy blobs above 4 MiB travel in isolated version-1 packs, preserving
+their object IDs and revision history. Their plaintext limit is 256 MiB;
+the decoder also allows the 16-byte authentication tag. Directory and HTTPS
+remotes accept older packs up to 512 MiB, fetched one at a time. The server
+reserves response memory before reading ciphertext, and download size caps
+also apply to growing files and chunked HTTP responses. These compatibility
+transfers can use substantially more memory than new chunked content.
 
 `tig watch` runs until interrupted and snapshots delivered native filesystem
 events. Ordinary file events select those files and force a rehash. Directory

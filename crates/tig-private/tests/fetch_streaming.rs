@@ -146,6 +146,42 @@ fn private_chunk_closure_can_span_packs_and_orphans_are_not_downloaded() {
 }
 
 #[test]
+fn legacy_pack_above_batch_target_fetches_and_tampering_preserves_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = DirRemote::create(dir.path(), [179; 16]).unwrap();
+    let owner = Identity::generate().unwrap();
+    let (keyring, keys) = Keyring::create(remote.remote_id(), &owner).unwrap();
+    let key = &keys.keys[&("private".into(), 1)];
+    let bytes = vec![89; 17 * 1024 * 1024];
+    let file = tig_core::object::hash_object(ObjectKind::Blob, &bytes);
+    let path = RepoPath::new(".env").unwrap();
+    let sealed = key.seal(&path, EntryKind::File, &file);
+    let mut builder = PackBuilder::new(key);
+    builder.add_object(ObjectKind::Blob, file, &bytes).unwrap();
+    builder.add_sealed(sealed, path, EntryKind::File, file).unwrap();
+    let mut pack = builder.finish().unwrap();
+    assert!(pack.len() > tig_private::pack::PACK_BATCH_MAX);
+    remote.put_pack(&pack).unwrap();
+    let id = pack_id(&pack);
+    let tree = remote.public_store().put(&Object::Tree(Tree::new(vec![TreeEntry::sealed(".env", sealed).unwrap()]).unwrap())).unwrap();
+    commit(&remote, &owner, &keyring, tip(&remote, tree), BTreeMap::from([
+        (id, PackEntry { group: "private".into(), epoch: 1, sealed: BTreeSet::from([sealed]) }),
+    ]));
+    let transport = BoundedPacks { remote, downloaded: Mutex::new(Vec::new()) };
+    let local = MemoryStore::new();
+    let mut state = FetchState::new();
+    let report = fetch(&transport, &local, Some(&owner), &mut state, &PublishState::new()).unwrap();
+    assert_eq!(report.unsealed, 1);
+    assert_eq!(local.get_blob(&file).unwrap(), bytes);
+    assert_eq!(*transport.downloaded.lock().unwrap(), vec![id]);
+    *pack.last_mut().unwrap() ^= 1;
+    std::fs::write(dir.path().join("packs/private/1").join(format!("{}.pack", hex::encode(id))), pack).unwrap();
+    let before = state.clone();
+    assert!(fetch(&transport, &MemoryStore::new(), Some(&owner), &mut state, &PublishState::new()).is_err());
+    assert_eq!(state, before);
+}
+
+#[test]
 fn ordinary_fetch_opens_capsules_later_in_place_and_remembers_reveals() {
     use tig_core::treeops::{apply_edits, lookup, Leaf};
     use tig_core::store::empty_tree_id;

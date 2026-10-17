@@ -1053,8 +1053,10 @@ fn get_packs(state: &State, path: &str, reservation: &mut Reservation<'_>) -> Re
         }
         Some(hex_id) => {
             let id: [u8; 32] = parse_fixed_hex(hex_id).ok_or_else(|| refuse(400, "bad pack id"))?;
-            let size = state.remote.pack_size(group, epoch, &id).map_err(backend)?.unwrap_or(tig_private::pack::PACK_BATCH_MAX);
-            if size > tig_private::pack::PACK_BATCH_MAX || !reservation.grow(size.saturating_mul(2)) {
+            let size = state.remote.pack_size(group, epoch, &id).map_err(backend)?.unwrap_or(MAX_PACK_FILE);
+            // Loose reads can double their vector capacity; parsing also builds
+            // wire-id sets and ranges, including for malformed stored packs.
+            if size > MAX_PACK_FILE || !reservation.grow(size.saturating_mul(6)) {
                 return Err(refuse(503, "server is busy"));
             }
             match state.remote.get_pack(group, epoch, &id).map_err(backend)? {
@@ -1482,6 +1484,35 @@ mod tests {
             "response lost its memory reservation"
         );
         drop(held);
+        assert_eq!(*lock(&state.bodies.used), 0);
+    }
+
+    #[test]
+    fn legacy_pack_reserves_memory_before_reading_ciphertext() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let remote = tig_private::remote::DirRemote::create(dir.path(), [94; 16]).unwrap();
+        let pack_dir = dir.path().join("packs/private/1");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let id = [8; 32];
+        let size = 17 * 1024 * 1024;
+        let file = fs::File::create(pack_dir.join(format!("{}.pack", hex::encode(id)))).unwrap();
+        file.set_len(size as u64).unwrap();
+        drop(file);
+        let owner = tig_private::keys::Identity::generate().unwrap();
+        let state = State {
+            remote: Arc::new(remote), owner: owner.public(),
+            nonce_key: NonceKey::generate().unwrap(), consumed: Mutex::new(ConsumedNonces::default()),
+            head_lock: Mutex::new(()), head_dir: Some(dir.path().to_path_buf()),
+            bodies: Budget { used: Mutex::new(0), cap: size * 6 - 1 },
+            packs: Mutex::new(PackCache::default()),
+        };
+        let mut held = state.bodies.reserve(0).unwrap();
+        // Reading the deliberately invalid body would produce a backend error.
+        let response = get_packs(&state, &format!("/v1/packs/private/1/{}", hex::encode(id)), &mut held)
+            .err().unwrap();
+        assert_eq!(response.status, 503);
         assert_eq!(*lock(&state.bodies.used), 0);
     }
 

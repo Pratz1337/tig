@@ -94,6 +94,34 @@ fn packs_round_trip() {
 }
 
 #[test]
+fn legacy_pack_above_batch_target_survives_directory_server_restart() {
+    let owner = Identity::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let id = [93; 16];
+    let remote = tig_private::remote::DirRemote::create(dir.path(), id).unwrap();
+    let server = serve_dir(dir.path(), owner.public(), "127.0.0.1:0".parse().unwrap(), None).unwrap();
+    let client = HttpRemote::connect(&format!("http://{}", server.local_addr()), Some(copy_identity(&owner))).unwrap();
+    let key = EpochKey::generate(GroupEpoch { remote: id, group: "private".into(), epoch: 1 }).unwrap();
+    let bytes = vec![97; 17 * 1024 * 1024];
+    let object = hash_object(ObjectKind::Blob, &bytes);
+    let mut builder = PackBuilder::new(&key);
+    builder.add_object(ObjectKind::Blob, object, &bytes).unwrap();
+    let pack = builder.finish().unwrap();
+    assert!(pack.len() > tig_private::pack::PACK_BATCH_MAX);
+    client.put_pack(&pack).unwrap();
+    let pack_id = *blake3::hash(&pack).as_bytes();
+    assert_eq!(client.get_pack("private", 1, &pack_id).unwrap(), Some(pack.clone()));
+    drop(server);
+    let server = serve_dir(dir.path(), owner.public(), "127.0.0.1:0".parse().unwrap(), None).unwrap();
+    let reader = HttpRemote::connect(&format!("http://{}", server.local_addr()), None).unwrap();
+    let downloaded = reader.get_pack("private", 1, &pack_id).unwrap().unwrap();
+    let opened = tig_private::pack::Pack::open(&downloaded, &key).unwrap();
+    assert_eq!(opened.objects[0].1, object);
+    assert_eq!(&opened.objects[0].2[..], &bytes);
+    assert!(!remote.public_store().has(&object).unwrap());
+}
+
+#[test]
 fn pack_id_listing_does_not_read_ciphertext() {
     let dir = tempfile::tempdir().unwrap();
     let remote = tig_private::remote::DirRemote::create(dir.path(), [92; 16]).unwrap();

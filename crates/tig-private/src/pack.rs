@@ -22,9 +22,12 @@ use crate::keys::{EpochKey, KeyError, WireId};
 const MAGIC: &[u8; 4] = b"TIGP";
 const PACK_VERSION: u8 = 1;
 const INDEX_VERSION: u8 = 1;
-/// One object's ciphertext, or the index ciphertext.
+/// One object's plaintext, or the index plaintext.
 const MAX_BYTES: usize = 256 * 1024 * 1024;
-/// Each encrypted pack from [`PackBatch`] stays under the 128 MiB HTTP pack cap.
+const MAX_CIPHERTEXT: usize = MAX_BYTES + 16;
+/// Maximum encoded pack size, including legacy version-1 packs.
+pub const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
+/// Target encoded size for packs of new chunked content.
 pub const PACK_BATCH_MAX: usize = 16 * 1024 * 1024;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_GROUP: usize = 1024;
@@ -247,9 +250,9 @@ fn varint_len(mut value: u64) -> usize {
     bytes
 }
 
-/// Writes several independent version-1 packs, each at most [`PACK_BATCH_MAX`]
-/// encoded bytes. A single object that cannot fit is refused. Pack bytes are
-/// handed to `emit` and not retained.
+/// Writes independent version-1 packs targeting [`PACK_BATCH_MAX`] encoded
+/// bytes. Legacy blobs longer than a chunk travel alone, under [`MAX_PACK_FILE`].
+/// Pack bytes are handed to `emit` and not retained.
 pub struct PackBatch<'a> {
     key: &'a EpochKey,
     current: PackBuilder<'a>,
@@ -278,13 +281,18 @@ impl<'a> PackBatch<'a> {
         body: &[u8],
         emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
     ) -> Result<(), PackError> {
+        if kind == ObjectKind::Blob && body.len() > tig_core::blob::CHUNK_LEN {
+            self.flush(self.limit, emit)?;
+            self.current.add_object(kind, id, body)?;
+            return self.flush(MAX_PACK_FILE, emit);
+        }
         self.current.add_object(kind, id, body)?;
         if self.current.encoded_len() <= self.limit {
             return Ok(());
         }
         let wire = self.key.wire_id(&id);
         self.current.remove_object(&wire);
-        self.flush(emit)?;
+        self.flush(self.limit, emit)?;
         self.current.add_object(kind, id, body)?;
         if self.current.encoded_len() > self.limit {
             let wire = self.key.wire_id(&id);
@@ -312,7 +320,7 @@ impl<'a> PackBatch<'a> {
         if self.current.sealed.len() > before {
             self.current.pop_sealed();
         }
-        self.flush(emit)?;
+        self.flush(self.limit, emit)?;
         self.current.add_sealed(sealed_id, path, kind, target)?;
         if self.current.encoded_len() > self.limit {
             self.current.pop_sealed();
@@ -327,14 +335,14 @@ impl<'a> PackBatch<'a> {
         mut self,
         emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>,
     ) -> Result<usize, PackError> {
-        self.flush(emit)?;
+        self.flush(self.limit, emit)?;
         Ok(self.packs)
     }
 
-    fn flush(&mut self, emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>) -> Result<(), PackError> {
+    fn flush(&mut self, limit: usize, emit: &mut dyn FnMut(&[u8]) -> Result<(), PackError>) -> Result<(), PackError> {
         if self.current.objects.is_empty() && self.current.sealed.is_empty() { return Ok(()); }
         let bytes = self.current.encode()?;
-        if bytes.len() > self.limit {
+        if bytes.len() > limit {
             return Err(PackError::Invalid("pack batch is too large".into()));
         }
         emit(&bytes)?;
@@ -419,6 +427,9 @@ struct Parsed {
 }
 
 fn parse(bytes: &[u8]) -> Result<Parsed, PackError> {
+    if bytes.len() > MAX_PACK_FILE {
+        return Err(PackError::Invalid("pack is too large".into()));
+    }
     let mut c = Cursor::new(bytes);
     let magic = c.array::<4>()?;
     if &magic != MAGIC {
@@ -435,7 +446,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, PackError> {
     let epoch = c.varint()?;
     let prefix_end = c.pos;
     let nonce = c.array::<24>()?;
-    let index_ct = c.bytes_range(MAX_BYTES)?;
+    let index_ct = c.bytes_range(MAX_CIPHERTEXT)?;
     let n = c.count(MIN_FILE_OBJECT, MAX_OBJECTS)?;
     let mut objects = Vec::with_capacity(n);
     let mut seen = BTreeSet::new();
@@ -444,7 +455,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, PackError> {
         if !seen.insert(wire) {
             return Err(PackError::Invalid("duplicate wire id".into()));
         }
-        let ct = c.bytes_range(MAX_BYTES)?;
+        let ct = c.bytes_range(MAX_CIPHERTEXT)?;
         objects.push((WireId(wire), ct));
     }
     c.finish()?;

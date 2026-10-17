@@ -38,7 +38,7 @@ use tig_core::{ObjectId, ObjectKind};
 use crate::keyring::Keyring;
 use crate::pack::Pack;
 
-const MAX_PACK_FILE: usize = 512 * 1024 * 1024;
+const MAX_PACK_FILE: usize = crate::pack::MAX_PACK_FILE;
 const MAX_KEYRING_FILE: u64 = 64 * 1024 * 1024;
 const MAX_REFS_FILE: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_FILE: u64 = 256 * 1024 * 1024;
@@ -392,7 +392,7 @@ impl DirRemote {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if !meta.is_file() || meta.len() > crate::pack::PACK_BATCH_MAX as u64 {
+        if !meta.is_file() || meta.len() > MAX_PACK_FILE as u64 {
             return Err(RemoteError::Invalid("pack is too large or not a file".into()));
         }
         let bytes = read_limited(&path, meta.len())?;

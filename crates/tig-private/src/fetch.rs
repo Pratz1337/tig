@@ -582,7 +582,7 @@ fn open_member_packs(
         }) {
             let bytes = remote.get_pack(&group, epoch, id)?
                 .ok_or(FetchError::WithheldPack { epoch, missing: 1 })?;
-            if bytes.len() > crate::pack::PACK_BATCH_MAX {
+            if bytes.len() > crate::pack::MAX_PACK_FILE {
                 return Err(FetchError::TooLarge);
             }
             if pack_id(&bytes) != *id {
