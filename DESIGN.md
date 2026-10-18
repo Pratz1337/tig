@@ -98,6 +98,8 @@ The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (pat
 
 Stat scans reuse the frozen cache and update only changed rows. An identical revision, tree and stat cache needs no state-file rewrite; changes to timestamps or racy flags still get saved. Checking out an identical tree only records the revision move, without file-write preflight. Checkouts that change files retain the complete preflight and per-path safety checks.
 
+Ignore rules control discovery of untracked files. Files already in the working revision still detect edits and deletions when a rule starts matching them, including inside an ignored directory or after Git import. They use the same stat-cache checks and content reader as walked files; a clean cached file is not re-read. Reserved VCS metadata remains excluded even when previously tracked. A tracked path that has moved inside a nested workspace refuses a content read rather than recording that workspace's new bytes. A discovered file or symlink replacing a directory removes its cached descendants without reading through that replacement.
+
 ### Privacy (tig-private)
 
 The `.private` file sits at the repo root and uses `.gitignore` syntax, with optional `@role` tags:

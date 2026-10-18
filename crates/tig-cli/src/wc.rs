@@ -27,7 +27,7 @@ use tig_core::object::{hash_object, EntryKind, ObjectKind};
 use tig_core::ophead::FileOpHead;
 use tig_core::path::RepoPath;
 use tig_core::repo::{Repo, Settings, DEFAULT_WORKSPACE};
-use tig_core::store::{empty_tree_id, JournalStore, StoreExt};
+use tig_core::store::{empty_tree_id, JournalStore};
 use tig_core::treeops::{apply_edits, diff_trees, walk, DiffEntry, Leaf};
 use tig_core::workspace::Workspace;
 use tig_core::ObjectId;
@@ -58,7 +58,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// What one snapshot looked at. `changed == 0` means no operation was written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotStats {
-    /// Files visited. Ignored files and `.tig` are not counted.
+    /// Files visited. Ignored untracked files and `.tig` are not counted.
     pub scanned: usize,
     /// Files whose bytes were read and hashed. A cache hit is not a hash.
     pub hashed: usize,
@@ -951,8 +951,8 @@ impl WorkingCopy {
         warnings: &mut Vec<String>,
     ) -> Result<()> {
         // The walker skips ignored paths. A path still on disk is not a
-        // deletion: drop it only when it is gone. Tracked ignored files keep
-        // their cache row so a later delete is still noticed.
+        // deletion: drop it only when it is gone. Already tracked files still
+        // use their stat rows and record edits even when an ignore rule matches.
         let mut absent: Vec<RepoPath> = Vec::new();
         if self.trusted {
             absent.extend(
@@ -979,24 +979,44 @@ impl WorkingCopy {
                 ));
                 continue;
             }
+            if !ws.pending().is_empty() && tig_core::path::has_ancestor(ws.pending(), &path) {
+                // A discovered file or symlink replaced the old directory.
+                cache.remove(&path);
+                continue;
+            }
             let disk = disk_path(&self.root, &path);
-            match symlink_metadata_kind(&disk)? {
-                None => {
+            match fs::symlink_metadata(&disk) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     ws.remove(repo, &path)?;
                     cache.remove(&path);
                 }
-                Some(Shape::Dir) if !include_tracked
+                Err(error) => return Err(error.into()),
+                Ok(meta) if shape_of(&meta) == Shape::Dir && !include_tracked
                     && self.state.cache.get(&path).is_some_and(|row| row.kind == EntryKind::Conflict) => {
                     // Replacing a marker file with a directory resolves the
                     // conflict through child writes; its old cache row must go.
                     if !seen.iter().any(|seen| seen.starts_with(&path)) { ws.remove(repo, &path)?; }
                     cache.remove(&path);
                 }
-                Some(_) => {
-                    if include_tracked {
+                Ok(meta) => {
+                    let shape = shape_of(&meta);
+                    let mtime = observed_mtime(&meta, self.now());
+                    let prev = self.state.cache.get(&path);
+                    let unchanged = !include_tracked && mtime_parts(&meta).is_some()
+                        && prev.is_some_and(|row| !row.racy && row.size == meta.len()
+                            && row.mtime == mtime && row.ctime == ctime_parts(&meta)
+                            && shape_agrees(row, shape));
+                    if unchanged {
+                        stats.scanned += 1;
+                    } else {
                         ensure_ancestors_safe(&self.root, &path, &BTreeSet::new())?;
-                        let meta = fs::symlink_metadata(&disk)?;
-                        let shape = shape_of(&meta);
+                        let mut parent = path.parent();
+                        while let Some(dir) = parent.filter(|dir| !dir.is_root()) {
+                            if symlink_metadata_kind(&disk_path(&self.root, &dir).join(".tig"))?.is_some() {
+                                return Err(Error::Msg(format!("refusing to read {path}: inside a nested workspace")));
+                            }
+                            parent = dir.parent();
+                        }
                         if shape == Shape::Dir {
                             if !seen.iter().any(|seen| seen.starts_with(&path)) {
                                 ws.remove(repo, &path)?;
@@ -1010,38 +1030,27 @@ impl WorkingCopy {
                         if shape != Shape::Symlink {
                             ensure_not_metadata_alias(&disk)?;
                         }
-                        let prev = self.state.cache.get(&path);
                         let (kind, stand_in) =
                             desired_kind(&meta, shape, prev, baseline.get(&path).copied());
-                        let previous = prev.filter(|row| row.kind == EntryKind::Conflict)
-                            .map(|row| leaf_of(row.kind, row.id)).transpose()?
-                            .or_else(|| baseline.get(&path).copied().filter(|leaf| leaf.kind() == EntryKind::Conflict));
-                        let leaf = if let Some(previous) = previous.filter(|_| shape == Shape::File) {
-                            let bytes = read_shape(&disk, shape)?;
-                            tig_core::conflict::snapshot_file(repo.store().as_ref(), previous, &bytes, kind)?
-                        } else if shape == Shape::File {
-                            let mut file = OpenOptions::new().read(true).open(&disk)?;
-                            leaf_of(kind, tig_core::blob::put_reader(repo.store().as_ref(), &mut file)?)?
-                        } else {
-                            let bytes = read_shape(&disk, shape)?;
-                            leaf_of(kind, repo.store().put_blob(&bytes)?)?
+                        let conflict = prev.filter(|row| row.kind == EntryKind::Conflict).map(|row| row.id)
+                            .or_else(|| baseline.get(&path).filter(|leaf| leaf.kind() == EntryKind::Conflict).map(|leaf| leaf.id()));
+                        let item = ToHash {
+                            disk, shape, repo_path: path.clone(), prev: prev.cloned(), resolved_kind: kind,
+                            row: FileState {
+                                size: meta.len(), mtime, ctime: ctime_parts(&meta),
+                                kind: if conflict.is_some() && shape == Shape::File { EntryKind::Conflict } else { kind },
+                                id: conflict.unwrap_or(ObjectId([0; 32])),
+                                racy: mtime_parts(&meta).is_none(), symlink_stand_in: stand_in,
+                            },
                         };
-                        let (kind, id) = (leaf.kind(), leaf.id());
+                        let leaf = read_and_store(repo.store().as_ref(), &item)?;
+                        let mut row = item.row;
+                        row.kind = leaf.kind();
+                        row.id = leaf.id();
                         stats.scanned += 1;
                         stats.hashed += 1;
-                        ws.set(repo, path.clone(), Some(leaf_of(kind, id)?))?;
-                        cache.insert(
-                            path,
-                            FileState {
-                                size: meta.len(),
-                                mtime: observed_mtime(&meta, self.now()),
-                                ctime: ctime_parts(&meta),
-                                kind,
-                                id,
-                                racy: mtime_parts(&meta).is_none(),
-                                symlink_stand_in: stand_in,
-                            },
-                        );
+                        ws.set(repo, path.clone(), Some(leaf))?;
+                        cache.insert(path, row);
                         continue;
                     }
                 }
