@@ -94,6 +94,9 @@ that TIG is universally faster. The edited walk/classify/hash span alone is
 profiling targets than the remaining 25.96 ms tree/operation-write span. A
 different tree format is not justified by this run alone.
 
+The subsequent [Windows filename-check measurements](WINDOWS_NAMES.md) address
+part of the scan cost and add finer state-load timings; this run is retained.
+
 ## Existing real-source check
 
 The same driver also ran 15 samples on the previously pinned Gitoxide fixture
