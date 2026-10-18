@@ -62,3 +62,8 @@ python bench/trace_compare.py target/release/deps/tig-ed9e0d448ee9a563.exe
 ```
 
 The baseline executable is an ignored retained build artifact, not reproduced by a fresh build of the final sources. Preserve the executable from a baseline build before repeating this comparison. Raw paired samples: `target/bench-trace-paired.json`.
+
+## Real-source follow-up
+
+The [wide-directory comparison](PARALLEL_WALK.md) retains paired TypeScript and
+Gitoxide samples, including the remaining edited-status loss against Git.
