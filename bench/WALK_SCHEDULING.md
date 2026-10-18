@@ -7,8 +7,9 @@ root-file read could therefore leave the rest of the worker pool idle.
 
 **LOW performance, high confidence — FIXED:** eligible children are now queued
 after the directory listing, nested-workspace check and ignore-rule loading,
-before its file visitors run. File entries are buffered per active directory;
-their metadata is still obtained once. Results remain unordered and the public
+before its file visitors run. The directory listing caches names and file types
+for both passes without a separate file-entry vector; metadata is still obtained
+once. Results remain unordered and the public
 worker limit remains 1–16. Once an error is recorded, further child queues are
 discarded and active workers finish before the error returns.
 
@@ -50,3 +51,16 @@ read for verification; raw metadata and private data are not exported.
 Setup and warming are outside samples; process startup and captured TIG phase
 output are inside. Tool order rotates and reverses. Git status inspects edits;
 TIG status records them. Normal desktop background services remain active.
+
+## Initial candidate and follow-up
+
+The first implementation used a separate file-entry buffer. Its paired
+[Gitoxide samples](gitoxide-walk-scheduling-2026-10-18.json) improved root-file
+edited status from 71.37 to 59.41 ms, against Git at 62.84 ms. However, the
+[10k-file samples](walk-scheduling-10k-2026-10-18.json) showed clean status rising
+from 36.11 to 38.39 ms. The in-process walk rose from 11.37 to 13.73 ms;
+startup did not explain that increase. Those initial results are retained.
+
+The follow-up reuses the directory listing buffer and caches each entry name
+once instead of repeatedly cloning names for boundary, ignore-file and entry
+checks. Its verification and measurements are recorded separately below.

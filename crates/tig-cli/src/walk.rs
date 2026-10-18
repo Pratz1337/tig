@@ -235,15 +235,20 @@ fn list_dir<T, F>(
 where
     F: Fn(Found<'_>) -> T,
 {
-    let entries: Vec<fs::DirEntry> = fs::read_dir(&dir.disk)?.collect::<io::Result<_>>()?;
+    let mut entries: Vec<_> = fs::read_dir(&dir.disk)?.map(|entry| {
+        entry.map(|entry| {
+            let name = entry.file_name();
+            (entry, name, None)
+        })
+    }).collect::<io::Result<_>>()?;
     // A subdirectory with its own `.tig` is another workspace or a nested
     // repo: never sweep it into this one (git skips nested repos too).
-    if dir.depth > 0 && entries.iter().any(|e| e.file_name() == OsStr::new(".tig")) {
+    if dir.depth > 0 && entries.iter().any(|(_, name, _)| name.as_os_str() == OsStr::new(".tig")) {
         return Ok(());
     }
 
     let mut ignores = dir.ignores.clone();
-    let has = |name: &str| entries.iter().any(|e| e.file_name() == OsStr::new(name));
+    let has = |name: &str| entries.iter().any(|(_, found, _)| found.as_os_str() == OsStr::new(name));
     if has(".gitignore") || has(".tigignore") {
         let mut builder = GitignoreBuilder::new(&dir.disk);
         for file in [".gitignore", ".tigignore"] {
@@ -265,40 +270,46 @@ where
     }
 
     let mut children = Vec::new();
-    let mut files = Vec::new();
-    for entry in entries {
-        let name = entry.file_name();
-        if name == OsStr::new(".tig") || is_scratch(&name) || is_vcs_metadata(&name) {
+    for (entry, name, kind) in &mut entries {
+        let name = name.as_os_str();
+        if name == OsStr::new(".tig") || is_scratch(name) || is_vcs_metadata(name) {
             continue;
         }
         let file_type = entry.file_type()?;
-        let disk = entry.path();
-        let is_dir = file_type.is_dir();
-        if ignored(&ignores, &disk, is_dir) {
-            continue;
-        }
-        let repo = match (&dir.repo, name.to_str()) {
-            (Ok(parent), Some(text)) => parent.join(text).map_err(|e| format!("{}: {e}", disk.display())),
-            (Ok(_), None) => Err(format!("{}: path is not valid UTF-8", disk.display())),
-            (Err(e), _) => Err(e.clone()),
-        };
-        if is_dir {
+        if file_type.is_dir() {
+            let disk = entry.path();
+            if ignored(&ignores, &disk, true) { continue; }
+            let repo = entry_repo_path(dir, name, &disk);
             children.push(Dir { disk, repo, depth: dir.depth + 1, ignores: ignores.clone() });
-        } else if file_type.is_file() || file_type.is_symlink() {
-            files.push((entry, repo, disk, file_type));
         } else {
-            warnings.push(format!("skipping special file {}", disk.display()));
+            *kind = Some(file_type);
         }
     }
     // A slow file read must not keep the other workers waiting for children.
     if !children.is_empty() {
         enqueue(children);
     }
-    for (entry, repo, disk, file_type) in files {
-        let meta = entry.metadata()?;
-        out.push(visit(Found { path: repo, disk, file_type, meta: &meta }));
+    for (entry, name, kind) in entries {
+        let Some(file_type) = kind else { continue; };
+        let disk = entry.path();
+        if ignored(&ignores, &disk, false) { continue; }
+        if file_type.is_file() || file_type.is_symlink() {
+            let repo = entry_repo_path(dir, &name, &disk);
+            let meta = entry.metadata()?;
+            out.push(visit(Found { path: repo, disk, file_type, meta: &meta }));
+        } else {
+            warnings.push(format!("skipping special file {}", disk.display()));
+        }
     }
     Ok(())
+}
+
+fn entry_repo_path(dir: &Dir, name: &OsStr, disk: &Path) -> Result<RepoPath, String> {
+    match (&dir.repo, name.to_str()) {
+        (Ok(parent), Some(text)) => parent.join(text).map_err(|e| format!("{}: {e}", disk.display())),
+        (Ok(_), None) => Err(format!("{}: path is not valid UTF-8", disk.display())),
+        (Err(e), _) => Err(e.clone()),
+    }
 }
 
 /// The nearest matcher with an opinion decides; a whitelist (`!pattern`)
