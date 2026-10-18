@@ -221,19 +221,9 @@ pub fn put_reader<S: Store + ?Sized>(store: &S, mut reader: impl Read) -> Result
 }
 
 fn fill_chunk(reader: &mut impl Read, buf: &mut Vec<u8>) -> Result<()> {
-    buf.resize(CHUNK_LEN, 0);
-    let mut filled = 0;
-    while filled < CHUNK_LEN {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => {
-                buf.truncate(filled);
-                return Ok(());
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
+    // Most files are much smaller than a chunk; grow only as bytes arrive.
+    buf.clear();
+    reader.take(CHUNK_LEN as u64).read_to_end(buf)?;
     Ok(())
 }
 
@@ -671,6 +661,40 @@ mod tests {
             self.data = &self.data[n..];
             Ok(n)
         }
+    }
+
+    #[test]
+    fn short_streams_do_not_allocate_a_full_chunk() {
+        for data in [&b""[..], &b"small edited source file"[..]] {
+            let mut bytes = Vec::new();
+            fill_chunk(&mut Cursor::new(data), &mut bytes).unwrap();
+            assert_eq!(bytes, data);
+            assert!(bytes.capacity() < CHUNK_LEN, "small stream allocated a full chunk");
+        }
+    }
+
+    #[test]
+    fn chunk_reads_stay_bounded_and_retry_interruptions() {
+        struct InterruptedOnce(Cursor<Vec<u8>>, bool);
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.1 {
+                    self.1 = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.0.read(buf)
+            }
+        }
+        let data = vec![37; CHUNK_LEN + 17];
+        let mut reader = InterruptedOnce(Cursor::new(data.clone()), true);
+        let mut bytes = Vec::new();
+        fill_chunk(&mut reader, &mut bytes).unwrap();
+        assert_eq!(bytes, data[..CHUNK_LEN]);
+        assert_eq!(reader.0.position(), CHUNK_LEN as u64);
+        fill_chunk(&mut reader, &mut bytes).unwrap();
+        assert_eq!(bytes, data[CHUNK_LEN..]);
+        fill_chunk(&mut reader, &mut bytes).unwrap();
+        assert!(bytes.is_empty());
     }
 
     #[test]
