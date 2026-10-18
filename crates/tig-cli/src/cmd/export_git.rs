@@ -2,6 +2,7 @@
 //!
 //! The destination worktree is not checked out. Private paths stay in tig.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -14,6 +15,7 @@ pub(super) fn run(
     repository: Option<&Path>,
     destination: &Path,
     bookmarks: Vec<String>,
+    working_copy: bool,
     declassify: Vec<String>,
     force: bool,
     verbose: bool,
@@ -38,10 +40,17 @@ pub(super) fn run(
     } else {
         ExportState::default()
     };
+    let working_bookmarks;
+    let bookmarks = if working_copy {
+        working_bookmarks = BTreeMap::from([("working-copy".into(), session.working()?)]);
+        &working_bookmarks
+    } else {
+        &session.repo.view().bookmarks
+    };
     let report = export_git(
         destination,
         session.repo.store().as_ref(),
-        &session.repo.view().bookmarks,
+        bookmarks,
         &mut state,
         &options,
     )?;

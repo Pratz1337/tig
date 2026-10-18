@@ -29,6 +29,12 @@ come from the imported history. It refuses a dirty source clone or a nonempty
 destination, so existing work is preserved. A GitHub source ZIP has no history and
 cannot be used for this full-history bootstrap.
 
+The first build verifies the clone against recent public GitHub commits and
+uploads only committed source; untracked local files are excluded. Later builds
+in the TIG workspace export an immutable public snapshot, including uncommitted
+public edits, through TIG's native privacy checks. See
+[`scripts/MODAL.md`](scripts/MODAL.md) for the upload boundary and regressions.
+
 The source clone stays separate. The new workspace uses `.tig`; there is no Git
 index or staging step for local work. The original development checkout also
 retains its older `.git` directory for recovery. Both use the optional GitHub
@@ -63,7 +69,8 @@ The two explicit PEM exceptions are public localhost TLS fixtures used by tests.
 The local `pending/private-demo/` directory contains a generated demonstration
 note, not a real credential. Git ignores all of `pending/`. `.tigignore` includes
 only this demo directory in TIG; `.private` keeps it out of public exports. The
-Modal build uploader excludes `pending/` and `.tig/`.
+Modal build uploader reads only staged public source and excludes `pending/`
+and VCS metadata.
 
 After each tested change, export only the `master` bookmark:
 

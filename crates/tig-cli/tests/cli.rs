@@ -262,6 +262,34 @@ fn end_to_end_session() {
 }
 
 #[test]
+fn export_working_copy_is_private_and_does_not_move_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("public.txt"), "before\n").unwrap();
+    fs::write(repo.join(".env"), "PRIVATE_BUILD_TOKEN=not-a-real-token\n").unwrap();
+    expect_ok(tig(&repo).args(["init"]));
+    expect_ok(tig(&repo).args(["bookmark", "set", "main"]));
+    expect_ok(tig(&repo).args(["new"]));
+    let bookmarks = expect_ok(tig(&repo).args(["bookmark", "list"]));
+    fs::write(repo.join("public.txt"), "uncommitted edit\n").unwrap();
+    let dest = tmp.path().join("source.git");
+    expect_ok(tig(&repo).args(["export-git", "--working-copy"]).arg(&dest));
+    assert_eq!(expect_ok(tig(&repo).args(["bookmark", "list"])), bookmarks);
+    let file = Command::new("git").arg("--git-dir").arg(&dest)
+        .args(["show", "working-copy:public.txt"]).output().unwrap();
+    assert!(file.status.success());
+    assert_eq!(file.stdout, b"uncommitted edit\n");
+    let private = Command::new("git").arg("--git-dir").arg(&dest)
+        .args(["ls-tree", "-r", "--name-only", "working-copy"]).output().unwrap();
+    assert!(private.status.success());
+    assert!(!String::from_utf8(private.stdout).unwrap().lines().any(|p| p == ".env"));
+    let bad = run(tig(&repo).args(["export-git", "--working-copy", "--bookmark", "main"]).arg(tmp.path().join("bad.git")));
+    assert_eq!(bad.code, Some(2));
+    assert!(!tmp.path().join("bad.git").exists());
+}
+
+#[test]
 fn init_hints_when_author_is_unset() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
