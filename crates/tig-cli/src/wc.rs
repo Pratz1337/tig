@@ -1068,7 +1068,11 @@ fn state_path(tig_dir: &Path, name: &str) -> PathBuf {
 }
 
 fn load_state_file(path: &Path) -> Result<(WcState, bool, Option<String>)> {
-    match fs::read(path) {
+    let bytes = {
+        let _t = crate::trace::span("    state: read file");
+        fs::read(path)
+    };
+    match bytes {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((
             WcState::blank(),
             false,
@@ -1147,9 +1151,14 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
         return Err("missing checksum".into());
     }
     let (payload, checksum) = bytes.split_at(bytes.len() - 32);
-    if state_checksum(payload).0 != checksum {
+    let verified = {
+        let _t = crate::trace::span("    state: verify checksum");
+        state_checksum(payload).0 == checksum
+    };
+    if !verified {
         return Err("checksum mismatch".into());
     }
+    let rows_span = crate::trace::span("    state: decode cache rows");
     let mut r = Reader::new(&payload[5..], "workspace state");
     let watcher_enabled = if version == 4 {
         if r.u8().map_err(|e| e.to_string())? != 1 { return Err("unknown watcher state flags".into()); }
@@ -1212,7 +1221,11 @@ fn decode_state(bytes: &[u8]) -> std::result::Result<WcState, String> {
     }
     r.finish().map_err(|e| e.to_string())?;
     if version != 4 && (version == 3) != has_conflicts { return Err("non-canonical conflict state version".into()); }
-    let cache = PathIndex::from_sorted(rows).map_err(|e| e.to_string())?;
+    drop(rows_span);
+    let cache = {
+        let _t = crate::trace::span("    state: build path index");
+        PathIndex::from_sorted(rows).map_err(|e| e.to_string())?
+    };
     Ok(WcState {
         working,
         tree,
@@ -1396,7 +1409,7 @@ fn path_name_block(path: &RepoPath) -> Option<&'static str> {
 fn windows_name_block(name: &str) -> Option<&'static str> {
     if name.contains(['<', '>', '"', '|', '?', '*']) {
         Some("invalid Windows filename character")
-    } else if name.encode_utf16().count() > 255 {
+    } else if name.len() > 255 && name.encode_utf16().count() > 255 {
         Some("Windows filename exceeds 255 UTF-16 units")
     } else if is_windows_device(name) {
         Some("Windows device name")
@@ -1417,6 +1430,14 @@ fn is_windows_device(name: &str) -> bool {
     };
     if stem.is_empty() {
         return false;
+    }
+    if stem.is_ascii() {
+        let bytes = stem.as_bytes();
+        return ["con", "prn", "aux", "nul", "conin$", "conout$"].iter()
+            .any(|device| stem.eq_ignore_ascii_case(device))
+            || (bytes.len() == 4
+                && (bytes[..3].eq_ignore_ascii_case(b"com") || bytes[..3].eq_ignore_ascii_case(b"lpt"))
+                && matches!(bytes[3], b'1'..=b'9'));
     }
     let folded = fold_device(stem);
     matches!(
@@ -1458,12 +1479,13 @@ fn fold_device(name: &str) -> String {
 /// ignored by NTFS; the path policy already rejects those, and we trim
 /// them here so a hand-built tree still cannot sneak one through.
 fn is_tig_short_name(name: &str) -> bool {
-    let folded = fold_device(name);
-    let trimmed = folded.trim_end_matches(&[' ', '.'][..]);
-    let Some(rest) = trimmed.strip_prefix("tig~") else {
+    let folded = (!name.is_ascii()).then(|| fold_device(name));
+    let trimmed = folded.as_deref().unwrap_or(name).trim_end_matches(&[' ', '.'][..]);
+    let bytes = trimmed.as_bytes();
+    if !bytes.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"tig~")) {
         return false;
-    };
-    let bytes = rest.as_bytes();
+    }
+    let bytes = &bytes[4..];
     !bytes.is_empty()
         && bytes.len() <= 6
         && bytes.iter().all(|b| b.is_ascii_digit())
@@ -2577,6 +2599,29 @@ mod tests {
         }
         for name in [".tig", "tig", "TIG~0", "TIG~1.txt", "GIT~1", "not~1"] {
             assert!(!is_tig_short_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn windows_name_guards_preserve_unicode_and_length_boundaries() {
+        for name in ["cOm¹.log", "LpT².txt", "CoNiN$.txt", "CONOUT$.log"] {
+            assert_eq!(windows_name_block(name), Some("Windows device name"), "{name}");
+        }
+        for name in ["TIG~¹", "tIg~²³", "TIG~123456. "] {
+            assert_eq!(windows_name_block(name), Some("NTFS 8.3 alias of .tig"), "{name}");
+        }
+        for name in ["COM1x", "LPT10", "conout", "conin$more", "TIG~01", "TIG~1234567", "TIG~١", "TIG~1.txt"] {
+            assert_eq!(windows_name_block(name), None, "{name}");
+        }
+        for (name, allowed) in [
+            ("a".repeat(255), true),
+            ("a".repeat(256), false),
+            ("é".repeat(255), true),
+            ("é".repeat(256), false),
+            (format!("{}a", "😀".repeat(127)), true),
+            ("😀".repeat(128), false),
+        ] {
+            assert_eq!(windows_name_block(&name).is_none(), allowed);
         }
     }
 
