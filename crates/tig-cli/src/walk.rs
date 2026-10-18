@@ -18,9 +18,10 @@
 //! - Symlinks are reported as files and never followed.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileType, Metadata};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -48,8 +49,20 @@ struct Dir {
     ignores: Arc<Vec<Arc<Gitignore>>>,
 }
 
+type ListedEntry = (fs::DirEntry, OsString, Option<FileType>);
+
+struct FileBatch {
+    dir: Dir,
+    entries: Vec<ListedEntry>,
+}
+
+enum Job {
+    Directory(Dir),
+    Files(Arc<FileBatch>, Range<usize>),
+}
+
 struct Shared {
-    queue: VecDeque<Dir>,
+    queue: VecDeque<Job>,
     active: usize,
     failed: Option<io::Error>,
 }
@@ -72,12 +85,12 @@ where
     F: Fn(Found<'_>) -> T + Sync,
 {
     let shared = Mutex::new(Shared {
-        queue: VecDeque::from([Dir {
+        queue: VecDeque::from([Job::Directory(Dir {
             disk: root.to_path_buf(),
             repo: Ok(RepoPath::root()),
             depth: 0,
             ignores: Arc::new(Vec::new()),
-        }]),
+        })]),
         active: 0,
         failed: None,
     });
@@ -90,14 +103,17 @@ where
                 scope.spawn(|| {
                     let mut out = Vec::new();
                     let mut warn = Vec::new();
-                    while let Some(dir) = next_job(&shared, &wake) {
-                        let result = list_dir(&dir, is_scratch, &visit, &mut out, &mut warn, |children| {
-                            let mut s = shared.lock().expect("walk lock poisoned");
-                            if s.failed.is_none() {
-                                s.queue.extend(children);
-                                wake.notify_all();
-                            }
-                        });
+                    while let Some(job) = next_job(&shared, &wake) {
+                        let result = match job {
+                            Job::Directory(dir) => list_dir(dir, is_scratch, &visit, &mut out, &mut warn, workers, |jobs| {
+                                let mut s = shared.lock().expect("walk lock poisoned");
+                                if s.failed.is_none() {
+                                    s.queue.extend(jobs);
+                                    wake.notify_all();
+                                }
+                            }),
+                            Job::Files(batch, range) => visit_files(&batch.dir, &batch.entries[range], &visit, &mut out, &mut warn),
+                        };
                         let mut s = shared.lock().expect("walk lock poisoned");
                         if let Err(e) = result {
                             s.failed.get_or_insert(e);
@@ -202,7 +218,7 @@ where
 
 /// Blocks until a directory is available, or returns `None` when the queue
 /// is empty and no worker can add more.
-fn next_job(shared: &Mutex<Shared>, wake: &Condvar) -> Option<Dir> {
+fn next_job(shared: &Mutex<Shared>, wake: &Condvar) -> Option<Job> {
     let mut s = shared.lock().expect("walk lock poisoned");
     loop {
         if let Some(dir) = s.queue.pop_front() {
@@ -225,12 +241,13 @@ pub(crate) fn is_vcs_metadata(name: &OsStr) -> bool {
 
 /// Lists one directory, queues its children, then visits its files.
 fn list_dir<T, F>(
-    dir: &Dir,
+    dir: Dir,
     is_scratch: fn(&OsStr) -> bool,
     visit: &F,
     out: &mut Vec<T>,
     warnings: &mut Vec<String>,
-    enqueue: impl FnOnce(Vec<Dir>),
+    workers: usize,
+    mut enqueue: impl FnMut(Vec<Job>),
 ) -> io::Result<()>
 where
     F: Fn(Found<'_>) -> T,
@@ -279,7 +296,7 @@ where
         if file_type.is_dir() {
             let disk = entry.path();
             if ignored(&ignores, &disk, true) { continue; }
-            let repo = entry_repo_path(dir, name, &disk);
+            let repo = entry_repo_path(&dir, name, &disk);
             children.push(Dir { disk, repo, depth: dir.depth + 1, ignores: ignores.clone() });
         } else {
             *kind = Some(file_type);
@@ -287,16 +304,41 @@ where
     }
     // A slow file read must not keep the other workers waiting for children.
     if !children.is_empty() {
-        enqueue(children);
+        enqueue(children.into_iter().map(Job::Directory).collect());
     }
+    let dir = Dir { ignores, ..dir };
+    if workers > 1 && entries.len() > 1024 {
+        // Share the original listing; only large directories need file jobs.
+        // Every disjoint range keeps the same ignore chain and cached types.
+        let count = entries.len();
+        let batch = Arc::new(FileBatch { dir, entries });
+        enqueue((0..count).step_by(512).map(|start| {
+            Job::Files(batch.clone(), start..(start + 512).min(count))
+        }).collect());
+        Ok(())
+    } else {
+        visit_files(&dir, &entries, visit, out, warnings)
+    }
+}
+
+fn visit_files<T, F>(
+    dir: &Dir,
+    entries: &[ListedEntry],
+    visit: &F,
+    out: &mut Vec<T>,
+    warnings: &mut Vec<String>,
+) -> io::Result<()>
+where
+    F: Fn(Found<'_>) -> T,
+{
     for (entry, name, kind) in entries {
         let Some(file_type) = kind else { continue; };
         let disk = entry.path();
-        if ignored(&ignores, &disk, false) { continue; }
+        if ignored(&dir.ignores, &disk, false) { continue; }
         if file_type.is_file() || file_type.is_symlink() {
-            let repo = entry_repo_path(dir, &name, &disk);
+            let repo = entry_repo_path(dir, name, &disk);
             let meta = entry.metadata()?;
-            out.push(visit(Found { path: repo, disk, file_type, meta: &meta }));
+            out.push(visit(Found { path: repo, disk, file_type: *file_type, meta: &meta }));
         } else {
             warnings.push(format!("skipping special file {}", disk.display()));
         }
@@ -373,5 +415,64 @@ mod tests {
             assert_eq!(files.into_iter().collect::<BTreeSet<_>>(), expected);
         }
         assert!(walk_with_workers(&root.path().join("absent"), |_| false, |_| (), 2).is_err());
+    }
+
+    #[test]
+    fn a_waiting_file_does_not_stall_a_wide_directory() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..1025 {
+            fs::write(root.path().join(format!("file{i}")), b"file").unwrap();
+        }
+        let first = AtomicBool::new(true);
+        let (sent, received) = mpsc::sync_channel(1);
+        let received = Mutex::new(received);
+        let (found, warnings) = walk_with_workers(root.path(), |_| false, |item| {
+            let another_file_finished = if first.swap(false, Ordering::Relaxed) {
+                received.lock().unwrap().recv_timeout(Duration::from_secs(5)).is_ok()
+            } else {
+                let _ = sent.try_send(());
+                true
+            };
+            (item.path.unwrap(), another_file_finished)
+        }, 2).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(found.len(), 1025);
+        assert!(found.iter().all(|(_, finished)| *finished),
+            "one file visitor blocked every other visit in a wide directory");
+        assert_eq!(found.into_iter().map(|(path, _)| path).collect::<BTreeSet<_>>().len(), 1025);
+    }
+
+    #[test]
+    fn wide_directory_batches_preserve_discovery_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = BTreeSet::new();
+        for i in 0..1025 {
+            let name = format!("file{i}");
+            fs::write(root.path().join(&name), b"file").unwrap();
+            expected.insert(RepoPath::new(&name).unwrap());
+        }
+        fs::write(root.path().join(".gitignore"), b"*.skip\nignored/\n").unwrap();
+        fs::write(root.path().join(".tigignore"), b"!keep.skip\n").unwrap();
+        for name in [".gitignore", ".tigignore", "keep.skip", ".env", "child/leaf"] {
+            let path = root.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !name.ends_with("ignore") { fs::write(path, b"file").unwrap(); }
+            expected.insert(RepoPath::new(name).unwrap());
+        }
+        for name in ["drop.skip", "ignored/leaf", "scratch/leaf", "nested/.tig/state", "nested/leaf",
+            ".git/config", ".GIT/config", ".g\u{200c}it/config", ".hg/hgrc", ".svn/entries", ".jj/repo"] {
+            let path = root.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"excluded").unwrap();
+        }
+        for workers in [1, 2, 4] {
+            let (found, warnings) = walk_with_workers(root.path(), |name| name == OsStr::new("scratch"),
+                |item| item.path.unwrap(), workers).unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(found.len(), expected.len());
+            assert_eq!(found.into_iter().collect::<BTreeSet<_>>(), expected);
+        }
     }
 }
