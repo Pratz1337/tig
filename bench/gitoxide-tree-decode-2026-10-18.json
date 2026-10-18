@@ -1,0 +1,1728 @@
+{
+  "fixture_commit": "ad0202e3ab396d752a56664001c134f48d834177",
+  "fixture_tree": "096060a59918228474c3db880317dacdf67456c5",
+  "files": 3223,
+  "tracked_ignored_files": 186,
+  "edited_path": "README.md",
+  "edited_ignored_path": "gix-actor/fuzz/corpus/actors/identity.txt",
+  "symlinks": 136,
+  "materialized_symlinks": 136,
+  "complete_tree_verified": true,
+  "baseline_ignored_edit_correct": true,
+  "source": "55dd69544fa63c2c4be1cffebb1ff2a4936a75a7",
+  "platform": "Windows-10-10.0.26300-SP0",
+  "git_version": "git version 2.56.0.windows.1",
+  "binaries_sha256": {
+    "baseline": "2ab4454bc22e0374ca2b7f535e8d7774396920fa7e4266ccb1c11aeeb1be341e",
+    "current": "d0975cedd8863092e18ea309f79cbd9e6dbcda911f0c83056b950748a2a2c814"
+  },
+  "runs": 15,
+  "samples": {
+    "git": {
+      "clean": [
+        {
+          "wall_ms": 61.75290000101086
+        },
+        {
+          "wall_ms": 64.81979999807663
+        },
+        {
+          "wall_ms": 63.00629999896046
+        },
+        {
+          "wall_ms": 63.82800001301803
+        },
+        {
+          "wall_ms": 64.14190000214148
+        },
+        {
+          "wall_ms": 65.52469999587629
+        },
+        {
+          "wall_ms": 65.29369999771006
+        },
+        {
+          "wall_ms": 65.77839999226853
+        },
+        {
+          "wall_ms": 64.89270000020042
+        },
+        {
+          "wall_ms": 65.11939999472816
+        },
+        {
+          "wall_ms": 67.52270000288263
+        },
+        {
+          "wall_ms": 62.85589998879004
+        },
+        {
+          "wall_ms": 62.615399991045706
+        },
+        {
+          "wall_ms": 63.84499999694526
+        },
+        {
+          "wall_ms": 70.67119999555871
+        }
+      ],
+      "edited": [
+        {
+          "wall_ms": 70.9115999925416
+        },
+        {
+          "wall_ms": 67.58829999307636
+        },
+        {
+          "wall_ms": 65.18429999414366
+        },
+        {
+          "wall_ms": 67.07779999123886
+        },
+        {
+          "wall_ms": 63.948199996957555
+        },
+        {
+          "wall_ms": 64.40129999828059
+        },
+        {
+          "wall_ms": 68.62839999666903
+        },
+        {
+          "wall_ms": 64.65709999611136
+        },
+        {
+          "wall_ms": 64.81809999968391
+        },
+        {
+          "wall_ms": 69.72130000940524
+        },
+        {
+          "wall_ms": 67.06070000655018
+        },
+        {
+          "wall_ms": 65.81970000115689
+        },
+        {
+          "wall_ms": 72.08329999411944
+        },
+        {
+          "wall_ms": 67.65240000095218
+        },
+        {
+          "wall_ms": 66.52290000056382
+        }
+      ],
+      "ignored edit": [
+        {
+          "wall_ms": 65.82999999227468
+        },
+        {
+          "wall_ms": 68.91860000905581
+        },
+        {
+          "wall_ms": 65.95309999829624
+        },
+        {
+          "wall_ms": 68.2132000074489
+        },
+        {
+          "wall_ms": 71.52480000513606
+        },
+        {
+          "wall_ms": 70.78670000191778
+        },
+        {
+          "wall_ms": 67.24180000310298
+        },
+        {
+          "wall_ms": 67.70289999258239
+        },
+        {
+          "wall_ms": 70.27799999923445
+        },
+        {
+          "wall_ms": 70.7066000031773
+        },
+        {
+          "wall_ms": 66.57779999659397
+        },
+        {
+          "wall_ms": 73.16960000025574
+        },
+        {
+          "wall_ms": 70.78100000217091
+        },
+        {
+          "wall_ms": 73.5555999999633
+        },
+        {
+          "wall_ms": 74.02050000382587
+        }
+      ]
+    },
+    "baseline": {
+      "clean": [
+        {
+          "wall_ms": 48.10159999760799,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.43,
+            "open workspace": 2.47,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 17.3,
+            "scan: apply": 0.19,
+            "scan: deletions": 7.07,
+            "snapshot: walk + stat + hash": 24.66,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.21,
+            "snapshot": 25.34,
+            "total": 28.83
+          }
+        },
+        {
+          "wall_ms": 45.89259999920614,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.48,
+            "open workspace": 2.46,
+            "snapshot: checks + reload": 0.33,
+            "scan: walk + classify + hash": 16.23,
+            "scan: apply": 0.17,
+            "scan: deletions": 6.31,
+            "snapshot: walk + stat + hash": 22.83,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.19,
+            "snapshot": 23.47,
+            "total": 26.95
+          }
+        },
+        {
+          "wall_ms": 41.8156999949133,
+          "phases_ms": {
+            "load repo (op + view)": 0.09,
+            "load workspace state": 1.48,
+            "open workspace": 2.5,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 14.42,
+            "scan: apply": 0.16,
+            "scan: deletions": 5.78,
+            "snapshot: walk + stat + hash": 20.45,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.16,
+            "snapshot": 21.04,
+            "total": 24.49
+          }
+        },
+        {
+          "wall_ms": 42.0933999994304,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.61,
+            "open workspace": 2.69,
+            "snapshot: checks + reload": 0.42,
+            "scan: walk + classify + hash": 12.9,
+            "scan: apply": 0.17,
+            "scan: deletions": 5.87,
+            "snapshot: walk + stat + hash": 19.03,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 19.71,
+            "total": 23.37
+          }
+        },
+        {
+          "wall_ms": 44.384399996488355,
+          "phases_ms": {
+            "load repo (op + view)": 0.09,
+            "load workspace state": 1.37,
+            "open workspace": 2.34,
+            "snapshot: checks + reload": 0.31,
+            "scan: walk + classify + hash": 15.94,
+            "scan: apply": 0.18,
+            "scan: deletions": 6.98,
+            "snapshot: walk + stat + hash": 23.25,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.22,
+            "snapshot": 23.89,
+            "total": 27.24
+          }
+        },
+        {
+          "wall_ms": 44.727300002705306,
+          "phases_ms": {
+            "load repo (op + view)": 0.09,
+            "load workspace state": 1.5,
+            "open workspace": 2.45,
+            "snapshot: checks + reload": 0.32,
+            "scan: walk + classify + hash": 16.38,
+            "scan: apply": 0.15,
+            "scan: deletions": 6.04,
+            "snapshot: walk + stat + hash": 22.65,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 23.24,
+            "total": 26.66
+          }
+        },
+        {
+          "wall_ms": 45.68749999452848,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.66,
+            "open workspace": 2.71,
+            "snapshot: checks + reload": 0.34,
+            "scan: walk + classify + hash": 16.63,
+            "scan: apply": 0.14,
+            "scan: deletions": 5.53,
+            "snapshot: walk + stat + hash": 22.38,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.2,
+            "snapshot": 23.07,
+            "total": 26.8
+          }
+        },
+        {
+          "wall_ms": 45.06069999479223,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.57,
+            "open workspace": 2.61,
+            "snapshot: checks + reload": 0.34,
+            "scan: walk + classify + hash": 15.46,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.73,
+            "snapshot: walk + stat + hash": 21.45,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.2,
+            "snapshot": 22.15,
+            "total": 25.82
+          }
+        },
+        {
+          "wall_ms": 46.72949999803677,
+          "phases_ms": {
+            "load repo (op + view)": 0.12,
+            "load workspace state": 1.58,
+            "open workspace": 2.66,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 17.67,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.81,
+            "snapshot: walk + stat + hash": 23.72,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.21,
+            "snapshot": 24.46,
+            "total": 28.1
+          }
+        },
+        {
+          "wall_ms": 48.51780000899453,
+          "phases_ms": {
+            "load repo (op + view)": 0.12,
+            "load workspace state": 1.81,
+            "open workspace": 2.96,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 16.99,
+            "scan: apply": 0.13,
+            "scan: deletions": 5.24,
+            "snapshot: walk + stat + hash": 22.46,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.16,
+            "snapshot": 23.08,
+            "total": 27.05
+          }
+        },
+        {
+          "wall_ms": 44.795399997383356,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.55,
+            "open workspace": 2.51,
+            "snapshot: checks + reload": 0.31,
+            "scan: walk + classify + hash": 17.5,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.78,
+            "snapshot: walk + stat + hash": 23.52,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.16,
+            "snapshot": 24.09,
+            "total": 27.55
+          }
+        },
+        {
+          "wall_ms": 42.20080000231974,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.57,
+            "open workspace": 2.6,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 14.76,
+            "scan: apply": 0.1,
+            "scan: deletions": 5.44,
+            "snapshot: walk + stat + hash": 20.39,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.15,
+            "snapshot": 20.98,
+            "total": 24.55
+          }
+        },
+        {
+          "wall_ms": 43.33519999636337,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.42,
+            "open workspace": 2.45,
+            "snapshot: checks + reload": 0.3,
+            "scan: walk + classify + hash": 16.02,
+            "scan: apply": 0.14,
+            "scan: deletions": 5.82,
+            "snapshot: walk + stat + hash": 22.08,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 22.61,
+            "total": 26.11
+          }
+        },
+        {
+          "wall_ms": 46.09170000185259,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.6,
+            "open workspace": 2.6,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 16.98,
+            "scan: apply": 0.14,
+            "scan: deletions": 5.78,
+            "snapshot: walk + stat + hash": 23.03,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 23.66,
+            "total": 27.2
+          }
+        },
+        {
+          "wall_ms": 51.32220000086818,
+          "phases_ms": {
+            "load repo (op + view)": 0.09,
+            "load workspace state": 1.46,
+            "open workspace": 2.41,
+            "snapshot: checks + reload": 0.33,
+            "scan: walk + classify + hash": 19.93,
+            "scan: apply": 0.23,
+            "scan: deletions": 8.55,
+            "snapshot: walk + stat + hash": 28.84,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.23,
+            "snapshot": 29.54,
+            "total": 33.01
+          }
+        }
+      ],
+      "edited": [
+        {
+          "wall_ms": 73.02739999431651,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.55,
+            "open workspace": 2.59,
+            "snapshot: checks + reload": 0.31,
+            "scan: walk + classify + hash": 41.58,
+            "scan: apply": 0.43,
+            "scan: deletions": 6.03,
+            "snapshot: walk + stat + hash": 48.13,
+            "snapshot: write trees + operation": 1.4,
+            "snapshot: save workspace state": 1.85,
+            "snapshot": 52.03,
+            "total": 55.78
+          }
+        },
+        {
+          "wall_ms": 63.27309999323916,
+          "phases_ms": {
+            "load repo (op + view)": 0.2,
+            "load workspace state": 1.5,
+            "open workspace": 2.83,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 31.1,
+            "scan: apply": 0.21,
+            "scan: deletions": 5.47,
+            "snapshot: walk + stat + hash": 36.87,
+            "snapshot: write trees + operation": 1.43,
+            "snapshot: save workspace state": 2.14,
+            "snapshot": 40.98,
+            "total": 45.01
+          }
+        },
+        {
+          "wall_ms": 60.619999989285134,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.52,
+            "open workspace": 2.91,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 28.68,
+            "scan: apply": 0.2,
+            "scan: deletions": 5.77,
+            "snapshot: walk + stat + hash": 34.75,
+            "snapshot: write trees + operation": 1.47,
+            "snapshot: save workspace state": 1.72,
+            "snapshot": 38.46,
+            "total": 42.45
+          }
+        },
+        {
+          "wall_ms": 73.22619999467861,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.48,
+            "open workspace": 2.87,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 39.03,
+            "scan: apply": 0.25,
+            "scan: deletions": 6.76,
+            "snapshot: walk + stat + hash": 46.14,
+            "snapshot: write trees + operation": 1.67,
+            "snapshot: save workspace state": 2.12,
+            "snapshot": 50.47,
+            "total": 54.5
+          }
+        },
+        {
+          "wall_ms": 70.05789999675471,
+          "phases_ms": {
+            "load repo (op + view)": 0.13,
+            "load workspace state": 1.44,
+            "open workspace": 2.76,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 36.5,
+            "scan: apply": 0.23,
+            "scan: deletions": 6.88,
+            "snapshot: walk + stat + hash": 43.73,
+            "snapshot: write trees + operation": 1.72,
+            "snapshot: save workspace state": 2.08,
+            "snapshot": 48.06,
+            "total": 52.01
+          }
+        },
+        {
+          "wall_ms": 61.89339999400545,
+          "phases_ms": {
+            "load repo (op + view)": 0.13,
+            "load workspace state": 1.4,
+            "open workspace": 2.76,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 31.04,
+            "scan: apply": 0.22,
+            "scan: deletions": 5.58,
+            "snapshot: walk + stat + hash": 36.92,
+            "snapshot: write trees + operation": 1.42,
+            "snapshot: save workspace state": 1.53,
+            "snapshot": 40.36,
+            "total": 44.26
+          }
+        },
+        {
+          "wall_ms": 70.21419999364298,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.49,
+            "open workspace": 2.98,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 37.28,
+            "scan: apply": 0.21,
+            "scan: deletions": 6.58,
+            "snapshot: walk + stat + hash": 44.18,
+            "snapshot: write trees + operation": 1.69,
+            "snapshot: save workspace state": 1.92,
+            "snapshot": 48.37,
+            "total": 52.61
+          }
+        },
+        {
+          "wall_ms": 63.87389999872539,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.55,
+            "open workspace": 3.31,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 29.5,
+            "scan: apply": 0.25,
+            "scan: deletions": 6.15,
+            "snapshot: walk + stat + hash": 36.07,
+            "snapshot: write trees + operation": 1.79,
+            "snapshot: save workspace state": 2.04,
+            "snapshot": 40.46,
+            "total": 45.02
+          }
+        },
+        {
+          "wall_ms": 70.2068000100553,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.38,
+            "open workspace": 3.0,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 36.15,
+            "scan: apply": 0.27,
+            "scan: deletions": 7.05,
+            "snapshot: walk + stat + hash": 43.59,
+            "snapshot: write trees + operation": 1.77,
+            "snapshot: save workspace state": 1.97,
+            "snapshot": 47.86,
+            "total": 52.13
+          }
+        },
+        {
+          "wall_ms": 63.40319999435451,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.52,
+            "open workspace": 3.27,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 30.34,
+            "scan: apply": 0.22,
+            "scan: deletions": 5.97,
+            "snapshot: walk + stat + hash": 36.63,
+            "snapshot: write trees + operation": 1.63,
+            "snapshot: save workspace state": 1.62,
+            "snapshot": 40.4,
+            "total": 44.86
+          }
+        },
+        {
+          "wall_ms": 62.76849999267142,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.38,
+            "open workspace": 3.03,
+            "snapshot: checks + reload": 0.34,
+            "scan: walk + classify + hash": 31.22,
+            "scan: apply": 0.2,
+            "scan: deletions": 5.79,
+            "snapshot: walk + stat + hash": 37.31,
+            "snapshot: write trees + operation": 1.51,
+            "snapshot: save workspace state": 1.68,
+            "snapshot": 41.02,
+            "total": 45.19
+          }
+        },
+        {
+          "wall_ms": 66.30329998733941,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.47,
+            "open workspace": 3.25,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 32.43,
+            "scan: apply": 0.25,
+            "scan: deletions": 6.74,
+            "snapshot: walk + stat + hash": 39.55,
+            "snapshot: write trees + operation": 1.66,
+            "snapshot: save workspace state": 1.83,
+            "snapshot": 43.58,
+            "total": 48.07
+          }
+        },
+        {
+          "wall_ms": 64.12729999283329,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.59,
+            "open workspace": 3.34,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 31.33,
+            "scan: apply": 0.25,
+            "scan: deletions": 6.31,
+            "snapshot: walk + stat + hash": 38.0,
+            "snapshot: write trees + operation": 1.61,
+            "snapshot: save workspace state": 1.86,
+            "snapshot": 42.04,
+            "total": 46.63
+          }
+        },
+        {
+          "wall_ms": 67.31800000125077,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.51,
+            "open workspace": 3.42,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 33.89,
+            "scan: apply": 0.23,
+            "scan: deletions": 6.37,
+            "snapshot: walk + stat + hash": 40.6,
+            "snapshot: write trees + operation": 1.72,
+            "snapshot: save workspace state": 1.74,
+            "snapshot": 44.56,
+            "total": 49.18
+          }
+        },
+        {
+          "wall_ms": 64.38530000741594,
+          "phases_ms": {
+            "load repo (op + view)": 0.2,
+            "load workspace state": 1.55,
+            "open workspace": 3.4,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 31.95,
+            "scan: apply": 0.23,
+            "scan: deletions": 5.9,
+            "snapshot: walk + stat + hash": 38.18,
+            "snapshot: write trees + operation": 1.53,
+            "snapshot: save workspace state": 1.73,
+            "snapshot": 41.98,
+            "total": 46.57
+          }
+        }
+      ],
+      "ignored edit": [
+        {
+          "wall_ms": 50.515199996880256,
+          "phases_ms": {
+            "load repo (op + view)": 0.19,
+            "load workspace state": 1.61,
+            "open workspace": 3.64,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 17.32,
+            "scan: apply": 0.15,
+            "scan: deletions": 6.71,
+            "snapshot: walk + stat + hash": 24.26,
+            "snapshot: write trees + operation": 1.57,
+            "snapshot: save workspace state": 1.7,
+            "snapshot": 28.09,
+            "total": 33.19
+          }
+        },
+        {
+          "wall_ms": 51.040499994996935,
+          "phases_ms": {
+            "load repo (op + view)": 0.19,
+            "load workspace state": 1.54,
+            "open workspace": 3.63,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 16.3,
+            "scan: apply": 0.17,
+            "scan: deletions": 7.1,
+            "snapshot: walk + stat + hash": 23.65,
+            "snapshot: write trees + operation": 1.77,
+            "snapshot: save workspace state": 2.04,
+            "snapshot": 28.0,
+            "total": 33.12
+          }
+        },
+        {
+          "wall_ms": 51.804999995511025,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.45,
+            "open workspace": 3.32,
+            "snapshot: checks + reload": 0.41,
+            "scan: walk + classify + hash": 16.76,
+            "scan: apply": 0.19,
+            "scan: deletions": 7.71,
+            "snapshot: walk + stat + hash": 24.76,
+            "snapshot: write trees + operation": 1.83,
+            "snapshot: save workspace state": 1.91,
+            "snapshot": 29.1,
+            "total": 33.87
+          }
+        },
+        {
+          "wall_ms": 54.50879999261815,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.51,
+            "open workspace": 3.64,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 17.93,
+            "scan: apply": 0.16,
+            "scan: deletions": 7.49,
+            "snapshot: walk + stat + hash": 25.68,
+            "snapshot: write trees + operation": 1.82,
+            "snapshot: save workspace state": 1.88,
+            "snapshot": 29.93,
+            "total": 35.05
+          }
+        },
+        {
+          "wall_ms": 52.42330000328366,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.55,
+            "open workspace": 3.59,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 17.05,
+            "scan: apply": 0.15,
+            "scan: deletions": 7.63,
+            "snapshot: walk + stat + hash": 24.95,
+            "snapshot: write trees + operation": 1.8,
+            "snapshot: save workspace state": 1.77,
+            "snapshot": 29.08,
+            "total": 34.1
+          }
+        },
+        {
+          "wall_ms": 53.06879999989178,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.58,
+            "open workspace": 3.72,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 15.18,
+            "scan: apply": 0.18,
+            "scan: deletions": 7.78,
+            "snapshot: walk + stat + hash": 23.24,
+            "snapshot: write trees + operation": 2.07,
+            "snapshot: save workspace state": 2.17,
+            "snapshot": 28.05,
+            "total": 33.34
+          }
+        },
+        {
+          "wall_ms": 55.73510000249371,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.47,
+            "open workspace": 3.54,
+            "snapshot: checks + reload": 0.45,
+            "scan: walk + classify + hash": 16.68,
+            "scan: apply": 0.18,
+            "scan: deletions": 10.01,
+            "snapshot: walk + stat + hash": 27.01,
+            "snapshot: write trees + operation": 2.53,
+            "snapshot: save workspace state": 2.36,
+            "snapshot": 32.57,
+            "total": 37.81
+          }
+        },
+        {
+          "wall_ms": 52.75360000086948,
+          "phases_ms": {
+            "load repo (op + view)": 0.19,
+            "load workspace state": 1.58,
+            "open workspace": 3.83,
+            "snapshot: checks + reload": 0.46,
+            "scan: walk + classify + hash": 15.88,
+            "scan: apply": 0.16,
+            "scan: deletions": 7.49,
+            "snapshot: walk + stat + hash": 23.63,
+            "snapshot: write trees + operation": 1.82,
+            "snapshot: save workspace state": 2.01,
+            "snapshot": 28.1,
+            "total": 33.52
+          }
+        },
+        {
+          "wall_ms": 52.798400007304735,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.51,
+            "open workspace": 3.68,
+            "snapshot: checks + reload": 0.45,
+            "scan: walk + classify + hash": 15.77,
+            "scan: apply": 0.18,
+            "scan: deletions": 8.15,
+            "snapshot: walk + stat + hash": 24.26,
+            "snapshot: write trees + operation": 2.11,
+            "snapshot: save workspace state": 2.06,
+            "snapshot": 29.05,
+            "total": 34.27
+          }
+        },
+        {
+          "wall_ms": 57.552800004486926,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.67,
+            "open workspace": 4.03,
+            "snapshot: checks + reload": 0.43,
+            "scan: walk + classify + hash": 19.58,
+            "scan: apply": 0.19,
+            "scan: deletions": 7.69,
+            "snapshot: walk + stat + hash": 27.55,
+            "snapshot: write trees + operation": 1.78,
+            "snapshot: save workspace state": 2.01,
+            "snapshot": 31.94,
+            "total": 37.52
+          }
+        },
+        {
+          "wall_ms": 52.5325999915367,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.45,
+            "open workspace": 3.49,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 15.19,
+            "scan: apply": 0.19,
+            "scan: deletions": 9.0,
+            "snapshot: walk + stat + hash": 24.5,
+            "snapshot: write trees + operation": 2.08,
+            "snapshot: save workspace state": 2.15,
+            "snapshot": 29.31,
+            "total": 34.36
+          }
+        },
+        {
+          "wall_ms": 54.89020000095479,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.47,
+            "open workspace": 3.58,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 19.05,
+            "scan: apply": 0.17,
+            "scan: deletions": 8.26,
+            "snapshot: walk + stat + hash": 27.59,
+            "snapshot: write trees + operation": 1.95,
+            "snapshot: save workspace state": 2.03,
+            "snapshot": 32.15,
+            "total": 37.2
+          }
+        },
+        {
+          "wall_ms": 58.768000002601184,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.43,
+            "open workspace": 3.73,
+            "snapshot: checks + reload": 0.44,
+            "scan: walk + classify + hash": 16.4,
+            "scan: apply": 0.26,
+            "scan: deletions": 12.98,
+            "snapshot: walk + stat + hash": 29.78,
+            "snapshot: write trees + operation": 2.28,
+            "snapshot: save workspace state": 2.5,
+            "snapshot": 35.25,
+            "total": 40.59
+          }
+        },
+        {
+          "wall_ms": 58.87769999390002,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.57,
+            "open workspace": 3.94,
+            "snapshot: checks + reload": 0.45,
+            "scan: walk + classify + hash": 19.98,
+            "scan: apply": 0.17,
+            "scan: deletions": 8.34,
+            "snapshot: walk + stat + hash": 28.61,
+            "snapshot: write trees + operation": 1.92,
+            "snapshot: save workspace state": 1.93,
+            "snapshot": 33.08,
+            "total": 38.88
+          }
+        },
+        {
+          "wall_ms": 55.98489999829326,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.56,
+            "open workspace": 3.89,
+            "snapshot: checks + reload": 0.45,
+            "scan: walk + classify + hash": 16.67,
+            "scan: apply": 0.19,
+            "scan: deletions": 9.13,
+            "snapshot: walk + stat + hash": 26.2,
+            "snapshot: write trees + operation": 2.12,
+            "snapshot: save workspace state": 2.03,
+            "snapshot": 30.97,
+            "total": 36.55
+          }
+        }
+      ]
+    },
+    "current": {
+      "clean": [
+        {
+          "wall_ms": 48.31430000194814,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.61,
+            "open workspace": 2.67,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 16.94,
+            "scan: apply": 0.13,
+            "scan: deletions": 5.46,
+            "snapshot: walk + stat + hash": 22.63,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.16,
+            "snapshot": 23.24,
+            "total": 26.9
+          }
+        },
+        {
+          "wall_ms": 41.36350000044331,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.56,
+            "open workspace": 2.61,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 14.99,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.87,
+            "snapshot: walk + stat + hash": 21.11,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.18,
+            "snapshot": 21.76,
+            "total": 25.35
+          }
+        },
+        {
+          "wall_ms": 43.297700001858175,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.52,
+            "open workspace": 2.47,
+            "snapshot: checks + reload": 0.31,
+            "scan: walk + classify + hash": 15.91,
+            "scan: apply": 0.14,
+            "scan: deletions": 5.79,
+            "snapshot: walk + stat + hash": 21.93,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 22.49,
+            "total": 25.96
+          }
+        },
+        {
+          "wall_ms": 42.18180000316352,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.61,
+            "open workspace": 2.6,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 15.08,
+            "scan: apply": 0.16,
+            "scan: deletions": 6.02,
+            "snapshot: walk + stat + hash": 21.36,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.18,
+            "snapshot": 22.01,
+            "total": 25.64
+          }
+        },
+        {
+          "wall_ms": 45.688999991398305,
+          "phases_ms": {
+            "load repo (op + view)": 0.12,
+            "load workspace state": 1.53,
+            "open workspace": 2.56,
+            "snapshot: checks + reload": 0.34,
+            "scan: walk + classify + hash": 16.83,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.88,
+            "snapshot: walk + stat + hash": 22.97,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.18,
+            "snapshot": 23.59,
+            "total": 27.11
+          }
+        },
+        {
+          "wall_ms": 42.84549999283627,
+          "phases_ms": {
+            "load repo (op + view)": 0.12,
+            "load workspace state": 1.56,
+            "open workspace": 2.57,
+            "snapshot: checks + reload": 0.31,
+            "scan: walk + classify + hash": 16.81,
+            "scan: apply": 0.13,
+            "scan: deletions": 5.3,
+            "snapshot: walk + stat + hash": 22.32,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.19,
+            "snapshot": 22.93,
+            "total": 26.42
+          }
+        },
+        {
+          "wall_ms": 42.18229999241885,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.56,
+            "open workspace": 2.69,
+            "snapshot: checks + reload": 0.33,
+            "scan: walk + classify + hash": 14.98,
+            "scan: apply": 0.14,
+            "scan: deletions": 5.57,
+            "snapshot: walk + stat + hash": 20.79,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.16,
+            "snapshot": 21.37,
+            "total": 25.06
+          }
+        },
+        {
+          "wall_ms": 40.709799999604,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.48,
+            "open workspace": 2.49,
+            "snapshot: checks + reload": 0.33,
+            "scan: walk + classify + hash": 14.77,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.75,
+            "snapshot: walk + stat + hash": 20.76,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 21.33,
+            "total": 24.77
+          }
+        },
+        {
+          "wall_ms": 43.556999997235835,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.45,
+            "open workspace": 2.35,
+            "snapshot: checks + reload": 0.29,
+            "scan: walk + classify + hash": 17.3,
+            "scan: apply": 0.17,
+            "scan: deletions": 6.48,
+            "snapshot: walk + stat + hash": 24.06,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.2,
+            "snapshot": 24.66,
+            "total": 27.97
+          }
+        },
+        {
+          "wall_ms": 47.166699994704686,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.51,
+            "open workspace": 2.53,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 17.58,
+            "scan: apply": 0.16,
+            "scan: deletions": 7.46,
+            "snapshot: walk + stat + hash": 25.31,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.21,
+            "snapshot": 26.02,
+            "total": 29.6
+          }
+        },
+        {
+          "wall_ms": 46.93270000279881,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.74,
+            "open workspace": 2.75,
+            "snapshot: checks + reload": 0.55,
+            "scan: walk + classify + hash": 18.84,
+            "scan: apply": 0.15,
+            "scan: deletions": 6.68,
+            "snapshot: walk + stat + hash": 25.78,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.2,
+            "snapshot": 26.63,
+            "total": 30.38
+          }
+        },
+        {
+          "wall_ms": 42.799999995622784,
+          "phases_ms": {
+            "load repo (op + view)": 0.09,
+            "load workspace state": 1.47,
+            "open workspace": 2.39,
+            "snapshot: checks + reload": 0.3,
+            "scan: walk + classify + hash": 16.14,
+            "scan: apply": 0.15,
+            "scan: deletions": 6.7,
+            "snapshot: walk + stat + hash": 23.11,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.19,
+            "snapshot": 23.75,
+            "total": 27.09
+          }
+        },
+        {
+          "wall_ms": 45.46959999424871,
+          "phases_ms": {
+            "load repo (op + view)": 0.11,
+            "load workspace state": 1.71,
+            "open workspace": 2.75,
+            "snapshot: checks + reload": 0.38,
+            "scan: walk + classify + hash": 17.02,
+            "scan: apply": 0.15,
+            "scan: deletions": 5.84,
+            "snapshot: walk + stat + hash": 23.12,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.17,
+            "snapshot": 23.74,
+            "total": 27.49
+          }
+        },
+        {
+          "wall_ms": 42.265099997166544,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.45,
+            "open workspace": 2.46,
+            "snapshot: checks + reload": 0.29,
+            "scan: walk + classify + hash": 14.86,
+            "scan: apply": 0.18,
+            "scan: deletions": 6.72,
+            "snapshot: walk + stat + hash": 21.85,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.23,
+            "snapshot": 22.52,
+            "total": 26.05
+          }
+        },
+        {
+          "wall_ms": 43.48779999418184,
+          "phases_ms": {
+            "load repo (op + view)": 0.1,
+            "load workspace state": 1.51,
+            "open workspace": 2.47,
+            "snapshot: checks + reload": 0.32,
+            "scan: walk + classify + hash": 15.86,
+            "scan: apply": 0.14,
+            "scan: deletions": 6.1,
+            "snapshot: walk + stat + hash": 22.24,
+            "snapshot: write trees + operation": 0.0,
+            "snapshot: save workspace state": 0.19,
+            "snapshot": 22.82,
+            "total": 26.26
+          }
+        }
+      ],
+      "edited": [
+        {
+          "wall_ms": 64.86859999131411,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.59,
+            "open workspace": 2.89,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 32.82,
+            "scan: apply": 0.22,
+            "scan: deletions": 6.2,
+            "snapshot: walk + stat + hash": 39.34,
+            "snapshot: write trees + operation": 1.69,
+            "snapshot: save workspace state": 2.14,
+            "snapshot": 43.75,
+            "total": 47.81
+          }
+        },
+        {
+          "wall_ms": 64.53670001064893,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.48,
+            "open workspace": 2.66,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 32.56,
+            "scan: apply": 0.23,
+            "scan: deletions": 6.75,
+            "snapshot: walk + stat + hash": 39.64,
+            "snapshot: write trees + operation": 1.59,
+            "snapshot: save workspace state": 1.88,
+            "snapshot": 43.62,
+            "total": 47.45
+          }
+        },
+        {
+          "wall_ms": 59.74939999578055,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.5,
+            "open workspace": 2.69,
+            "snapshot: checks + reload": 0.35,
+            "scan: walk + classify + hash": 28.87,
+            "scan: apply": 0.22,
+            "scan: deletions": 6.58,
+            "snapshot: walk + stat + hash": 35.85,
+            "snapshot: write trees + operation": 1.46,
+            "snapshot: save workspace state": 1.9,
+            "snapshot": 39.72,
+            "total": 43.53
+          }
+        },
+        {
+          "wall_ms": 69.52520000049844,
+          "phases_ms": {
+            "load repo (op + view)": 0.13,
+            "load workspace state": 1.45,
+            "open workspace": 2.74,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 36.66,
+            "scan: apply": 0.25,
+            "scan: deletions": 7.02,
+            "snapshot: walk + stat + hash": 44.07,
+            "snapshot: write trees + operation": 1.74,
+            "snapshot: save workspace state": 2.06,
+            "snapshot": 48.43,
+            "total": 52.3
+          }
+        },
+        {
+          "wall_ms": 60.74619998980779,
+          "phases_ms": {
+            "load repo (op + view)": 0.13,
+            "load workspace state": 1.56,
+            "open workspace": 2.92,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 28.72,
+            "scan: apply": 0.18,
+            "scan: deletions": 6.07,
+            "snapshot: walk + stat + hash": 35.08,
+            "snapshot: write trees + operation": 1.5,
+            "snapshot: save workspace state": 1.88,
+            "snapshot": 39.0,
+            "total": 43.1
+          }
+        },
+        {
+          "wall_ms": 65.53209999401588,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.53,
+            "open workspace": 2.89,
+            "snapshot: checks + reload": 0.43,
+            "scan: walk + classify + hash": 36.64,
+            "scan: apply": 0.19,
+            "scan: deletions": 5.64,
+            "snapshot: walk + stat + hash": 42.55,
+            "snapshot: write trees + operation": 1.56,
+            "snapshot: save workspace state": 1.52,
+            "snapshot": 46.21,
+            "total": 50.17
+          }
+        },
+        {
+          "wall_ms": 60.681200004182756,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.52,
+            "open workspace": 3.13,
+            "snapshot: checks + reload": 0.42,
+            "scan: walk + classify + hash": 28.28,
+            "scan: apply": 0.21,
+            "scan: deletions": 5.68,
+            "snapshot: walk + stat + hash": 34.26,
+            "snapshot: write trees + operation": 1.45,
+            "snapshot: save workspace state": 1.68,
+            "snapshot": 37.95,
+            "total": 42.23
+          }
+        },
+        {
+          "wall_ms": 63.786099999560975,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.68,
+            "open workspace": 3.36,
+            "snapshot: checks + reload": 0.46,
+            "scan: walk + classify + hash": 32.37,
+            "scan: apply": 0.22,
+            "scan: deletions": 6.1,
+            "snapshot: walk + stat + hash": 38.79,
+            "snapshot: write trees + operation": 1.75,
+            "snapshot: save workspace state": 2.07,
+            "snapshot": 43.24,
+            "total": 47.8
+          }
+        },
+        {
+          "wall_ms": 69.72529999620747,
+          "phases_ms": {
+            "load repo (op + view)": 0.14,
+            "load workspace state": 1.39,
+            "open workspace": 2.88,
+            "snapshot: checks + reload": 0.37,
+            "scan: walk + classify + hash": 37.33,
+            "scan: apply": 0.24,
+            "scan: deletions": 6.61,
+            "snapshot: walk + stat + hash": 44.27,
+            "snapshot: write trees + operation": 1.69,
+            "snapshot: save workspace state": 1.77,
+            "snapshot": 48.26,
+            "total": 52.27
+          }
+        },
+        {
+          "wall_ms": 62.45420000050217,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.52,
+            "open workspace": 3.22,
+            "snapshot: checks + reload": 0.41,
+            "scan: walk + classify + hash": 30.17,
+            "scan: apply": 0.21,
+            "scan: deletions": 5.96,
+            "snapshot: walk + stat + hash": 36.48,
+            "snapshot: write trees + operation": 1.54,
+            "snapshot: save workspace state": 1.9,
+            "snapshot": 40.52,
+            "total": 45.16
+          }
+        },
+        {
+          "wall_ms": 65.98759999906179,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.57,
+            "open workspace": 3.36,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 32.44,
+            "scan: apply": 0.2,
+            "scan: deletions": 5.7,
+            "snapshot: walk + stat + hash": 38.43,
+            "snapshot: write trees + operation": 1.67,
+            "snapshot: save workspace state": 1.62,
+            "snapshot": 42.21,
+            "total": 46.86
+          }
+        },
+        {
+          "wall_ms": 64.09810000332072,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.51,
+            "open workspace": 3.35,
+            "snapshot: checks + reload": 0.36,
+            "scan: walk + classify + hash": 32.96,
+            "scan: apply": 0.2,
+            "scan: deletions": 5.75,
+            "snapshot: walk + stat + hash": 39.0,
+            "snapshot: write trees + operation": 1.66,
+            "snapshot: save workspace state": 1.74,
+            "snapshot": 42.91,
+            "total": 47.46
+          }
+        },
+        {
+          "wall_ms": 64.82169999799225,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.7,
+            "open workspace": 3.71,
+            "snapshot: checks + reload": 0.4,
+            "scan: walk + classify + hash": 29.25,
+            "scan: apply": 0.22,
+            "scan: deletions": 6.22,
+            "snapshot: walk + stat + hash": 35.79,
+            "snapshot: write trees + operation": 1.86,
+            "snapshot: save workspace state": 1.98,
+            "snapshot": 40.25,
+            "total": 45.18
+          }
+        },
+        {
+          "wall_ms": 63.62099999387283,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.43,
+            "open workspace": 3.26,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 32.06,
+            "scan: apply": 0.24,
+            "scan: deletions": 6.78,
+            "snapshot: walk + stat + hash": 39.18,
+            "snapshot: write trees + operation": 1.78,
+            "snapshot: save workspace state": 1.89,
+            "snapshot": 43.44,
+            "total": 47.9
+          }
+        },
+        {
+          "wall_ms": 63.92980000237003,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.68,
+            "open workspace": 3.63,
+            "snapshot: checks + reload": 0.41,
+            "scan: walk + classify + hash": 30.96,
+            "scan: apply": 0.21,
+            "scan: deletions": 6.11,
+            "snapshot: walk + stat + hash": 37.37,
+            "snapshot: write trees + operation": 1.72,
+            "snapshot: save workspace state": 1.81,
+            "snapshot": 41.48,
+            "total": 46.44
+          }
+        }
+      ],
+      "ignored edit": [
+        {
+          "wall_ms": 51.07109999516979,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.61,
+            "open workspace": 3.56,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 15.7,
+            "scan: apply": 0.15,
+            "scan: deletions": 7.69,
+            "snapshot: walk + stat + hash": 23.65,
+            "snapshot: write trees + operation": 1.93,
+            "snapshot: save workspace state": 2.03,
+            "snapshot": 28.18,
+            "total": 33.29
+          }
+        },
+        {
+          "wall_ms": 49.77100000542123,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.53,
+            "open workspace": 3.46,
+            "snapshot: checks + reload": 0.47,
+            "scan: walk + classify + hash": 16.08,
+            "scan: apply": 0.21,
+            "scan: deletions": 7.19,
+            "snapshot: walk + stat + hash": 23.62,
+            "snapshot: write trees + operation": 1.78,
+            "snapshot: save workspace state": 1.52,
+            "snapshot": 27.55,
+            "total": 32.38
+          }
+        },
+        {
+          "wall_ms": 54.70870000135619,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.57,
+            "open workspace": 3.62,
+            "snapshot: checks + reload": 0.42,
+            "scan: walk + classify + hash": 18.32,
+            "scan: apply": 0.16,
+            "scan: deletions": 7.94,
+            "snapshot: walk + stat + hash": 26.52,
+            "snapshot: write trees + operation": 2.01,
+            "snapshot: save workspace state": 2.03,
+            "snapshot": 31.21,
+            "total": 36.3
+          }
+        },
+        {
+          "wall_ms": 52.293300002929755,
+          "phases_ms": {
+            "load repo (op + view)": 0.15,
+            "load workspace state": 1.56,
+            "open workspace": 3.65,
+            "snapshot: checks + reload": 0.43,
+            "scan: walk + classify + hash": 16.22,
+            "scan: apply": 0.18,
+            "scan: deletions": 7.72,
+            "snapshot: walk + stat + hash": 24.22,
+            "snapshot: write trees + operation": 1.83,
+            "snapshot: save workspace state": 2.02,
+            "snapshot": 28.68,
+            "total": 33.91
+          }
+        },
+        {
+          "wall_ms": 56.20949999138247,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.64,
+            "open workspace": 3.81,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 18.72,
+            "scan: apply": 0.16,
+            "scan: deletions": 7.74,
+            "snapshot: walk + stat + hash": 26.72,
+            "snapshot: write trees + operation": 1.85,
+            "snapshot: save workspace state": 1.94,
+            "snapshot": 31.08,
+            "total": 36.42
+          }
+        },
+        {
+          "wall_ms": 51.68299999786541,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.65,
+            "open workspace": 3.74,
+            "snapshot: checks + reload": 0.41,
+            "scan: walk + classify + hash": 17.55,
+            "scan: apply": 0.13,
+            "scan: deletions": 7.32,
+            "snapshot: walk + stat + hash": 25.09,
+            "snapshot: write trees + operation": 1.72,
+            "snapshot: save workspace state": 2.03,
+            "snapshot": 29.43,
+            "total": 34.75
+          }
+        },
+        {
+          "wall_ms": 53.0741999973543,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.64,
+            "open workspace": 3.9,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 15.25,
+            "scan: apply": 0.19,
+            "scan: deletions": 9.05,
+            "snapshot: walk + stat + hash": 24.6,
+            "snapshot: write trees + operation": 2.21,
+            "snapshot: save workspace state": 2.05,
+            "snapshot": 29.44,
+            "total": 34.92
+          }
+        },
+        {
+          "wall_ms": 49.8784999945201,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.5,
+            "open workspace": 3.5,
+            "snapshot: checks + reload": 0.42,
+            "scan: walk + classify + hash": 16.81,
+            "scan: apply": 0.17,
+            "scan: deletions": 7.63,
+            "snapshot: walk + stat + hash": 24.7,
+            "snapshot: write trees + operation": 1.86,
+            "snapshot: save workspace state": 1.79,
+            "snapshot": 28.95,
+            "total": 33.94
+          }
+        },
+        {
+          "wall_ms": 58.17270000989083,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.59,
+            "open workspace": 3.81,
+            "snapshot: checks + reload": 0.43,
+            "scan: walk + classify + hash": 19.83,
+            "scan: apply": 0.2,
+            "scan: deletions": 9.14,
+            "snapshot: walk + stat + hash": 29.29,
+            "snapshot: write trees + operation": 2.26,
+            "snapshot: save workspace state": 2.23,
+            "snapshot": 34.41,
+            "total": 39.91
+          }
+        },
+        {
+          "wall_ms": 56.90740000864025,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.68,
+            "open workspace": 3.87,
+            "snapshot: checks + reload": 0.44,
+            "scan: walk + classify + hash": 16.4,
+            "scan: apply": 0.21,
+            "scan: deletions": 9.57,
+            "snapshot: walk + stat + hash": 26.29,
+            "snapshot: write trees + operation": 2.29,
+            "snapshot: save workspace state": 3.14,
+            "snapshot": 32.43,
+            "total": 38.31
+          }
+        },
+        {
+          "wall_ms": 50.45230001269374,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.57,
+            "open workspace": 3.84,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 14.37,
+            "scan: apply": 0.14,
+            "scan: deletions": 6.98,
+            "snapshot: walk + stat + hash": 21.59,
+            "snapshot: write trees + operation": 2.04,
+            "snapshot: save workspace state": 1.84,
+            "snapshot": 26.0,
+            "total": 31.3
+          }
+        },
+        {
+          "wall_ms": 56.85249999805819,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.53,
+            "open workspace": 3.8,
+            "snapshot: checks + reload": 0.42,
+            "scan: walk + classify + hash": 19.06,
+            "scan: apply": 0.21,
+            "scan: deletions": 9.91,
+            "snapshot: walk + stat + hash": 29.3,
+            "snapshot: write trees + operation": 2.12,
+            "snapshot: save workspace state": 2.17,
+            "snapshot": 34.2,
+            "total": 39.67
+          }
+        },
+        {
+          "wall_ms": 61.65990000590682,
+          "phases_ms": {
+            "load repo (op + view)": 0.17,
+            "load workspace state": 1.66,
+            "open workspace": 4.11,
+            "snapshot: checks + reload": 0.53,
+            "scan: walk + classify + hash": 20.0,
+            "scan: apply": 0.18,
+            "scan: deletions": 8.54,
+            "snapshot: walk + stat + hash": 28.84,
+            "snapshot: write trees + operation": 2.02,
+            "snapshot: save workspace state": 2.25,
+            "snapshot": 33.84,
+            "total": 39.61
+          }
+        },
+        {
+          "wall_ms": 58.598300005542114,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.49,
+            "open workspace": 3.72,
+            "snapshot: checks + reload": 0.39,
+            "scan: walk + classify + hash": 20.58,
+            "scan: apply": 0.17,
+            "scan: deletions": 9.05,
+            "snapshot: walk + stat + hash": 29.93,
+            "snapshot: write trees + operation": 2.28,
+            "snapshot: save workspace state": 2.23,
+            "snapshot": 35.04,
+            "total": 40.36
+          }
+        },
+        {
+          "wall_ms": 55.6322999909753,
+          "phases_ms": {
+            "load repo (op + view)": 0.16,
+            "load workspace state": 1.62,
+            "open workspace": 3.95,
+            "snapshot: checks + reload": 0.4,
+            "scan: walk + classify + hash": 18.56,
+            "scan: apply": 0.17,
+            "scan: deletions": 8.38,
+            "snapshot: walk + stat + hash": 27.22,
+            "snapshot: write trees + operation": 2.04,
+            "snapshot: save workspace state": 2.11,
+            "snapshot": 31.96,
+            "total": 37.43
+          }
+        }
+      ]
+    }
+  },
+  "median_ms": {
+    "git": {
+      "clean": 64.81979999807663,
+      "edited": 67.06070000655018,
+      "ignored edit": 70.27799999923445
+    },
+    "baseline": {
+      "clean": 45.06069999479223,
+      "edited": 64.38530000741594,
+      "ignored edit": 53.06879999989178
+    },
+    "current": {
+      "clean": 43.297700001858175,
+      "edited": 64.09810000332072,
+      "ignored edit": 54.70870000135619
+    }
+  }
+}
