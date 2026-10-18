@@ -2,3 +2,4 @@
 /bin/
 /.tig/
 /pending/
+__pycache__/

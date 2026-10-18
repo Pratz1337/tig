@@ -5,6 +5,7 @@
 ```
 tig -R repo export-git ../public.git
 tig -R repo export-git ../public-repo --bookmark main --verbose
+tig -R repo export-git ../build-source.git --working-copy
 tig -R repo export-git ../public-repo --declassify notes.txt --force
 ```
 
@@ -15,6 +16,12 @@ tig -R repo export-git ../public-repo --declassify notes.txt --force
 Every bookmark becomes `refs/heads/<name>`. When `HEAD` is still unborn, it is pointed at `main` if that bookmark was exported, otherwise at the first exported bookmark. That does not check out files. An existing `HEAD` is left as it is. Repeat `--bookmark NAME` to export a subset. A name Git rejects as a branch (`HEAD`, `foo..bar`, names ending in `.lock`) is skipped with a warning. The working change is included only when a bookmark points at it. tig's root revision is not a commit; a revision whose only parent is the root becomes a Git root commit. Other parents keep their order, with the root omitted when it is one parent among several.
 
 File modes are `100644`, `100755` and `120000`. Existing `Sealed` entries are omitted. Commit author, committer, timestamps, timezone offsets and description are copied. Git stores whole seconds, so a sub-second tig timestamp is truncated toward zero (import stores `seconds * 1000`, and that round-trips). The tig change id is not written into the commit. The same revision always produces the same Git commit id. New repositories use SHA-1. An existing repository keeps its hash algorithm.
+
+`--working-copy` snapshots current edits and exports that change and its ancestry
+under the Git branch `working-copy`. It does not create, move or delete native
+bookmarks, and cannot be combined with `--bookmark`. It uses the same privacy,
+paste and ref-movement checks and destination map as bookmark exports. This is
+useful for public build inputs without advancing a development bookmark.
 
 ## Privacy
 

@@ -308,10 +308,11 @@ pub fn run() -> Result<()> {
         Cmd::ExportGit {
             path,
             bookmark,
+            working_copy,
             declassify,
             force,
             verbose,
-        } => export_git::run(repository, &path, bookmark, declassify, force, verbose)?,
+        } => export_git::run(repository, &path, bookmark, working_copy, declassify, force, verbose)?,
         Cmd::Status { short, null } => status::run(repository, short, null)?,
         Cmd::Watch => watch::run(repository)?,
         Cmd::Snapshot { rehash } => snapshot::run(repository, rehash)?,
@@ -428,6 +429,9 @@ enum Cmd {
         /// Bookmark to export. Repeat to export several. Defaults to every bookmark.
         #[arg(long, value_name = "NAME")]
         bookmark: Vec<String>,
+        /// Export the working change as working-copy, without setting a bookmark
+        #[arg(long, conflicts_with = "bookmark")]
+        working_copy: bool,
         /// Export this public path even though its bytes also appear in a private file
         #[arg(long, value_name = "PATH")]
         declassify: Vec<String>,

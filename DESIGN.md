@@ -244,6 +244,19 @@ ChangeIds are derived deterministically from Git commit IDs under a random local
 
 `tig export-git <path>` writes bookmarks into a Git repository via gitoxide. Git is a public channel: each revision is classified with its own `.private` plus the built-in floor, and private paths and existing sealed entries are omitted rather than sealed. `.private` itself stays public. A public file whose bytes match a non-empty private blob in the exported history is refused unless that path is passed with `--declassify`. The same tig revision always produces the same Git commit id. Refs move only after the objects exist, and only as a fast-forward of the last export unless `--force` is given. The worktree is not checked out, and hooks and filters are not run. See `EXPORT_GIT.md`.
 
+## Remote build inputs
+
+Remote compilation is a public upload boundary. `scripts/modal_build.py` stages
+native working changes with `snapshot --rehash` and `export-git --working-copy`,
+then uploads only that immutable public tree. It reuses export's privacy and
+historical paste checks; it adds no scans to ordinary status or snapshot paths.
+Local policy must match the staged policy, and running build scripts must match
+their public staged bytes. Automatic Python source inclusion is disabled.
+Only in-tree public file symlinks are allowed. A clean GitHub clone can bootstrap
+without TIG by verifying HEAD and its tree against a fixed list of recent public
+GitHub commits before reading committed blobs. Unverified local Git IDs and
+untracked bootstrap files are never sent. See `scripts/MODAL.md`.
+
 ## Phases
 
 - **Phase 1 (now):** core objects + stores, path index, trees/diff, revisions/changes, op log + undo, in-memory and filesystem workspaces, CLI (`init status diff log show new describe edit undo op-log workspace bookmark cat why`), `.private` rules plus local publish/fetch with sealing in simple mode, benchmarks against git.

@@ -1,23 +1,29 @@
 """Run tig Cargo commands on Modal and return the cargo exit code.
 
 Heavy builds stay off this machine. The Debian image (rustup + mingw) is
-cached by Modal. Each run uploads the working tree as it is now, including
-uncommitted edits, and reuses the ``tig-cargo-cache`` volume for the registry,
-git checkout, and ``CARGO_TARGET_DIR``.
+cached by Modal. Each run stages public source before uploading and reuses
+the ``tig-cargo-cache`` volume for the registry, git checkout, and
+``CARGO_TARGET_DIR``. See scripts/MODAL.md for the source boundary.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 import modal
 
+from build_source import UPLOAD_IGNORE, public_source
+
 REPO = Path(__file__).resolve().parents[1]
+RUNNER_SOURCES = {name: (REPO / name).read_bytes() for name in ("scripts/modal_build.py", "scripts/build_source.py")}
 REMOTE_REPO = "/repo"
 CACHE_ROOT = "/cargo-cache"
 CARGO_HOME = f"{CACHE_ROOT}/cargo-home"
@@ -27,20 +33,7 @@ LANE = "".join(c for c in os.environ.get("TIG_MODAL_CACHE", "main") if c.isalnum
 TARGET_DIR = f"{CACHE_ROOT}/target" if LANE == "main" else f"{CACHE_ROOT}/target-{LANE}"
 RELEASE_DIR = f"{TARGET_DIR}/x86_64-pc-windows-gnu/release"
 
-# Dockerignore-style. A name without a slash matches that path segment anywhere,
-# and Modal prunes those directories instead of walking them.
-UPLOAD_IGNORE = [
-    "target",
-    "bin",
-    ".git",
-    ".tig",
-    "pending",
-    "__pycache__",
-    ".claude",
-    ".grok",
-]
-
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "build-essential",
@@ -61,13 +54,12 @@ image = (
         {
             "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "CARGO_TERM_COLOR": "always",
+            "PYTHONPATH": "/repo/scripts",
         }
     )
-    .add_local_dir(str(REPO), remote_path=REMOTE_REPO, ignore=UPLOAD_IGNORE)
 )
 
 volume = modal.Volume.from_name("tig-cargo-cache", create_if_missing=True)
-app = modal.App("tig-build")
 
 RUN_ENV = {
     "CARGO_HOME": CARGO_HOME,
@@ -144,15 +136,7 @@ def _stream(cmd: list[str]) -> int:
     return proc.wait()
 
 
-@app.function(
-    image=image,
-    cpu=16,
-    memory=32 * 1024,
-    timeout=60 * 60,
-    volumes={CACHE_ROOT: volume},
-    env=RUN_ENV,
-)
-def cargo_exec(cmd: list[str]) -> int:
+def _cargo_exec(cmd: list[str]) -> int:
     os.makedirs(CARGO_HOME, exist_ok=True)
     os.makedirs(TARGET_DIR, exist_ok=True)
     _sync_mtimes()
@@ -162,15 +146,7 @@ def cargo_exec(cmd: list[str]) -> int:
         volume.commit()
 
 
-@app.function(
-    image=image,
-    cpu=16,
-    memory=32 * 1024,
-    timeout=60 * 60,
-    volumes={CACHE_ROOT: volume},
-    env=RUN_ENV,
-)
-def cargo_release() -> dict:
+def _cargo_release() -> dict:
     """Build Windows GNU bins and return their bytes. ``code`` is cargo's status."""
     os.makedirs(CARGO_HOME, exist_ok=True)
     os.makedirs(TARGET_DIR, exist_ok=True)
@@ -199,11 +175,30 @@ def cargo_release() -> dict:
         volume.commit()
 
 
+@contextlib.contextmanager
+def build_app(root=REPO, binary=None):
+    with public_source(root, binary) as source:
+        for name in ("scripts/modal_build.py", "scripts/build_source.py", "Cargo.toml", "Cargo.lock"):
+            if not (source / name).is_file():
+                raise RuntimeError(f"public source omits required build input {name}; refusing upload")
+        for name, expected in RUNNER_SOURCES.items():
+            if (source / name).read_bytes() != expected:
+                raise RuntimeError(f"{name} differs from the running build program; refusing upload")
+        image = base_image.add_local_dir(source, remote_path=REMOTE_REPO, ignore=UPLOAD_IGNORE)
+        app = modal.App("tig-build", include_source=False)
+        options = dict(image=image, cpu=16, memory=32 * 1024, timeout=60 * 60,
+                       volumes={CACHE_ROOT: volume}, env=RUN_ENV, serialized=True)
+        cargo_exec = app.function(name="cargo_exec", **options)(_cargo_exec)
+        cargo_release = app.function(name="cargo_release", **options)(_cargo_release)
+        yield app, cargo_exec, cargo_release
+
+
 def _run_remote(cmd: list[str]) -> int:
     started = time.perf_counter()
-    with modal.enable_output():
-        with app.run():
-            code = cargo_exec.remote(cmd)
+    with build_app() as (app, cargo_exec, _):
+        with modal.enable_output():
+            with app.run():
+                code = cargo_exec.remote(cmd)
     elapsed = time.perf_counter() - started
     print(f"modal exit {code} in {elapsed:.1f}s", flush=True)
     return int(code)
@@ -254,9 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_remote(rest)
 
     started = time.perf_counter()
-    with modal.enable_output():
-        with app.run():
-            result = cargo_release.remote()
+    with build_app() as (app, _, cargo_release):
+        with modal.enable_output():
+            with app.run():
+                result = cargo_release.remote()
     elapsed = time.perf_counter() - started
     code = int(result["code"])
     print(f"modal exit {code} in {elapsed:.1f}s", flush=True)
