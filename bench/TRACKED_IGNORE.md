@@ -103,3 +103,6 @@ used independent copies of the exported source and 15 samples per cell:
 The source procedure and workflow differences are in [SELF_HOSTING.md](SELF_HOSTING.md).
 These warm desktop samples do not establish universal superiority, a guaranteed
 speedup, cold-cache performance or behavior on other repositories.
+
+The follow-up [walker scheduling measurements](WALK_SCHEDULING.md) address the
+root-file slowdown while retaining the exact-file-coverage and ignored-edit checks.
