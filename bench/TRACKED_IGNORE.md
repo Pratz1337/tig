@@ -59,3 +59,47 @@ it missed the edit; the retained reader then verifies that each timed fixed-TIG
 ignored edit was actually recorded. Setup, warming and the documented racy-window
 wait are outside timings. Git status inspects edits; TIG status records them.
 TIG samples include captured `TIG_TRACE_PERF=1` phase output.
+
+## Results
+
+```powershell
+git -c core.autocrlf=false -c core.symlinks=false clone --depth 1 https://github.com/GitoxideLabs/gitoxide.git gitoxide-source
+git -C gitoxide-source fetch --depth 1 origin ad0202e3ab396d752a56664001c134f48d834177
+git -C gitoxide-source checkout --detach ad0202e3ab396d752a56664001c134f48d834177
+python -X utf8 bench/imported_status_compare.py gitoxide-source .git/tig-bootstrap/tig-before-tracked-ignore.exe --runs 15 --json bench/gitoxide-status-2026-10-18.json
+```
+
+The retained binary is an ignored pre-fix artifact, not supplied by a fresh
+checkout. No competing build, test or benchmark driver was active during the
+accepted measurements. A one-sample functional smoke run was excluded. Normal
+desktop background services remained active.
+
+Median wall milliseconds, 15 samples per cell
+([raw source provenance, executable hashes and phases](gitoxide-status-2026-10-18.json)):
+
+| Operation | Git | Previous TIG | Fixed TIG |
+|---|---:|---:|---:|
+| Clean status | 60.81 | 42.16 | 41.12 |
+| Edit `README.md` | 65.58 | 80.64 | 75.75 |
+| Edit tracked ignored corpus file | 68.07 | Incorrect; excluded | 53.50 |
+
+Fixed TIG correctly records the ignored edit and measured faster than Git for
+that workflow. The ordinary root-file edit improved against the retained binary
+but remains **15.5% slower than Git**. The edited walk/classify/hash phase was
+41.53 ms versus 15.47 ms clean; its tracked fallback phase was 6.46 ms versus
+the previous binary's 7.11 ms. Directory scheduling and overlap of root-file
+reads with child-directory scans are the next profiling target. This is a
+measurement lead, not an established causal explanation.
+
+A separate [176-file TIG source comparison](tracked-ignore-self-source-2026-10-18.json)
+used independent copies of the exported source and 15 samples per cell:
+
+| Operation | Git | Previous TIG | Fixed TIG |
+|---|---:|---:|---:|
+| Clean status | 41.64 | 20.47 | 19.18 |
+| Edited status | 43.03 | 26.07 | 24.14 |
+| Record change | 92.14 | 43.35 | 40.26 |
+
+The source procedure and workflow differences are in [SELF_HOSTING.md](SELF_HOSTING.md).
+These warm desktop samples do not establish universal superiority, a guaranteed
+speedup, cold-cache performance or behavior on other repositories.

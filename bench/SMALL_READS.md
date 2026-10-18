@@ -88,3 +88,7 @@ sample of the same command. These measured workflows all beat Git here.
 Larger real repositories, cold-cache behavior and different edit patterns still
 need measurement. The allocation regression is directly tested; the observed
 wall-time changes also include normal filesystem and antivirus variation.
+
+The follow-up [Gitoxide comparison](TRACKED_IGNORE.md) covers a larger real tree,
+fixes missed tracked ignored edits, and retains an ordinary edited-status loss
+to Git as the next performance target.
