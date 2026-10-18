@@ -353,8 +353,9 @@ impl Tree {
         r.finish()?;
         // Decoding must accept only canonical trees; otherwise one directory
         // could have several IDs.
-        let tree = Tree::new(entries.clone())?;
-        if tree.entries != entries {
+        let ordered = entries.windows(2).all(|w| w[0].name.as_bytes() < w[1].name.as_bytes());
+        let tree = Tree::new(entries)?;
+        if !ordered {
             return Err(Error::decode("tree", "entries not in canonical order"));
         }
         if (version == 2) != tree.has_conflicts {
@@ -645,6 +646,42 @@ mod tests {
             id
         }])
         .is_err());
+    }
+
+    #[test]
+    fn tree_decode_enforces_canonical_wire_entries() {
+        use EntryKind::{Conflict, File, Sealed, Tree as Directory};
+
+        let encoded = |version, entries: &[(&str, EntryKind)]| {
+            let mut w = Writer::new();
+            w.u8(version);
+            w.varint(entries.len() as u64);
+            for (name, kind) in entries {
+                w.u8(*kind as u8);
+                w.str(name);
+                w.id(&ObjectId([1; 32]));
+            }
+            w.finish()
+        };
+        for (version, entries) in [
+            (1, vec![]),
+            (1, vec![("a", File), ("a-b", Directory), ("é", Sealed)]),
+            (2, vec![("a", Conflict), ("é", File)]),
+        ] {
+            let body = encoded(version, &entries);
+            assert_eq!(Tree::decode(&body).unwrap().encode(), body);
+        }
+        for (version, entries) in [
+            (1, vec![("é", File), ("a", File)]),
+            (1, vec![("a", File), ("a", Directory)]),
+            (1, vec![("x/y", File)]),
+            (1, vec![(".TIG", Directory)]),
+            (1, vec![("a", Conflict)]),
+            (2, vec![("a", File)]),
+            (2, vec![]),
+        ] {
+            assert!(Tree::decode(&encoded(version, &entries)).is_err());
+        }
     }
 
     #[test]

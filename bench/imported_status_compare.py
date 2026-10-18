@@ -37,6 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("baseline", type=Path)
+    parser.add_argument("--edit-path", default="README.md", help="Tracked regular file to edit (default: README.md)")
     parser.add_argument("--runs", type=int, default=15)
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
@@ -82,15 +83,17 @@ def main():
                                  input=b"\0".join(sorted(modes)) + b"\0", capture_output=True)
         assert ignored.returncode in (0, 1)
         ignored_paths = ignored.stdout.split(b"\0")[:-1]
-        ignored_file = next(name for name in sorted(ignored_paths) if modes[name] != b"120000").decode()
-        assert b"README.md" in modes
+        ignored_file = next((name.decode() for name in sorted(ignored_paths) if modes[name] != b"120000"), None)
+        assert modes.get(args.edit_path.encode()) in (b"100644", b"100755"), "edit path must be a tracked regular file"
         time.sleep(2.1)
         for binary in binaries.values():
             assert call(root, binary, "status", "--short") == b""
         run(["git", "status", "--porcelain"], root)
         baseline_ignored_correct = None
         for mode in ("clean", "edited", "ignored edit"):
-            path = root / (ignored_file if mode == "ignored edit" else "README.md")
+            if mode == "ignored edit" and ignored_file is None:
+                continue
+            path = root / (ignored_file if mode == "ignored edit" else args.edit_path)
             if mode == "ignored edit":
                 with path.open("ab") as stream:
                     stream.write(b"\nretained binary correctness check\n")
@@ -118,7 +121,7 @@ def main():
                     samples[name][mode].append(row)
     result = {
         "fixture_commit": commit, "fixture_tree": tree, "files": len(modes),
-        "tracked_ignored_files": len(ignored_paths), "edited_ignored_path": ignored_file,
+        "tracked_ignored_files": len(ignored_paths), "edited_path": args.edit_path, "edited_ignored_path": ignored_file,
         "symlinks": len(symlinks), "materialized_symlinks": actual_links,
         "complete_tree_verified": True, "baseline_ignored_edit_correct": baseline_ignored_correct,
         "source": call(ROOT, "git", "--git-dir=" + str(ROOT / ".git/tig-public.git"), "rev-parse", "master").decode().strip(),
