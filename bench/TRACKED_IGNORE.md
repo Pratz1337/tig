@@ -63,10 +63,10 @@ TIG samples include captured `TIG_TRACE_PERF=1` phase output.
 ## Results
 
 ```powershell
-git -c core.autocrlf=false -c core.symlinks=false clone --depth 1 https://github.com/GitoxideLabs/gitoxide.git gitoxide-source
-git -C gitoxide-source fetch --depth 1 origin ad0202e3ab396d752a56664001c134f48d834177
-git -C gitoxide-source checkout --detach ad0202e3ab396d752a56664001c134f48d834177
-python -X utf8 bench/imported_status_compare.py gitoxide-source .git/tig-bootstrap/tig-before-tracked-ignore.exe --runs 15 --json bench/gitoxide-status-2026-10-18.json
+git -c core.longpaths=true -c core.autocrlf=false -c core.symlinks=false clone --depth 1 --single-branch --branch main https://github.com/GitoxideLabs/gitoxide.git .git/tig-bootstrap/gitoxide-source
+git -C .git/tig-bootstrap/gitoxide-source fetch --depth 1 origin ad0202e3ab396d752a56664001c134f48d834177
+git -C .git/tig-bootstrap/gitoxide-source -c core.longpaths=true checkout --detach ad0202e3ab396d752a56664001c134f48d834177
+python -X utf8 bench/imported_status_compare.py .git/tig-bootstrap/gitoxide-source .git/tig-bootstrap/tig-before-tracked-ignore.exe --runs 15 --json bench/gitoxide-status-2026-10-18.json
 ```
 
 The retained binary is an ignored pre-fix artifact, not supplied by a fresh
