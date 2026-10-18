@@ -1,7 +1,6 @@
 """Compare status on a real Git tree, retaining tracked files matched by ignores.
 
-SOURCE is a local clone; BASELINE predates the tracked-ignore fix. A temporary
-root commit preserves its exact HEAD tree
+SOURCE is a local clone. A temporary root commit preserves its exact HEAD tree
 without timing history import. No source files are changed or copied into TIG's
 project. Export TIG's public master before measuring the current bin/ executable.
 """
@@ -25,6 +24,13 @@ from compare import ENV, ROOT, run
 def call(cwd, *args, data=None):
     result = subprocess.run([str(arg) for arg in args], cwd=cwd, env=ENV, input=data, capture_output=True, check=True)
     return result.stdout
+
+
+def recorded_bytes(root, binary, path):
+    state = (root / ".tig/workspaces/default/state").read_bytes()
+    assert state[:5] == b"TIGW\x02", "expected ordinary version-2 benchmark state"
+    revision = state[5:37].hex()
+    return call(root, binary, "cat", "-r", revision, path)
 
 
 def main():
@@ -88,10 +94,10 @@ def main():
             if mode == "ignored edit":
                 with path.open("ab") as stream:
                     stream.write(b"\nretained binary correctness check\n")
-                baseline_ignored_correct = call(root, binaries["baseline"], "cat", ignored_file) == path.read_bytes()
-                assert not baseline_ignored_correct, "use a retained binary from before the tracked-ignore fix"
+                call(root, binaries["baseline"], "status", "--short")
+                baseline_ignored_correct = recorded_bytes(root, current, ignored_file) == path.read_bytes()
                 assert call(root, current, "cat", ignored_file) == path.read_bytes()
-            names = list(samples) if mode != "ignored edit" else ["git", "current"]
+            names = list(samples) if mode != "ignored edit" or baseline_ignored_correct else ["git", "current"]
             for sample in range(args.runs):
                 offset = sample % len(names)
                 order = names[offset:] + names[:offset]
@@ -107,8 +113,8 @@ def main():
                         trace_status.TIG = binaries[name]
                         row = trace_status.traced(root, ["status"])
                         del row["trace"]
-                        if mode == "ignored edit":
-                            assert call(root, binaries["baseline"], "cat", ignored_file) == path.read_bytes(), "timed status missed the edit"
+                        if mode != "clean":
+                            assert recorded_bytes(root, current, str(path.relative_to(root)).replace("\\", "/")) == path.read_bytes(), "timed status missed the edit"
                     samples[name][mode].append(row)
     result = {
         "fixture_commit": commit, "fixture_tree": tree, "files": len(modes),

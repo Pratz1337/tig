@@ -62,6 +62,15 @@ where
     T: Send,
     F: Fn(Found<'_>) -> T + Sync,
 {
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
+    walk_with_workers(root, is_scratch, visit, workers)
+}
+
+fn walk_with_workers<T, F>(root: &Path, is_scratch: fn(&OsStr) -> bool, visit: F, workers: usize) -> io::Result<(Vec<T>, Vec<String>)>
+where
+    T: Send,
+    F: Fn(Found<'_>) -> T + Sync,
+{
     let shared = Mutex::new(Shared {
         queue: VecDeque::from([Dir {
             disk: root.to_path_buf(),
@@ -73,7 +82,6 @@ where
         failed: None,
     });
     let wake = Condvar::new();
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
     let mut results = Vec::new();
     let mut warnings = Vec::new();
     std::thread::scope(|scope| {
@@ -83,14 +91,17 @@ where
                     let mut out = Vec::new();
                     let mut warn = Vec::new();
                     while let Some(dir) = next_job(&shared, &wake) {
-                        let result = list_dir(&dir, is_scratch, &visit, &mut out, &mut warn);
-                        let mut s = shared.lock().expect("walk lock poisoned");
-                        match result {
-                            Ok(children) => s.queue.extend(children),
-                            Err(e) => {
-                                s.failed.get_or_insert(e);
-                                s.queue.clear();
+                        let result = list_dir(&dir, is_scratch, &visit, &mut out, &mut warn, |children| {
+                            let mut s = shared.lock().expect("walk lock poisoned");
+                            if s.failed.is_none() {
+                                s.queue.extend(children);
+                                wake.notify_all();
                             }
+                        });
+                        let mut s = shared.lock().expect("walk lock poisoned");
+                        if let Err(e) = result {
+                            s.failed.get_or_insert(e);
+                            s.queue.clear();
                         }
                         s.active -= 1;
                         wake.notify_all();
@@ -212,14 +223,15 @@ pub(crate) fn is_vcs_metadata(name: &OsStr) -> bool {
     })
 }
 
-/// Lists one directory: visits its files, returns its subdirectories.
+/// Lists one directory, queues its children, then visits its files.
 fn list_dir<T, F>(
     dir: &Dir,
     is_scratch: fn(&OsStr) -> bool,
     visit: &F,
     out: &mut Vec<T>,
     warnings: &mut Vec<String>,
-) -> io::Result<Vec<Dir>>
+    enqueue: impl FnOnce(Vec<Dir>),
+) -> io::Result<()>
 where
     F: Fn(Found<'_>) -> T,
 {
@@ -227,7 +239,7 @@ where
     // A subdirectory with its own `.tig` is another workspace or a nested
     // repo: never sweep it into this one (git skips nested repos too).
     if dir.depth > 0 && entries.iter().any(|e| e.file_name() == OsStr::new(".tig")) {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let mut ignores = dir.ignores.clone();
@@ -253,6 +265,7 @@ where
     }
 
     let mut children = Vec::new();
+    let mut files = Vec::new();
     for entry in entries {
         let name = entry.file_name();
         if name == OsStr::new(".tig") || is_scratch(&name) || is_vcs_metadata(&name) {
@@ -272,13 +285,20 @@ where
         if is_dir {
             children.push(Dir { disk, repo, depth: dir.depth + 1, ignores: ignores.clone() });
         } else if file_type.is_file() || file_type.is_symlink() {
-            let meta = entry.metadata()?;
-            out.push(visit(Found { path: repo, disk, file_type, meta: &meta }));
+            files.push((entry, repo, disk, file_type));
         } else {
             warnings.push(format!("skipping special file {}", disk.display()));
         }
     }
-    Ok(children)
+    // A slow file read must not keep the other workers waiting for children.
+    if !children.is_empty() {
+        enqueue(children);
+    }
+    for (entry, repo, disk, file_type) in files {
+        let meta = entry.metadata()?;
+        out.push(visit(Found { path: repo, disk, file_type, meta: &meta }));
+    }
+    Ok(())
 }
 
 /// The nearest matcher with an opinion decides; a whitelist (`!pattern`)
@@ -292,4 +312,55 @@ fn ignored(chain: &[Arc<Gitignore>], path: &Path, is_dir: bool) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_waiting_parent_file_does_not_stall_descendant_visits() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("root.txt"), b"root").unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(root.path().join("child/leaf"), b"child").unwrap();
+        let (sent, received) = mpsc::sync_channel(1);
+        let received = Mutex::new(received);
+        let (found, warnings) = walk_with_workers(root.path(), |_| false, |item| {
+            let path = item.path.unwrap();
+            let child_finished = if path.as_str() == "root.txt" {
+                received.lock().unwrap().recv_timeout(Duration::from_secs(5)).is_ok()
+            } else {
+                sent.send(()).unwrap();
+                true
+            };
+            (path, child_finished)
+        }, 2).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|(_, child_finished)| *child_finished),
+            "a root-file visitor blocked every child-directory worker");
+    }
+
+    #[test]
+    fn worker_counts_preserve_each_file_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = BTreeSet::new();
+        for i in 0..8 {
+            fs::create_dir_all(root.path().join(format!("dir{i}/nested"))).unwrap();
+            for name in [format!("dir{i}/file"), format!("dir{i}/nested/file")] {
+                fs::write(root.path().join(&name), b"file").unwrap();
+                expected.insert(RepoPath::new(&name).unwrap());
+            }
+        }
+        for workers in [1, 2, 4] {
+            let (files, warnings) = walk_with_workers(root.path(), |_| false, |item| item.path.unwrap(), workers).unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(files.len(), expected.len());
+            assert_eq!(files.into_iter().collect::<BTreeSet<_>>(), expected);
+        }
+        assert!(walk_with_workers(&root.path().join("absent"), |_| false, |_| (), 2).is_err());
+    }
 }
