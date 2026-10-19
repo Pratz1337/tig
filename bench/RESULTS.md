@@ -70,3 +70,6 @@ Gitoxide samples, including the remaining edited-status loss against Git.
 
 The [path-validation follow-up](PATH_VALIDATION.md) profiles cached-path
 validation, preserves its policy, and records paired state/CLI measurements.
+
+The [metadata-filter follow-up](METADATA_PREFIX.md) profiles snapshot path checks
+and preserves Unicode metadata exclusions while skipping definite non-matches.

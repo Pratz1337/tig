@@ -2750,6 +2750,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set TIG_PROFILE_STATE to a local real-workspace state file"]
+    fn profile_snapshot_path_checks() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let bytes = fs::read(std::env::var_os("TIG_PROFILE_STATE").expect("set TIG_PROFILE_STATE")).unwrap();
+        let state = decode_state(&bytes).unwrap();
+        let paths: Vec<_> = state.cache.iter().map(|(path, _)| path.clone()).collect();
+        println!("profile: {} cached paths", paths.len());
+        for _ in 0..7 {
+            let started = Instant::now();
+            for path in &paths {
+                black_box(state.cache.get(black_box(path))).unwrap();
+            }
+            println!("profile: cache lookups {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = Instant::now();
+            for path in &paths {
+                let name = path.file_name().unwrap();
+                black_box(crate::walk::is_vcs_metadata(OsStr::new(black_box(name))));
+            }
+            println!("profile: VCS name checks {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            #[cfg(windows)]
+            {
+                let started = Instant::now();
+                for path in &paths {
+                    black_box(path_name_block(black_box(path)));
+                }
+                println!("profile: Windows name checks {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+    }
+
+    #[test]
     fn failed_rename_preserves_destination() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("state");
