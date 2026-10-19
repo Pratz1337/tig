@@ -73,3 +73,6 @@ validation, preserves its policy, and records paired state/CLI measurements.
 
 The [metadata-filter follow-up](METADATA_PREFIX.md) profiles snapshot path checks
 and preserves Unicode metadata exclusions while skipping definite non-matches.
+
+The [cached-directory-name follow-up](CACHED_DIRECTORY_NAMES.md) reuses listed
+names for disk paths, with before/after filesystem tests and real-source timings.
