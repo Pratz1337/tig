@@ -299,7 +299,7 @@ where
         }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            let disk = entry.path();
+            let disk = dir.disk.join(name);
             if ignored(&ignores, &disk, true) { continue; }
             let repo = entry_repo_path(&dir, name, &disk);
             children.push(Dir { disk, repo, depth: dir.depth + 1, ignores: ignores.clone() });
@@ -338,7 +338,8 @@ where
 {
     for (entry, name, kind) in entries {
         let Some(file_type) = kind else { continue; };
-        let disk = entry.path();
+        // The listing already converted and retained this entry's name.
+        let disk = dir.disk.join(name);
         if ignored(&dir.ignores, &disk, false) { continue; }
         if file_type.is_file() || file_type.is_symlink() {
             let repo = entry_repo_path(dir, name, &disk);
@@ -377,6 +378,96 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "set TIG_PROFILE_ROOT and TIG_PROFILE_DIR to a local flat fixture directory"]
+    fn profile_walk_operations() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let root = fs::canonicalize(std::env::var_os("TIG_PROFILE_ROOT").expect("set TIG_PROFILE_ROOT")).unwrap();
+        let repo = RepoPath::from_os_relative(&std::env::var("TIG_PROFILE_DIR").expect("set TIG_PROFILE_DIR")).unwrap();
+        let disk = root.join(repo.as_str());
+        let mut ignores = Vec::new();
+        for ancestor in disk.ancestors().take_while(|path| path.starts_with(&root)).collect::<Vec<_>>().into_iter().rev() {
+            let files = [ancestor.join(".gitignore"), ancestor.join(".tigignore")];
+            if files.iter().any(|path| path.is_file()) {
+                let mut builder = GitignoreBuilder::new(ancestor);
+                for path in files.iter().filter(|path| path.is_file()) { assert!(builder.add(path).is_none()); }
+                ignores.push(Arc::new(builder.build().unwrap()));
+            }
+        }
+        let dir = Dir { disk, depth: repo.components().count(), repo: Ok(repo), ignores: Arc::new(ignores) };
+        for _ in 0..7 {
+            let started = Instant::now();
+            let entries = fs::read_dir(&dir.disk).unwrap().collect::<io::Result<Vec<_>>>().unwrap();
+            println!("profile: list directory {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            println!("profile: {} directory entries", entries.len());
+            let started = Instant::now();
+            let names: Vec<_> = entries.iter().map(|entry| (entry.file_name(), entry.file_type().unwrap())).collect();
+            println!("profile: names and types {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            assert!(names.iter().all(|(name, kind)| kind.is_file() && !is_vcs_metadata(name)));
+            let started = Instant::now();
+            let paths: Vec<_> = entries.iter().map(|entry| entry.path()).collect();
+            println!("profile: disk paths {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = Instant::now();
+            let cached_paths: Vec<_> = names.iter().map(|(name, _)| dir.disk.join(name)).collect();
+            black_box(&cached_paths);
+            println!("profile: disk paths cached names {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(paths, cached_paths);
+            let started = Instant::now();
+            for path in &paths { assert!(!black_box(ignored(&dir.ignores, black_box(path), false))); }
+            println!("profile: ignore matching {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = Instant::now();
+            let repo_paths: Vec<_> = names.iter().zip(&paths).map(|((name, _), path)| {
+                entry_repo_path(&dir, black_box(name), path).unwrap()
+            }).collect();
+            black_box(&repo_paths);
+            println!("profile: repo paths {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = Instant::now();
+            for entry in &entries { black_box(entry.metadata().unwrap()); }
+            println!("profile: cached metadata {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = Instant::now();
+            let (found, warnings) = walk(&root, |_| false, |item| item.path.unwrap()).unwrap();
+            println!("profile: full walk paths only {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            assert!(warnings.is_empty());
+            println!("profile: {} walked paths", found.len());
+            black_box(found);
+        }
+    }
+
+    #[test]
+    fn disk_paths_preserve_unicode_and_invalid_os_names() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = vec![root.path().join("plain.txt"), root.path().join("nested résumé/space 東京.txt")];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            paths.push(root.path().join(OsString::from_vec(vec![b'f', 0xff])));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            paths.push(root.path().join(OsString::from_wide(&[102, 0xd800])));
+        }
+        let expected: std::collections::BTreeMap<_, _> = paths.into_iter().enumerate().map(|(i, path)| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("file {i}\n").into_bytes();
+            fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        }).collect();
+        for workers in [1, 2, 4] {
+            let (found, warnings) = walk_with_workers(root.path(), |_| false, |item| {
+                assert_eq!(item.path.is_ok(), item.disk.to_str().is_some());
+                let bytes = fs::read(&item.disk).unwrap();
+                assert_eq!(item.meta.len(), bytes.len() as u64);
+                (item.disk, bytes)
+            }, workers).unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(found.len(), expected.len());
+            assert_eq!(found.into_iter().collect::<std::collections::BTreeMap<_, _>>(), expected);
+        }
+    }
 
     #[test]
     fn vcs_aliases_keep_ignorable_prefixes_and_case_matching() {
