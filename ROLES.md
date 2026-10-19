@@ -77,6 +77,8 @@ tig env origin --role billing -- PROGRAM ARGUMENTS
 tig env origin --role billing --file internal/billing/service.env -- PROGRAM ARGUMENTS
 ```
 
-The default file is `.env.<role>`. The selected source must be classified private for that role. Missing, sealed, unreadable, invalid, and unauthorized sources fail before the child starts. Authorization checks the live verified remote policy even if the file and an old key remain cached locally.
+The default file is `.env.<role>`. Here `--role` selects the read group named in `.private`; a custom role definition can authorize several such groups. The selected source must be classified private for that group. Missing, sealed, unreadable, invalid, and unauthorized sources fail before the child starts. Authorization checks the live verified remote policy even if the file and an old key remain cached locally.
+
+Role commands and `tig env` persist each verified policy counter and signed policy prefix before acting, including a denied environment request. Later commands reject an older head or a different accepted prefix. This local observation floor survives stale fetch/publish cache saves and serializes competing observers. It cannot detect an older genuine policy on first contact or revoke plaintext already held by another process.
 
 Dotenv parsing is literal: optional `export ` and matching outer quotes are supported; `$`, command substitutions, and escapes are not evaluated. The command and its arguments are passed directly to the child without an inserted shell. The child inherits standard input/output/error and its exit status is propagated; it can print or otherwise disclose secrets it receives. tig itself does not print parsed values or include invalid line contents in errors.

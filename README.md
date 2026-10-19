@@ -111,9 +111,15 @@ flowchart LR
     X[Outsider] -.reads.-> PUB[everything public]
 ```
 
-Owners rank roles, and roles carry permissions like editing private paths, managing roles or approving merges. Going from simple to advanced mode is just adding tags to the same file, with no migration and no new repo.
+Owners rank roles and grant `edit-private`, `manage-roles`, `assign-roles` and `publish` permissions. Managers can delegate only permissions they hold to lower-ranked roles. Adding tags activates role mode while preserving existing simple-mode members' access.
 
-> Roles are partly built: the `@role` syntax and per-role keys are in, and full end-to-end role grants are landing next.
+```sh
+tig role create billing --rank 1
+tig role grant billing READER_TOKEN
+tig role revoke billing READER_TOKEN   # removes access and rotates keys
+```
+
+Role creation, grants, revocation, literal command environments and ownership transfer are implemented. See [`ROLES.md`](ROLES.md) for the commands and the separation between management permission and secret-key custody.
 
 ## Architecture
 
@@ -124,33 +130,19 @@ flowchart TB
     PRIV --> CORE["tig-core<br/>objects, store, changes, merge, op log, workspaces"]
 ```
 
-About 27k lines of Rust. See [`DESIGN.md`](DESIGN.md) for the full design contract.
+See [`DESIGN.md`](DESIGN.md) for the full design contract.
 
 This repository now uses TIG locally. See [`SELF_HOSTING.md`](SELF_HOSTING.md) for compact status output, the privacy demo and the GitHub export bridge.
 
 ## Speed
 
-Synthetic trees on Linux, median wall time, git on default settings:
-
-| Operation | 100k files: git | 100k files: tig | tig / git |
-|---|---:|---:|---:|
-| init + first snapshot | 30,632 ms | 23,914 ms | 0.78x |
-| status, no change | 1,694 ms | 1,179 ms | 0.70x |
-| status, 1 file edited | 1,687 ms | 1,234 ms | 0.73x |
-| record change | 1,630 ms | 1,081 ms | 0.66x |
-
-Methodology, Windows numbers and caveats are in [`bench/RESULTS.md`](bench/RESULTS.md). Comparisons against tuned git and jj are next.
+Real-source Windows comparisons include wins and losses: TIG is faster for clean Gitoxide status and a tracked ignored-file edit, but slower for its README edit and for edited TypeScript status. TIG status also records edits, while Git status only reports them. Frozen binary IDs, methods and retained samples are in [`bench/RESULTS.md`](bench/RESULTS.md).
 
 ## Status
 
-| Done | Next |
-|---|---|
-| core engine, changes, undo, workspaces | export back to git |
-| `.private` simple mode | Discord-style roles end to end |
-| publish and fetch with crash recovery | GitHub integration |
-| git import with full history | security audit |
+Implemented: changes, undo, workspaces, stored conflicts, per-path privacy, roles, directory/HTTPS remotes, Git history import, public Git export and a reproducible GitHub-to-TIG local setup.
 
-**Alpha and unaudited.** Please try to break it. See [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md) and open an issue.
+**Alpha and unaudited.** First-contact trust, previously disclosed secrets and filesystem crash/race limits still matter. See [`DESIGN.md`](DESIGN.md#known-gaps-tracked-not-forgotten) and [`SECURITY.md`](SECURITY.md). Sharing unresolved conflicts, server-side garbage collection and operation-history transfer remain deferred.
 
 ## License
 

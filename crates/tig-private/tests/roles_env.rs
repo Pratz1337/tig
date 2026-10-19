@@ -38,6 +38,44 @@ fn simple_keyring_stays_version_1() {
 }
 
 #[test]
+fn assigning_an_existing_role_cannot_delegate_permissions_the_manager_lacks() {
+    let owner = Identity::generate().unwrap();
+    let manager = Identity::generate().unwrap();
+    let member = Identity::generate().unwrap();
+    let (mut ring, _) = Keyring::create(remote(), &owner).unwrap();
+    let sign = |body: TransitionBody, counter, actor: &Identity| body.sign(remote(), &owner.public().signing, counter, actor);
+    let mut definitions = vec![sign(TransitionBody::SetRole {
+        name: "lead".into(), role: role(10, roles::ASSIGN_ROLES, &[]),
+    }, 2, &owner)];
+    for (name, permissions) in [("rules", roles::EDIT_PRIVATE), ("manager", roles::MANAGE_ROLES),
+        ("publisher", roles::PUBLISH), ("delegate", roles::ASSIGN_ROLES), ("reader", 0)] {
+        definitions.push(sign(TransitionBody::SetRole {
+            name: name.into(), role: role(1, permissions, &[]),
+        }, 2, &owner));
+    }
+    ring.commit_policy(&owner, definitions, vec![]).unwrap();
+    ring.commit_policy(&owner, vec![sign(TransitionBody::Assign {
+        member: manager.public(), role: "lead".into(),
+    }, 3, &owner)], vec![]).unwrap();
+    let before = ring.encode().unwrap();
+    for name in ["rules", "manager", "publisher"] {
+        let error = ring.commit_policy(&manager, vec![sign(TransitionBody::Assign {
+            member: member.public(), role: name.into(),
+        }, 4, &manager)], vec![]).unwrap_err();
+        assert!(error.to_string().contains("permission"), "{error}");
+        assert_eq!(ring.encode().unwrap(), before);
+    }
+    ring.commit_policy(&manager, vec!["delegate", "reader"].into_iter().map(|name| sign(TransitionBody::Assign {
+        member: member.public(), role: name.into(),
+    }, 4, &manager)).collect(), vec![]).unwrap();
+    assert_eq!(ring.policy_snapshot().unwrap().permissions(&member.public()), roles::ASSIGN_ROLES);
+    ring.commit_policy(&owner, vec![sign(TransitionBody::Assign {
+        member: member.public(), role: "publisher".into(),
+    }, 5, &owner)], vec![]).unwrap();
+    assert!(ring.policy_snapshot().unwrap().has(&member.public(), roles::PUBLISH));
+}
+
+#[test]
 fn owner_commits_reader_wraps_and_env_denies_removed_reader() {
     let owner = Identity::generate().unwrap();
     let alice = Identity::generate().unwrap();

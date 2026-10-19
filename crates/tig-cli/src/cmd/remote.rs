@@ -264,6 +264,10 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
         Some(bytes) => FetchState::decode(&bytes)
             .map_err(|err| CliError::msg(format!("cannot read fetch state: {err}"))),
     }?;
+    let observed = match read_optional(&dir.join("observed-policy"))? {
+        Some(bytes) => FetchState::decode(&bytes)?,
+        None => FetchState::new(),
+    };
     if published.owner_signing.is_some()
         && fetched.owner_signing.is_some()
         && (published.owner_signing != fetched.owner_signing
@@ -273,13 +277,20 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
             "fetch and publish state disagree about the remote owner",
         ));
     }
-    if let Some(pin) = published.owner_signing.or(fetched.owner_signing) {
+    if let Some(pin) = published.owner_signing.or(fetched.owner_signing).or(observed.owner_signing) {
         let remote_id = if published.owner_signing.is_some() {
             published.remote_id
-        } else {
+        } else if fetched.owner_signing.is_some() {
             fetched.remote_id
+        } else {
+            observed.remote_id
         };
-        let mut counter = published.counter.max(fetched.counter);
+        if observed.owner_signing.is_some()
+            && (observed.owner_signing != Some(pin) || observed.remote_id != remote_id)
+        {
+            return Err(CliError::msg("observed role policy disagrees about the remote owner"));
+        }
+        let mut counter = published.counter.max(fetched.counter).max(observed.counter);
         if let Some(bytes) = read_optional(&dir.join("pending-keyring"))?.filter(|_| pending_floor) {
             let pending = Keyring::decode(&bytes)?;
             if pending.remote != remote_id {
@@ -288,6 +299,7 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
             pending.verify(&pin, 0)?;
             pending.verify_policy_checkpoint(published.policy_checkpoint.as_ref())?;
             pending.verify_policy_checkpoint(fetched.policy_checkpoint.as_ref())?;
+            pending.verify_policy_checkpoint(observed.policy_checkpoint.as_ref())?;
             counter = counter.max(pending.head.counter);
         }
         published.remote_id = remote_id;
@@ -296,12 +308,16 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
         fetched.owner_signing = Some(pin);
         published.counter = counter;
         fetched.counter = counter;
-        let checkpoint = match (published.policy_checkpoint, fetched.policy_checkpoint) {
-            (Some(left), Some(right)) if left.transitions == right.transitions && left != right =>
-                return Err(CliError::msg("fetch and publish state disagree about the accepted role policy")),
-            (Some(left), Some(right)) => Some(if left.transitions >= right.transitions { left } else { right }),
-            (left, right) => left.or(right),
-        };
+        let mut checkpoint: Option<tig_private::keyring::PolicyCheckpoint> = None;
+        for next in [published.policy_checkpoint, fetched.policy_checkpoint, observed.policy_checkpoint].into_iter().flatten() {
+            if let Some(previous) = checkpoint {
+                if previous.transitions == next.transitions && previous != next {
+                    return Err(CliError::msg("local states disagree about the accepted role policy"));
+                }
+                if previous.transitions > next.transitions { continue; }
+            }
+            checkpoint = Some(next);
+        }
         published.policy_checkpoint = checkpoint;
         fetched.policy_checkpoint = checkpoint;
         let revealed = published.revealed.union(&fetched.revealed).copied().collect();
@@ -314,7 +330,7 @@ fn load_states(dir: &Path, pending_floor: bool) -> Result<(PublishState, FetchSt
     Ok((published, fetched))
 }
 
-/// Check both persisted prefixes before a merged state chooses the newer one.
+/// Check every persisted prefix before a merged state chooses the newer one.
 pub(super) fn verify_policy_checkpoints(dir: &Path, keyring: &Keyring) -> Result<()> {
     if let Some(bytes) = read_optional(&dir.join("publish-state"))? {
         let state = PublishState::decode(&bytes)?;
@@ -324,7 +340,37 @@ pub(super) fn verify_policy_checkpoints(dir: &Path, keyring: &Keyring) -> Result
         let state = FetchState::decode(&bytes)?;
         keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
     }
+    if let Some(bytes) = read_optional(&dir.join("observed-policy"))? {
+        let state = FetchState::decode(&bytes)?;
+        keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
+    }
     Ok(())
+}
+
+/// Read-only role commands must remember observations too. A separate floor
+/// survives stale cache saves; the OS lock serializes competing observations.
+pub(super) fn remember_policy_head(dir: &Path, keyring: &Keyring) -> Result<PublishState> {
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(dir.join("observed-policy.lock"))?;
+    lock.lock()?;
+    let mut state = load_publish_state(dir)?;
+    let pin = state.owner_signing.ok_or_else(|| CliError::msg("fetch this remote before using its role policy"))?;
+    if state.remote_id != keyring.remote { return Err(CliError::msg("keyring is for a different remote")); }
+    keyring.verify(&pin, state.counter)?;
+    verify_policy_checkpoints(dir, keyring)?;
+    let mut observed = FetchState::new();
+    observed.remote_id = keyring.remote;
+    observed.owner_signing = Some(pin);
+    observed.counter = keyring.head.counter;
+    observed.policy_checkpoint = keyring.policy_checkpoint();
+    let bytes = observed.encode()?;
+    let path = dir.join("observed-policy");
+    if read_optional(&path)?.as_deref() != Some(bytes.as_slice()) {
+        super::disk::write_replace(&path, &bytes, false)?;
+    }
+    state.counter = observed.counter;
+    state.policy_checkpoint = observed.policy_checkpoint;
+    Ok(state)
 }
 
 pub(super) fn save_publish_state(dir: &Path, state: &PublishState) -> Result<()> {
@@ -487,6 +533,46 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_policy_survives_competing_observers_and_stale_cache_saves() {
+        use std::sync::{Arc, Barrier};
+        use tig_private::roles::{Role, TransitionBody};
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Identity::generate().unwrap();
+        let (original, _) = Keyring::create([45; 16], &owner).unwrap();
+        let mut stale = PublishState::new();
+        stale.remote_id = original.remote;
+        stale.owner_signing = Some(owner.public().signing);
+        stale.counter = original.head.counter;
+        save_publish_state(dir.path(), &stale).unwrap();
+        let mut current = original.clone();
+        for (counter, name) in [(2, "first"), (3, "second")] {
+            current.commit_policy(&owner, vec![TransitionBody::SetRole {
+                name: name.into(), role: Role { rank: 1, permissions: 0, groups: Default::default() },
+            }.sign(current.remote, &owner.public().signing, counter, &owner)], vec![]).unwrap();
+            if counter == 2 { remember_policy_head(dir.path(), &current).unwrap(); }
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [original.clone(), current.clone()].into_iter().map(|ring| {
+            let barrier = barrier.clone();
+            let path = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                barrier.wait();
+                remember_policy_head(&path, &ring).is_ok()
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(results, [false, true]);
+        save_publish_state(dir.path(), &stale).unwrap();
+        save_fetch_state(dir.path(), &FetchState::new()).unwrap();
+        for state in [load_publish_state(dir.path()).unwrap().counter, load_fetch_state(dir.path()).unwrap().counter] {
+            assert_eq!(state, current.head.counter);
+        }
+        assert_eq!(load_publish_state(dir.path()).unwrap().policy_checkpoint, current.policy_checkpoint());
+        assert!(remember_policy_head(dir.path(), &original).is_err());
+        assert_eq!(load_publish_state(dir.path()).unwrap().counter, current.head.counter);
+    }
 
     #[test]
     fn pending_revoke_is_recovered_before_using_an_older_remote_head() {

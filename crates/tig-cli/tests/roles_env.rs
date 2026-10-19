@@ -50,6 +50,7 @@ fn env_uses_literal_role_secrets_real_exit_code_and_denies_cached_revoked_access
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(output.stdout, b"literal-$(never-run)");
     assert!(output.stderr.is_empty());
+    let before_revoke = fs::read(remote.join("keyring")).unwrap();
     ok(command(&owner, &owner_id).args(["role", "origin", "unassign", "billing", &reader_token]));
     let marker = temp.path().join("child-ran");
     let denied = command(&reader, &reader_id).args(["env", "origin", "--role", "billing", "--", "touch"]).arg(&marker).output().unwrap();
@@ -57,6 +58,15 @@ fn env_uses_literal_role_secrets_real_exit_code_and_denies_cached_revoked_access
     assert!(!marker.exists());
     assert!(!String::from_utf8_lossy(&denied.stderr).contains("literal-$(never-run)"));
     assert_eq!(fs::read_to_string(reader.join(".env.billing")).unwrap(), "TOKEN=literal-$(never-run)\n");
+    let after_revoke = fs::read(remote.join("keyring")).unwrap();
+    // An untrusted remote replays a valid head after this client saw revocation.
+    fs::write(remote.join("keyring"), &before_revoke).unwrap();
+    let replayed = command(&reader, &reader_id).args(["env", "origin", "--role", "billing", "--", "sh", "-c", "touch \"$1\"", "role-replay"])
+        .arg(&marker).output().unwrap();
+    assert!(!replayed.status.success(), "a replayed role policy ran the child");
+    assert!(!marker.exists());
+    assert!(!String::from_utf8_lossy(&replayed.stderr).contains("literal-$(never-run)"));
+    fs::write(remote.join("keyring"), after_revoke).unwrap();
     ok(command(&owner, &owner_id).args(["role", "origin", "rotate", "billing"]));
     ok(command(&owner, &owner_id).args(["role", "origin", "rotate", "private"]));
     fs::write(owner.join("readme"), "public after rotations").unwrap();
@@ -95,11 +105,45 @@ fn transfer_proposal_is_public_successor_accepts_and_former_owner_loses_authorit
     ok(command(&owner, &owner_id).args(["role", "origin", "transfer", &successor_token]).arg(&proposal));
     let bytes = fs::read(&proposal).unwrap();
     assert!(!bytes.windows(64).any(|window| window == fs::read(&owner_id).unwrap()));
+    let before_transfer = fs::read(remote.join("keyring")).unwrap();
     ok(command(&successor, &successor_id).args(["role", "origin", "accept-transfer"]).arg(&proposal));
+    ok(command(&owner, &owner_id).args(["role", "list"]));
+    let after_transfer = fs::read(remote.join("keyring")).unwrap();
+    fs::write(remote.join("keyring"), &before_transfer).unwrap();
+    let replayed = command(&owner, &owner_id).args(["role", "list"]).output().unwrap();
+    assert!(!replayed.status.success(), "role list accepted a previously superseded owner");
+    fs::write(remote.join("keyring"), &after_transfer).unwrap();
     ok(command(&successor, &successor_id).args(["role", "origin", "set", "new", "--rank", "1"]));
     let denied = command(&owner, &owner_id).args(["role", "origin", "set", "old", "--rank", "2"]).output().unwrap();
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("role"));
+}
+
+#[test]
+fn role_assignment_cannot_delegate_a_permission_the_manager_lacks() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner_id = temp.path().join("owner.id");
+    let manager_id = temp.path().join("manager.id");
+    let member_id = temp.path().join("member.id");
+    let owner = temp.path().join("owner");
+    let manager = temp.path().join("manager");
+    let remote = temp.path().join("remote");
+    let manager_token = token(temp.path(), &manager_id);
+    let member_token = token(temp.path(), &member_id);
+    ok(command(temp.path(), &owner_id).arg("init").arg(&owner));
+    fs::write(owner.join("readme"), "public").unwrap();
+    ok(command(&owner, &owner_id).args(["remote", "add", "origin"]).arg(&remote));
+    ok(command(&owner, &owner_id).args(["publish", "origin"]));
+    ok(command(&owner, &owner_id).args(["role", "set", "lead", "--rank", "10", "--permissions", "assign-roles"]));
+    ok(command(&owner, &owner_id).args(["role", "set", "publisher", "--rank", "1", "--permissions", "publish"]));
+    ok(command(&owner, &owner_id).args(["role", "assign", "lead", &manager_token]));
+    ok(command(temp.path(), &manager_id).arg("clone").arg(&remote).arg(&manager));
+    let before = fs::read(remote.join("keyring")).unwrap();
+    let denied = command(&manager, &manager_id).args(["role", "assign", "publisher", &member_token]).output().unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("permission you do not hold"));
+    assert_eq!(fs::read(remote.join("keyring")).unwrap(), before);
+    ok(command(&owner, &owner_id).args(["role", "assign", "publisher", &member_token]));
 }
 
 #[test]

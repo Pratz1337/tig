@@ -64,7 +64,7 @@ pub(super) fn run(repository: Option<&Path>, source: &Path, strip_private: bool)
             .iter()
             .any(|(id, _)| previous.contains(id));
     // Bulk objects bypass the journal, so ordinary commands do not inherit
-    // import compaction. See the measured comparison in bench/IMPORT.md.
+    // import compaction. See the measured comparison in bench/RESULTS.md.
     let bulk = DiskStore::open(tig.join("store"))?;
     let report = import_git(&source, &bulk, &mut state)?;
     for path in &report.matched {
