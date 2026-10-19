@@ -67,3 +67,6 @@ The baseline executable is an ignored retained build artifact, not reproduced by
 
 The [wide-directory comparison](PARALLEL_WALK.md) retains paired TypeScript and
 Gitoxide samples, including the remaining edited-status loss against Git.
+
+The [path-validation follow-up](PATH_VALIDATION.md) profiles cached-path
+validation, preserves its policy, and records paired state/CLI measurements.
