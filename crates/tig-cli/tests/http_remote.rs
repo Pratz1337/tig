@@ -106,6 +106,74 @@ fn contains_bytes(root: &Path, needle: &[u8]) -> bool {
 }
 
 #[test]
+fn manager_assigns_pending_readers_and_shared_role_revocation_keeps_other_access() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner_id = tmp.path().join("owner.id");
+    let manager_id = tmp.path().join("manager.id");
+    let holder_id = tmp.path().join("holder.id");
+    let reader_id = tmp.path().join("reader.id");
+    let owner = |dir: &Path| tig(dir, "owner", &owner_id);
+    let manager = |dir: &Path| tig(dir, "manager", &manager_id);
+    let holder = |dir: &Path| tig(dir, "holder", &holder_id);
+    let reader = |dir: &Path| tig(dir, "reader", &reader_id);
+    expect_ok(owner(tmp.path()).arg("identity"));
+    let manager_token = token(&expect_ok(manager(tmp.path()).arg("identity")));
+    let holder_token = token(&expect_ok(holder(tmp.path()).arg("identity")));
+    let reader_token = token(&expect_ok(reader(tmp.path()).arg("identity")));
+    let fingerprint = tig_cli::ui::parse_identity_token(&reader_token).unwrap().fingerprint();
+    let (_server, url) = start_server(tmp.path(), &owner_id);
+    let repo = tmp.path().join("owner");
+    let admin = tmp.path().join("manager");
+    let custody = tmp.path().join("holder");
+    let clone = tmp.path().join("reader");
+    expect_ok(owner(tmp.path()).arg("init").arg(&repo));
+    fs::write(repo.join("readme"), "public").unwrap();
+    expect_ok(owner(&repo).args(["remote", "add", "origin", &url]));
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    for role in ["billing", "security"] {
+        expect_ok(owner(&repo).args(["role", "create", role, "--rank", "1"]));
+    }
+    fs::write(repo.join(".private"), ".env.billing @billing\n.env.shared @billing @security\n.env.security @security\n").unwrap();
+    fs::write(repo.join(".env.billing"), "billing only").unwrap();
+    fs::write(repo.join(".env.shared"), "shared version one").unwrap();
+    fs::write(repo.join(".env.security"), "security only").unwrap();
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(owner(&repo).args(["role", "set", "lead", "--rank", "10", "--permissions", "assign-roles"]));
+    expect_ok(owner(&repo).args(["role", "assign", "lead", &manager_token]));
+    expect_ok(owner(&repo).args(["role", "grant", "billing", &holder_token]));
+    for (identity, path) in [(&manager_id, &admin), (&holder_id, &custody), (&reader_id, &clone)] {
+        expect_ok(tig(tmp.path(), "clone", identity).args(["clone", &url]).arg(path));
+    }
+    expect_ok(manager(&admin).args(["role", "assign", "billing", &reader_token]));
+    let pending = expect_ok(manager(&admin).args(["role", "pending"]));
+    assert!(pending.contains(&format!("billing+security: key grant pending for {fingerprint}")), "{pending}");
+    expect_err(manager(&admin).args(["role", "grant", "billing", &reader_token]));
+    assert_eq!(expect_ok(manager(&admin).args(["role", "pending"])), pending);
+    expect_ok(reader(&clone).args(["fetch", "origin"]));
+    expect_err(reader(&clone).args(["cat", ".env.shared", "-r", "origin/main"]));
+    expect_ok(holder(&custody).args(["role", "grant", "billing", &reader_token]));
+    assert_eq!(expect_ok(manager(&admin).args(["role", "pending"])).trim(), "no pending role grants or frozen groups");
+    expect_ok(reader(&clone).args(["fetch", "origin"]));
+    assert_eq!(expect_ok(reader(&clone).args(["cat", ".env.shared", "-r", "origin/main"])), "shared version one");
+    expect_err(reader(&clone).args(["cat", ".env.security", "-r", "origin/main"]));
+    expect_ok(owner(&repo).args(["role", "set", "backup", "--rank", "1", "--groups", "billing"]));
+    expect_ok(owner(&repo).args(["role", "grant", "backup", &reader_token]));
+    expect_ok(owner(&repo).args(["role", "revoke", "billing", &reader_token]));
+    expect_ok(owner(&repo).args(["new", "-m", "shared access remains"]));
+    fs::write(repo.join(".env.shared"), "shared version two").unwrap();
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(reader(&clone).args(["fetch", "origin"]));
+    assert_eq!(expect_ok(reader(&clone).args(["cat", ".env.shared", "-r", "origin/main"])), "shared version two");
+    expect_ok(owner(&repo).args(["role", "revoke", "backup", &reader_token]));
+    expect_ok(owner(&repo).args(["new", "-m", "last read role removed"]));
+    fs::write(repo.join(".env.shared"), "shared version three").unwrap();
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(reader(&clone).args(["fetch", "origin"]));
+    expect_err(reader(&clone).args(["cat", ".env.shared", "-r", "origin/main"]));
+    assert!(!contains_bytes(&tmp.path().join("server"), b"shared version three"));
+}
+
+#[test]
 fn high_level_roles_create_grant_and_revoke_over_http() {
     let tmp = tempfile::tempdir().unwrap();
     let owner_id = tmp.path().join("owner.id");

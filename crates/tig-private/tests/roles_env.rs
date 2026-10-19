@@ -491,6 +491,12 @@ fn union_group_visibility_is_any_named_reader_and_removal_stays_explicit() {
     let snapshot = keyring.policy_snapshot().unwrap();
     assert!(snapshot.may_read(&alice.public(), "billing+security", &BTreeSet::new()));
     assert!(!snapshot.may_read(&alice.public(), "security", &BTreeSet::new()));
+    let pending = roles::pending_access(&snapshot,
+        &BTreeMap::from([("billing+security".into(), 1)]), keyring.grants.iter());
+    assert_eq!(pending.grants_pending, vec![
+        ("billing".into(), alice.public().fingerprint()),
+        ("billing+security".into(), alice.public().fingerprint()),
+    ]);
 }
 
 #[test]

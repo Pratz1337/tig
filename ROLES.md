@@ -25,7 +25,11 @@ tig role grant lead MANAGER_TOKEN
 
 A manager without a group's read role cannot obtain its key merely by managing it. A current key holder completes pending grants. For a new group, its first authorized reader can create the initial epoch while granting it. Existing groups require existing epoch-key custody for grants and rotation.
 
+A manager can use `assign` before the key holder uses `grant` for that already-assigned role. The key holder needs read access and key custody, without management or publish permission. `pending` lists missing keys for ordinary and combined groups, including `billing+security` when either role permits reading it.
+
 Publishing a new `@billing` tag as the owner also creates that read role and initializes its key automatically. Adding tags is sufficient to switch from simple mode; no migration command is needed. The role policy and published bookmark land in the same conditional head update. Existing simple-mode members retain their private-group access, publish permission, and rule-edit permission through a built-in rank-0 `private` role. New read-role recipients receive no unrelated private-group keys or publish permission. A tag does not change existing roles' ranks or permissions.
+
+Rules with several tags use a combined encryption group. Publish initializes a missing group's epoch for an authorized publishing reader in the same update; other assigned readers remain pending until a key holder wraps its key. Existing epochs are retained.
 
 Put role rules in `.private`, for example:
 
