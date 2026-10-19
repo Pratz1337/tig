@@ -233,6 +233,11 @@ fn next_job(shared: &Mutex<Shared>, wake: &Condvar) -> Option<Job> {
 }
 
 pub(crate) fn is_vcs_metadata(name: &OsStr) -> bool {
+    // Encoded OS strings preserve ASCII. Ignorable prefixes are non-ASCII,
+    // so an ASCII non-dot prefix cannot become a metadata name.
+    if name.as_encoded_bytes().first().is_some_and(|&byte| byte.is_ascii() && byte != b'.') {
+        return false;
+    }
     name.to_str().is_some_and(|name| {
         [".git", ".hg", ".svn", ".jj"].iter()
             .any(|vcs| tig_core::object::is_metadata_alias(name, vcs))
@@ -372,6 +377,47 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn vcs_aliases_keep_ignorable_prefixes_and_case_matching() {
+        for metadata in [".git", ".hg", ".svn", ".jj"] {
+            for name in [metadata.to_string(), metadata.to_uppercase(),
+                format!("\u{200c}{metadata}"), format!("\u{feff}{metadata}\u{200f}"),
+                format!(".\u{200d}{}", &metadata[1..])] {
+                assert!(is_vcs_metadata(OsStr::new(&name)), "{name:?}");
+            }
+            for prefix in (0..=127u8).filter(|byte| *byte != b'.') {
+                let name = format!("{}{metadata}", char::from(prefix));
+                assert!(!is_vcs_metadata(OsStr::new(&name)), "{name:?}");
+            }
+        }
+        for name in ["", "git", "README.md", ".gitignore", ".github", ".git~1", ".tig", "é.git", "a\u{200c}.git"] {
+            assert!(!is_vcs_metadata(OsStr::new(name)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn non_unicode_os_names_are_not_vcs_metadata() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            for bytes in [b"f\xff.git".as_slice(), b".g\xffit", b"\xff.git"] {
+                let name = OsStr::from_bytes(bytes);
+                assert!(name.to_str().is_none());
+                assert!(!is_vcs_metadata(name));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            for units in [vec![102, 0xd800, 46, 103, 105, 116],
+                vec![46, 103, 0xd800, 105, 116], vec![0xd800, 46, 103, 105, 116]] {
+                let name = OsString::from_wide(&units);
+                assert!(name.to_str().is_none());
+                assert!(!is_vcs_metadata(&name));
+            }
+        }
+    }
 
     #[test]
     fn a_waiting_parent_file_does_not_stall_descendant_visits() {
