@@ -225,6 +225,12 @@ One exception: access upgrades. A member who fetched while sealed out holds revi
 
 `object::validate_name` enforces a portable-name policy everywhere, including when decoding stored trees. It rejects `\`, `:`, control characters, a trailing `.` or space (Windows silently strips them, so `.env.` would land on disk as `.env`), and anything that aliases `.tig` (any case, or with HFS+-ignorable characters). Some names are only dangerous on some filesystems but exist in real repos, such as `aux.c` in Linux and `A` next to `a`. The filesystem working copy must check those before writing anything: Windows device names, case collisions on case-insensitive volumes, NTFS 8.3 aliases such as `TIG~1`, and never writing through a symlink or reparse-point ancestor.
 
+Common printable ASCII components use a single acceptance pass. Empty names,
+trailing dots/spaces, separators, colons, controls and `.tig` case aliases cannot
+take that shortcut. Other names retain the existing validator, including Unicode
+metadata aliases and the established rejection reasons and order. This changes
+neither accepted names nor stored encodings.
+
 Filesystem scans also exclude `.git`, `.hg`, `.svn` and `.jj`, including case and HFS+-ignorable aliases, at every depth. Checkout refuses those components before modifying any file, and Windows checks resolved names for metadata aliases too. An authoritative full snapshot drops previously tracked VCS metadata from its current tree and stat cache without reading updated disk contents or deleting the disk files. It warns that earlier history can still contain credentials; those bytes remain recoverable, and credentials must be rotated if shared. Ordinary stored tree names and encodings are unchanged; this is a filesystem boundary policy.
 
 ### Known gaps (tracked, not forgotten)

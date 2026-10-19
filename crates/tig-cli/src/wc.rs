@@ -2720,6 +2720,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set TIG_PROFILE_STATE to a local real-workspace state file"]
+    fn profile_state_path_decoding() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let bytes = fs::read(std::env::var_os("TIG_PROFILE_STATE").expect("set TIG_PROFILE_STATE")).unwrap();
+        let state = decode_state(&bytes).unwrap();
+        let paths: Vec<_> = state.cache.iter().map(|(path, _)| path.as_str()).collect();
+        println!("profile: {} cached paths", paths.len());
+        for _ in 0..7 {
+            let started = Instant::now();
+            let decoded = black_box(decode_state(black_box(&bytes)).unwrap());
+            println!("profile: decode state {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            drop(decoded);
+            let started = Instant::now();
+            let parsed: Vec<_> = paths.iter().map(|path| RepoPath::new(black_box(path)).unwrap()).collect();
+            black_box(&parsed);
+            println!("profile: parse paths {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+            drop(parsed);
+            let started = Instant::now();
+            for path in &paths {
+                for name in path.split('/') {
+                    black_box(tig_core::object::validate_name(black_box(name))).unwrap();
+                }
+            }
+            println!("profile: validate components {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    #[test]
     fn failed_rename_preserves_destination() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("state");
