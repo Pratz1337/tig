@@ -12,7 +12,7 @@ tig role grant billing READER_TOKEN
 tig role list
 ```
 
-The remote defaults to `origin`. The existing explicit form, such as `tig role origin list`, also works. `create` gives a new role its own read group and initializes the creator-owner's key custody. `grant` assigns the role and wraps its key together.
+The remote defaults to `origin`. The existing explicit form, such as `tig role origin list`, also works. `create` gives a new role its own read group and initializes the creator-owner's key custody. `grant` assigns the role and wraps its key together. Directory and HTTP remotes commit these consecutive signed policy batches in one conditional head update; the server verifies each batch and rejects skipped counters.
 
 `set` creates or replaces a role. Its `--groups` and `--permissions` arguments accept comma-separated names. Larger numeric ranks are higher. A manager can change or assign only roles strictly below their own highest rank, cannot give permissions they lack, and cannot assign themselves a higher role. The current owner is exempt from the rank limit.
 

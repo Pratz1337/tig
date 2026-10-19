@@ -1391,6 +1391,40 @@ fn startup_refuses_keyring_not_signed_by_pinned_owner() {
 }
 
 #[test]
+fn consecutive_role_batches_share_one_head_without_counter_gaps() {
+    use tig_private::roles::{Role, TransitionBody};
+    let owner = Identity::generate().unwrap();
+    let id = [211; 16];
+    let (_server, url) = start(id, &owner);
+    let remote = HttpRemote::connect(&url, Some(copy_identity(&owner))).unwrap();
+    let (ring, _) = Keyring::create(id, &owner).unwrap();
+    let head = remote.read_head().unwrap();
+    remote.commit_head(&head.version(), Some(&ring.encode().unwrap()), None).unwrap();
+    let before = remote.read_head().unwrap();
+    let extension = |counters: &[u64]| {
+        let mut next = ring.clone();
+        next.policy.baseline = ring.grants.iter().map(|grant| grant.signature).collect();
+        for (i, &counter) in counters.iter().enumerate() {
+            next.policy.transitions.push(TransitionBody::SetRole {
+                name: format!("reader{i}"), role: Role { rank: 1, permissions: 0, groups: Default::default() },
+            }.sign(id, &owner.public().signing, counter, &owner));
+        }
+        next.head.counter = *counters.last().unwrap();
+        let mut message = next.head.signing_bytes();
+        message.extend(next.policy.digest(id, &owner.public().signing));
+        next.head.signature = owner.sign(&message);
+        next.verify(&owner.public().signing, 0).unwrap();
+        next.encode().unwrap()
+    };
+    for counters in [&[3][..], &[2, 4][..]] {
+        assert!(remote.commit_head(&before.version(), Some(&extension(counters)), None).is_err());
+        assert_eq!(remote.read_head().unwrap().version(), before.version());
+    }
+    assert!(matches!(remote.commit_head(&before.version(), Some(&extension(&[2, 3])), None).unwrap(),
+        tig_private::remote::CommitOutcome::Committed(_)));
+}
+
+#[test]
 fn role_manager_heads_do_not_grant_upload_rights_and_successor_accepts_transfer() {
     use std::collections::BTreeSet;
     use tig_private::roles::{self, Role, TransitionBody};

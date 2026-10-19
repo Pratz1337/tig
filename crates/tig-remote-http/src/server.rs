@@ -1170,8 +1170,7 @@ fn check_keyring_change(
         return if previous.policy.is_empty() && signer == &before.current_owner { Ok(()) }
             else { Err(refuse(403, "role policy cannot be removed")) };
     }
-    if proposed.head.counter != floor
-        || !proposed.policy.transitions.starts_with(&previous.policy.transitions)
+    if !proposed.policy.transitions.starts_with(&previous.policy.transitions)
         || proposed.policy.transitions.len() == previous.policy.transitions.len()
         || !previous.grants.iter().all(|grant| proposed.grants.contains(grant))
     {
@@ -1184,7 +1183,10 @@ fn check_keyring_change(
         return Err(refuse(403, "historical grant baseline cannot be changed"));
     }
     let batch = &proposed.policy.transitions[previous.policy.transitions.len()..];
-    if batch.iter().any(|transition| transition.counter_after != floor) {
+    if batch.first().map(|transition| transition.counter_after) != Some(floor)
+        || batch.windows(2).any(|pair| pair[1].counter_after != pair[0].counter_after
+            && pair[0].counter_after.checked_add(1) != Some(pair[1].counter_after))
+    {
         return Err(refuse(403, "policy batch has an unexpected counter"));
     }
     if signer == &before.current_owner || signer == &after.current_owner

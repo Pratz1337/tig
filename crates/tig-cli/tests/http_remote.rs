@@ -106,6 +106,41 @@ fn contains_bytes(root: &Path, needle: &[u8]) -> bool {
 }
 
 #[test]
+fn high_level_roles_create_grant_and_revoke_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner_id = tmp.path().join("owner.id");
+    let reader_id = tmp.path().join("reader.id");
+    let owner = |dir: &Path| tig(dir, "owner", &owner_id);
+    let reader = |dir: &Path| tig(dir, "reader", &reader_id);
+    expect_ok(owner(tmp.path()).arg("identity"));
+    let reader_token = token(&expect_ok(reader(tmp.path()).arg("identity")));
+    let (_server, url) = start_server(tmp.path(), &owner_id);
+    let repo = tmp.path().join("owner");
+    let clone = tmp.path().join("reader");
+    expect_ok(owner(tmp.path()).arg("init").arg(&repo));
+    fs::write(repo.join("readme"), "public").unwrap();
+    fs::write(repo.join(".env"), "default-group-only").unwrap();
+    expect_ok(owner(&repo).args(["remote", "add", "origin", &url]));
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(owner(&repo).args(["role", "create", "billing", "--rank", "1"]));
+    fs::write(repo.join(".private"), ".env.billing @billing\n").unwrap();
+    fs::write(repo.join(".env.billing"), "billing version one").unwrap();
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(owner(&repo).args(["role", "grant", "billing", &reader_token]));
+    expect_ok(reader(tmp.path()).args(["clone", &url]).arg(&clone));
+    expect_ok(reader(&clone).args(["edit", "origin/main"]));
+    assert_eq!(fs::read_to_string(clone.join(".env.billing")).unwrap(), "billing version one");
+    assert!(!clone.join(".env").exists());
+    expect_ok(owner(&repo).args(["role", "revoke", "billing", &reader_token]));
+    expect_ok(owner(&repo).args(["new", "-m", "after revocation"]));
+    fs::write(repo.join(".env.billing"), "billing version two").unwrap();
+    expect_ok(owner(&repo).args(["publish", "origin"]));
+    expect_ok(reader(&clone).args(["fetch", "origin"]));
+    expect_err(reader(&clone).args(["cat", ".env.billing", "-r", "origin/main"]));
+    assert!(!contains_bytes(&tmp.path().join("server"), b"billing version two"));
+}
+
+#[test]
 fn two_users_publish_and_fetch_over_http() {
     let tmp = tempfile::tempdir().unwrap();
     let alice_id = tmp.path().join("alice.id");
