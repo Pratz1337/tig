@@ -663,6 +663,9 @@ fn assign_ok(
     if member.signing == *signer && !snap.is_current_owner(signer) {
         return Err(RoleError::Denied("you cannot raise your own roles".into()));
     }
+    if role.permissions & !snap.permissions(actor) != 0 {
+        return Err(RoleError::Denied("cannot grant a permission you do not hold".into()));
+    }
     Ok(())
 }
 

@@ -42,6 +42,7 @@ pub(super) fn run(repository: Option<&Path>, args: Args) -> Result<std::process:
     let verified = keyring.verify(&pin, state.counter)?;
     keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
     remote::verify_policy_checkpoints(&cfg.dir, &keyring)?;
+    remote::remember_policy_head(&cfg.dir, &keyring)?;
     if !verified.reads_now(&actor.public(), &args.role) {
         return Err(CliError::msg("you cannot read this role's secrets"));
     }

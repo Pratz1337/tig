@@ -72,6 +72,7 @@ pub(super) fn run(repository: Option<&Path>, args: Args) -> Result<()> {
     let verified = keyring.verify(&pin, state.counter)?;
     keyring.verify_policy_checkpoint(state.policy_checkpoint.as_ref())?;
     remote::verify_policy_checkpoints(&cfg.dir, &keyring)?;
+    state = remote::remember_policy_head(&cfg.dir, &keyring)?;
     match &args.action {
         Action::List => {
             let snapshot = verified.snapshot();
