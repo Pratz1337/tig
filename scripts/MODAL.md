@@ -33,8 +33,9 @@ and uncommitted builds.
 The uploader reads only the staged tree, with Modal's automatic source inclusion
 disabled. The running build scripts must match their public staged bytes.
 Symlinks must resolve to public files inside that tree; directory, dangling and
-outside links refuse the build. VCS metadata, `target/`, `bin/`, `pending/`, Python
-bytecode and local tool directories are excluded. No Git checkout, filters or
+outside links refuse the build. VCS metadata, `target/`, root `bin/`, `pending/`, Python
+bytecode and local tool directories are excluded. Nested Cargo `src/bin` entry
+points remain build inputs. No Git checkout, filters or
 hooks run. Registry, Git dependencies and build outputs persist on the Modal
 volume `tig-cargo-cache`. This change does not audit or erase older cache data.
 

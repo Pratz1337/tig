@@ -63,6 +63,29 @@ class PublicBuildSourceTests(unittest.TestCase):
             self.assertFalse((source / directory.name / "private.rs").exists())
             self.assertEqual((source / directory.name / "public.rs").read_bytes(), b"explicitly public\n")
 
+    def test_nested_cargo_bin_source_survives_without_outputs_or_private_data(self):
+        entry = "crates/server/src/bin/tig-server.rs"
+        for name, body in ((entry, b"fn main() {}\n"), ("bin/tig.exe", b"local build output"),
+                           ("crates/server/src/bin/.env", self.marker),
+                           ("crates/server/src/bin/.hg/config", self.marker)):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        with self.stage() as source:
+            self.assertEqual((source / entry).read_bytes(), b"fn main() {}\n")
+            self.assertFalse((source / "bin").exists())
+            self.assertFalse((source / "crates/server/src/bin/.env").exists())
+            self.assertFalse((source / "crates/server/src/bin/.hg").exists())
+
+    def test_modal_filter_keeps_nested_cargo_bin_source(self):
+        from modal.file_pattern_matcher import FilePatternMatcher
+        from build_source import UPLOAD_IGNORE
+        ignore = FilePatternMatcher(*UPLOAD_IGNORE)
+        self.assertFalse(ignore(Path("crates/server/src/bin/tig-server.rs")))
+        self.assertTrue(ignore(Path("bin/tig.exe")))
+        self.assertTrue(ignore(Path(".git/config")))
+        self.assertTrue(ignore(Path("target/debug/tig.exe")))
+
     def test_stage_is_immutable_and_bookmarks_are_preserved(self):
         before = self.tig("bookmark", "list")
         with self.stage() as source:

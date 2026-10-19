@@ -83,7 +83,8 @@ def copy_tree(root, revision, destination):
     for row in entries:
         meta, name = row.split(b"\t", 1)
         parts = name.decode("utf-8").split("/")
-        if any("".join(c for c in p if c not in IGNORABLE).lower() in UPLOAD_IGNORE for p in parts):
+        normalized = ["".join(c for c in p if c not in IGNORABLE).lower() for p in parts]
+        if normalized[0] == "bin" or any(p in UPLOAD_IGNORE for p in normalized if p != "bin"):
             continue
         parsed.append((meta, name))
     ids = [meta.split()[2] for meta, _ in parsed]
