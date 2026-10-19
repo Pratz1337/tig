@@ -98,6 +98,13 @@ The filesystem working copy (`tig-cli`) is one client: it uses a stat cache (pat
 
 After checking workspace boundaries and loading a directory's ignore rules, the walker queues its eligible child directories before visiting its files. A slow root-file read can then overlap descendant scans. The listing buffer caches entry names and file types for both passes, without a second file-list buffer. Worker counts remain bounded and results are unordered; file metadata is still obtained once. A failed walk stops new child queues and returns an error after active workers finish.
 
+Large directory listings also share disjoint file ranges across that same worker
+pool, so one wide directory cannot hold all of its file visits on one worker.
+The jobs borrow one immutable listing and retain its directory's ignore chain.
+Children are still queued first; small directories and single-worker walks visit
+files inline. Nested-workspace, metadata, scratch, ignore and path checks retain
+their existing order, and file metadata is still obtained once.
+
 Stat scans reuse the frozen cache and update only changed rows. An identical revision, tree and stat cache needs no state-file rewrite; changes to timestamps or racy flags still get saved. Checking out an identical tree only records the revision move, without file-write preflight. Checkouts that change files retain the complete preflight and per-path safety checks.
 
 Ignore rules control discovery of untracked files. Files already in the working revision still detect edits and deletions when a rule starts matching them, including inside an ignored directory or after Git import. They use the same stat-cache checks and content reader as walked files; a clean cached file is not re-read. Reserved VCS metadata remains excluded even when previously tracked. A tracked path that has moved inside a nested workspace refuses a content read rather than recording that workspace's new bytes. A discovered file or symlink replacing a directory removes its cached descendants without reading through that replacement.
