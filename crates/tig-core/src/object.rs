@@ -255,6 +255,14 @@ pub fn is_metadata_alias(name: &str, metadata: &str) -> bool {
 /// like `aux.c`, and `A` next to `a`) are checked by the filesystem working
 /// copy before it writes, not here.
 pub fn validate_name(name: &str) -> Result<()> {
+    // Accept ordinary ASCII names in one pass. Everything else keeps the
+    // existing validation and error order, including Unicode metadata aliases.
+    if name.as_bytes().last().is_some_and(|&b| !matches!(b, b'.' | b' '))
+        && !name.eq_ignore_ascii_case(".tig")
+        && name.bytes().all(|b| (b' '..=b'~').contains(&b) && !matches!(b, b'/' | b'\\' | b':'))
+    {
+        return Ok(());
+    }
     let bad = |reason| {
         Err(Error::InvalidPath {
             path: name.to_string(),
@@ -598,6 +606,47 @@ impl View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_policy_ascii_bytes() {
+        for byte in 0..=127u8 {
+            let character = char::from(byte);
+            for name in [format!("a{character}b"), format!("{character}ab"), format!("ab{character}")] {
+                let forbidden = byte.is_ascii_control() || matches!(byte, b'/' | b'\\' | b':')
+                    || name.ends_with('.') || name.ends_with(' ');
+                assert_eq!(validate_name(&name).is_err(), forbidden, "{name:?}");
+            }
+        }
+        for name in [".git", ".hg", ".svn", ".jj", "CON", "aux.c", "a?b", "a*b", "my file"] {
+            assert!(validate_name(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn name_policy_unicode_and_error_order() {
+        for name in ["é", "日本語", "😀", ".tīg", ".t\u{200c}igx", "a\u{200c}b"] {
+            assert!(validate_name(name).is_ok(), "{name:?}");
+        }
+        for (name, expected) in [
+            ("", "empty name"),
+            (".", "'.' and '..' are not allowed"),
+            ("..", "'.' and '..' are not allowed"),
+            ("x\0\\\u{85}.", "name contains '/' or NUL"),
+            ("x/\\\u{85}.", "name contains '/' or NUL"),
+            ("x\\\u{85}.", "name contains '\\' or ':'"),
+            ("x:\u{85}.", "name contains '\\' or ':'"),
+            ("x\u{85}.", "name contains a control character"),
+            ("x\u{9f}", "name contains a control character"),
+            ("é.", "name ends with '.' or ' ' (Windows would rename it)"),
+            ("é ", "name ends with '.' or ' ' (Windows would rename it)"),
+            (".TIG", "'.tig' is reserved for repository metadata"),
+            (".t\u{200c}ig", "'.tig' is reserved for repository metadata"),
+            (".T\u{feff}IG", "'.tig' is reserved for repository metadata"),
+        ] {
+            assert!(matches!(validate_name(name), Err(Error::InvalidPath { path, reason })
+                if path == name && reason == expected), "{name:?}");
+        }
+    }
 
     fn sig() -> Signature {
         Signature {
