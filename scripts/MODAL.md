@@ -1,13 +1,13 @@
 # Modal builds
 
-`scripts/modal_build.py` runs Cargo on Modal (Debian, Rust stable, 16 CPU, 32 GiB, 60 min) so this machine does not have to compile. Modal 1.5 is already authenticated for `C:\Program Files\Python311\python.exe`. The `modal` executable is not on `PATH`.
+`scripts/modal_build.py` runs Cargo on Modal (Debian, Rust stable, 16 CPU, 32 GiB, 60 min) so this machine does not have to compile. Install the pinned build dependencies and authenticate with `python -m modal setup` before the first build.
 
 ```powershell
-& "C:\Program Files\Python311\python.exe" scripts/modal_build.py run -- cargo --version
-& "C:\Program Files\Python311\python.exe" scripts/modal_build.py test -p tig-core
-& "C:\Program Files\Python311\python.exe" scripts/modal_build.py test -p tig-private --test collaboration
-& "C:\Program Files\Python311\python.exe" scripts/modal_build.py clippy
-& "C:\Program Files\Python311\python.exe" scripts/modal_build.py release
+python -B -X utf8 scripts/modal_build.py run -- cargo --version
+python -B -X utf8 scripts/modal_build.py test -p tig-core
+python -B -X utf8 scripts/modal_build.py test -p tig-private --test collaboration
+python -B -X utf8 scripts/modal_build.py clippy
+python -B -X utf8 scripts/modal_build.py release
 ```
 
 `test` runs `cargo test --workspace --locked` plus any extra arguments. `clippy` runs `cargo clippy --workspace --all-targets --locked -- -D warnings`. `run --` runs the rest of the command in `/repo`. `release` cross-compiles `--target x86_64-pc-windows-gnu --bins` with the mingw linker and writes each `.exe` into `bin\`. The script exits with cargo's status.
@@ -42,7 +42,7 @@ volume `tig-cargo-cache`. This change does not audit or erase older cache data.
 For a fresh machine, install the pinned build dependency with
 `python -m pip install -r scripts/requirements-build.txt`, then authenticate with
 `python -m modal setup`. The complete Windows bootstrap is in
-[`SELF_HOSTING.md`](../SELF_HOSTING.md#set-up-a-fresh-windows-workspace-from-github).
+[development guide](../docs/development.md#set-up-a-fresh-windows-workspace-from-github).
 
 Tests gated with `#[cfg(windows)]` do not run on Modal (Linux). Cross-compile their
 test executables on Modal and run the downloaded executables on Windows when

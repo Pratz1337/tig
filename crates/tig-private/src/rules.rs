@@ -261,6 +261,10 @@ impl Rules {
         self.roles.clone()
     }
 
+    pub(crate) fn reader_sets(&self) -> impl Iterator<Item = &BTreeSet<String>> {
+        self.rules.iter().filter(|rule| !rule.negated).map(|rule| &rule.readers)
+    }
+
     /// True when the file names no custom roles.
     ///
     /// `@private` is the built-in group, so a file that only uses it is still

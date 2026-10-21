@@ -4,7 +4,7 @@ This checkout uses TIG for local changes, snapshots, bookmarks, merges and undo.
 GitHub holds the source, setup scripts, build dependencies and `.private` policy.
 Generated `.tig` state and private keys stay on the developer's machine.
 Use `bin/tig.exe` on Windows: the `tig` bundled with Git is a different program.
-Builds and tests run through `scripts/modal_build.py`; see `scripts/MODAL.md`.
+Builds and tests run through `scripts/modal_build.py`; see [remote builds](../scripts/MODAL.md).
 
 ## Set up a fresh Windows workspace from GitHub
 
@@ -33,7 +33,7 @@ The first build verifies the clone against recent public GitHub commits and
 uploads only committed source; untracked local files are excluded. Later builds
 in the TIG workspace export an immutable public snapshot, including uncommitted
 public edits, through TIG's native privacy checks. See
-[`scripts/MODAL.md`](scripts/MODAL.md) for the upload boundary and regressions.
+[`scripts/MODAL.md`](../scripts/MODAL.md) for the upload boundary and regressions.
 
 The source clone stays separate. The new workspace uses `.tig`; there is no Git
 index or staging step for local work. The original development checkout also
@@ -59,18 +59,12 @@ record with NUL. Conflicts appear once as `C path`, without explanatory text.
 Both formats snapshot edits just like ordinary status and compare the working
 change with its first parent. They describe local files, including private files.
 
-## Privacy demo
+## Public export
 
 `.tig` is trusted local metadata. It contains plaintext objects, local history
 and key material, and must stay local. `.gitignore` excludes it from Git.
 `.private` is public policy; TIG always applies its built-in privacy floor too.
 The two explicit PEM exceptions are public localhost TLS fixtures used by tests.
-
-The local `pending/private-demo/` directory contains a generated demonstration
-note, not a real credential. Git ignores all of `pending/`. `.tigignore` includes
-only this demo directory in TIG; `.private` keeps it out of public exports. The
-Modal build uploader reads only staged public source and excludes `pending/`
-and VCS metadata.
 
 After each tested change, export only the `master` bookmark:
 
@@ -83,10 +77,9 @@ The two declassifications permit only the known public test fixtures. Older
 revisions predate their `.private` exceptions, so the historical paste check
 otherwise refuses their current public copies. No other private path is allowed.
 
-Inspect the exported tree and reachable history before pushing. Neither the demo
-note nor `.tig` may be present. The exporter also checks private-content copies.
-This demo exercises Git export omission; encrypted collaboration uses TIG remotes
-and is described in `DESIGN.md`.
+Inspect the exported tree and reachable history before pushing. Local private content and `.tig` must be absent. The exporter also checks private-content copies.
+Git export omits private content; encrypted collaboration uses TIG remotes
+and is described in [the design](../DESIGN.md).
 
 ## GitHub bridge
 
@@ -128,5 +121,5 @@ the native bookmark instead of rewriting it.
 Run `bench/compare.py` against a release binary and retain the raw samples.
 `bench/RESULTS.md` includes workloads where TIG is slower. Faster than Git is a
 measurement goal for each operation and workload, not a universal guarantee.
-See [`bench/RESULTS.md`](bench/RESULTS.md) for the consolidated real-source
+See [`bench/RESULTS.md`](../bench/RESULTS.md) for the consolidated real-source
 comparisons, methods and raw timing samples.

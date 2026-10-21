@@ -1,6 +1,6 @@
 //! Private changes: one immutable public revision, opened in place.
 //!
-//! See `PRIVATE_CHANGES.md` for the capsule and public-history contract.
+//! See `docs/guide.md#private-changes` for the capsule and public-history contract.
 //! Crypto is `EpochKey` (XChaCha20-Poly1305, frozen subkeys). The per-change
 //! secret is not a role epoch key.
 

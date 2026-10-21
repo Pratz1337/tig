@@ -45,7 +45,7 @@ flowchart LR
 
 ## Quick start
 
-To develop this repository with TIG on Windows, follow the [GitHub-to-TIG setup](SELF_HOSTING.md#set-up-a-fresh-windows-workspace-from-github).
+To develop this repository with TIG on Windows, follow the [GitHub-to-TIG setup](docs/development.md#set-up-a-fresh-windows-workspace-from-github).
 
 ```sh
 cargo build --release -p tig-cli
@@ -119,7 +119,7 @@ tig role grant billing READER_TOKEN
 tig role revoke billing READER_TOKEN   # removes access and rotates keys
 ```
 
-Role creation, grants, revocation, literal command environments and ownership transfer are implemented. See [`ROLES.md`](ROLES.md) for the commands and the separation between management permission and secret-key custody.
+Role creation, grants, revocation, literal command environments and ownership transfer are implemented. See the [role guide](docs/guide.md#roles-and-command-environments) for the commands and the separation between management permission and secret-key custody.
 
 ## Architecture
 
@@ -132,11 +132,16 @@ flowchart TB
 
 See [`DESIGN.md`](DESIGN.md) for the full design contract.
 
-This repository now uses TIG locally. See [`SELF_HOSTING.md`](SELF_HOSTING.md) for compact status output, the privacy demo and the GitHub export bridge.
-
 ## Speed
 
 Real-source Windows comparisons include wins and losses: TIG is faster for clean Gitoxide status and a tracked ignored-file edit, but slower for its README edit and for edited TypeScript status. TIG status also records edits, while Git status only reports them. Frozen binary IDs, methods and retained samples are in [`bench/RESULTS.md`](bench/RESULTS.md).
+
+## Documentation
+
+- [User guide](docs/guide.md): roles, conflicts, Git import/export, private changes and large files.
+- [Design](DESIGN.md): architecture, wire formats and known limits.
+- [Security](SECURITY.md): identity protection and key storage.
+- [Development](docs/development.md): build, test and work on TIG with TIG.
 
 ## Status
 

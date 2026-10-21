@@ -467,13 +467,8 @@ where
             }
         }
         let mut readers = BTreeSet::new();
-        for (member, names) in &snapshot.assignments {
-            if names.iter().any(|name| {
-                snapshot
-                    .roles
-                    .get(name)
-                    .is_some_and(|role| role.groups.contains(&group))
-            }) {
+        for member in snapshot.assignments.keys() {
+            if snapshot.may_read(member, &group, &holders) {
                 readers.insert(*member);
             }
         }

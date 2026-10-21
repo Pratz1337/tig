@@ -28,11 +28,12 @@ use tig_core::{EntryKind, ObjectId, RepoPath};
 
 use crate::fetch::FetchState;
 use crate::keyring::{Keyring, KeyringError, OwnerKeys};
-use crate::keys::{EpochKey, Identity, KeyError, WireId};
+use crate::keys::{EpochKey, GroupEpoch, Identity, KeyError, WireId};
 use crate::manifest::{pack_id, Manifest, ManifestError, PackEntry};
 use crate::pack::{Pack, PackBatch, PackError};
 use crate::project::{access_group, project_grouped, public_revision, Projection, PRIVATE_GROUP};
 use crate::remote::{CommitOutcome, Remote, RemoteError};
+use crate::roles::TransitionBody;
 
 const VERSION: u8 = 6;
 const MAX_REVISIONS: usize = 1_000_000;
@@ -461,8 +462,11 @@ pub fn publish(
     let local_ids = local_of_public(state, fetched);
     let known = published_ids(state, fetched);
     let mut requested_roles = BTreeSet::new();
+    let mut requested_groups = BTreeSet::new();
     for id in parent_first(store, &[rev], |id| id == root_revision_id() || known.contains_key(&id))? {
-        requested_roles.extend(crate::project::rules_of(store, &store.get_revision(&id)?.tree)?.roles());
+        let rules = crate::project::rules_of(store, &store.get_revision(&id)?.tree)?;
+        requested_roles.extend(rules.roles());
+        requested_groups.extend(rules.reader_sets().map(access_group));
     }
     // Rollback floors for this call. Local state moves only after a commit.
     let mut counter_floor = state.counter.max(fetched.counter);
@@ -500,7 +504,7 @@ pub fn publish(
             return Err(PublishError::Invalid("the remote omitted a previously accepted reveal".into()));
         }
         if let Some(manifest) = &previous { revealed_floor.extend(manifest.reveals.keys().copied()); }
-        initialize_roles(&mut session, &requested_roles, identity, owner_keys)?;
+        initialize_roles(&mut session, &requested_roles, &requested_groups, identity, owner_keys)?;
         // Proposed role keys are freshly random. A public-only CAS race can
         // leave the remote keyring unchanged; its bytes alone cannot key the
         // projection cache for this unpublished policy.
@@ -1073,7 +1077,7 @@ fn read_manifest(
 }
 
 // Build locally so policy activation and the new bookmark share one CAS.
-fn initialize_roles(session: &mut Session, names: &BTreeSet<String>, identity: &Identity, owner_keys: Option<&OwnerKeys>) -> Result<(), PublishError> {
+fn initialize_roles(session: &mut Session, names: &BTreeSet<String>, groups: &BTreeSet<String>, identity: &Identity, owner_keys: Option<&OwnerKeys>) -> Result<(), PublishError> {
     let mut next = session.keyring.clone();
     let mut changed = false;
     for name in names {
@@ -1082,6 +1086,21 @@ fn initialize_roles(session: &mut Session, names: &BTreeSet<String>, identity: &
             return Err(PublishError::Invalid("the owner must initialize new roles".into()));
         }
         next.create_role(identity, name, 1, 0)?;
+        changed = true;
+    }
+    for group in groups {
+        if next.head.epochs.contains_key(group) { continue; }
+        if !next.policy_snapshot()?.may_read(&identity.public(), group, &BTreeSet::new()) {
+            return Err(PublishError::Invalid(format!("publisher cannot read group `{group}`")));
+        }
+        let key = EpochKey::generate(GroupEpoch { remote: next.remote, group: group.clone(), epoch: 1 })?;
+        let issued = crate::keys::grant(&key, &identity.public(), identity)?;
+        let counter = next.head.counter.checked_add(1).ok_or_else(|| PublishError::Invalid("counter overflow".into()))?;
+        let bodies = [TransitionBody::AdvanceEpoch { group: group.clone(), epoch: 1 },
+            TransitionBody::AuthorizeGrant { group: group.clone(), epoch: 1,
+                recipient: identity.public(), grant_signature: issued.signature }];
+        let transitions = bodies.into_iter().map(|body| body.sign(next.remote, &next.owner.signing, counter, identity)).collect();
+        next.commit_policy(identity, transitions, vec![issued])?;
         changed = true;
     }
     if changed {
