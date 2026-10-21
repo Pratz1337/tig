@@ -88,5 +88,5 @@ here because those build artifacts are ignored.
 
 Build the CLI and `tig-private`'s `import_bench` example on Modal, then run
 `python bench/import_compare.py PATH_TO_SOURCE_GIT --runs 3` locally;
-`--cli-only` measures just the CLI. See [IMPORT_GIT.md](../IMPORT_GIT.md) for
+`--cli-only` measures just the CLI. See [the import guide](../docs/guide.md#importing-git-history) for
 privacy rules and when an incremental import requires a fresh destination.
