@@ -48,7 +48,7 @@ flowchart LR
 To develop this repository with TIG on Windows, follow the [GitHub-to-TIG setup](docs/development.md#set-up-a-fresh-windows-workspace-from-github).
 
 ```sh
-cargo build --release -p tig-cli
+cargo install --locked --path crates/tig-cli
 
 tig init
 echo ".env" >> .private       # this path is now private
@@ -57,6 +57,8 @@ tig describe -m "first change"
 tig new                       # start the next change
 tig undo                      # changed your mind? undo it
 ```
+
+Run the install command from this checkout with Rust installed. It installs the CLI in Cargo's binary directory. If your system already has another `tig`, use the executable path printed by `cargo install`.
 
 Coming from git:
 
