@@ -179,13 +179,16 @@ impl JournalStore {
 /// (whose lock the caller holds). If the file shrank (another process
 /// compacted it), starts over.
 fn read_new(file: &mut File, inner: &mut Inner) -> Result<()> {
-    let len = file.metadata()?.len() as usize;
-    if len < inner.bytes.len() || inner.bytes.is_empty() {
+    let len = file.metadata()?.len();
+    if len < inner.bytes.len() as u64 || inner.bytes.is_empty() {
         inner.bytes.clear();
         inner.index.clear();
-        let mut all = Vec::with_capacity(len);
+        if len > COMPACT_AT {
+            return read_large(file, inner, len);
+        }
+        let mut all = Vec::with_capacity(len as usize);
         file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut all)?;
+        file.take(len).read_to_end(&mut all)?;
         if all.len() < MAGIC.len() || &all[..MAGIC.len()] != MAGIC {
             // Empty or foreign file: no records; the next append rewrites
             // the header.
@@ -194,14 +197,58 @@ fn read_new(file: &mut File, inner: &mut Inner) -> Result<()> {
         let valid = index_records(&all, MAGIC.len(), &mut inner.index);
         all.truncate(valid);
         inner.bytes = all;
-    } else if len > inner.bytes.len() {
+    } else if len > inner.bytes.len() as u64 {
         let start = inner.bytes.len();
+        if len - start as u64 > COMPACT_AT {
+            return read_large(file, inner, len);
+        }
         file.seek(SeekFrom::Start(start as u64))?;
-        file.read_to_end(&mut inner.bytes)?;
+        file.take(len - start as u64).read_to_end(&mut inner.bytes)?;
         let valid = index_records(&inner.bytes, start, &mut inner.index);
         inner.bytes.truncate(valid);
     }
     Ok(())
+}
+
+/// Large reads validate one bounded record before retaining it. File size
+/// alone must not reserve memory for a corrupt or sparse tail. Small reads
+/// keep the bulk path above; both paths stop at the observed file length.
+fn read_large(file: &mut File, inner: &mut Inner, len: u64) -> Result<()> {
+    let start = inner.bytes.len();
+    file.seek(SeekFrom::Start(start as u64))?;
+    let mut input = file.take(len - start as u64);
+    if start == 0 {
+        let mut magic = [0; MAGIC.len()];
+        if !read_complete(&mut input, &mut magic)? || &magic != MAGIC {
+            return Ok(());
+        }
+        inner.bytes.extend_from_slice(MAGIC);
+    }
+    let mut header = [0; HEADER];
+    let mut body = Vec::new();
+    while read_complete(&mut input, &mut header)? {
+        let size = u32::from_le_bytes(header[..4].try_into().expect("4 bytes")) as usize;
+        if size > SMALL_OBJECT { break; }
+        let Ok(kind) = ObjectKind::from_u8(header[4]) else { break };
+        let id = ObjectId(header[5..].try_into().expect("32 bytes"));
+        body.resize(size, 0);
+        if !read_complete(&mut input, &mut body)? || hash_object(kind, &body) != id {
+            break;
+        }
+        let start = inner.bytes.len() + HEADER;
+        inner.bytes.extend_from_slice(&header);
+        inner.bytes.extend_from_slice(&body);
+        inner.index.insert(id, (kind, start..start + size));
+    }
+    Ok(())
+}
+
+fn read_complete(input: &mut impl Read, bytes: &mut [u8]) -> Result<bool> {
+    match input.read_exact(bytes) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Indexes valid records from `start`; returns the end of the last valid
@@ -210,6 +257,7 @@ fn index_records(bytes: &[u8], start: usize, index: &mut HashMap<ObjectId, (Obje
     let mut pos = start;
     while bytes.len() - pos >= HEADER {
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+        if len > SMALL_OBJECT { break; }
         let Ok(kind) = ObjectKind::from_u8(bytes[pos + 4]) else { break };
         let id = ObjectId(bytes[pos + 5..pos + HEADER].try_into().expect("32 bytes"));
         let body_start = pos + HEADER;
@@ -342,5 +390,93 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let s = JournalStore::open(dir.path()).unwrap();
         assert!(s.get_raw(&a).unwrap().is_none(), "hash mismatch means not present");
+    }
+
+    #[test]
+    fn oversized_record_ends_the_valid_journal_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::open(dir.path()).unwrap();
+        let kept = store.put_blob(b"kept").unwrap();
+        let path = store.journal_path().to_path_buf();
+        drop(store);
+        let body = vec![7; SMALL_OBJECT + 1];
+        let oversized = hash_object(ObjectKind::Blob, &body);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&[ObjectKind::Blob as u8]).unwrap();
+        file.write_all(oversized.as_bytes()).unwrap();
+        file.write_all(&body).unwrap();
+        drop(file);
+        let store = JournalStore::open(dir.path()).unwrap();
+        assert_eq!(store.get_blob(&kept).unwrap(), b"kept");
+        assert!(store.get_raw(&oversized).unwrap().is_none());
+        let next = store.put_blob(b"after oversized record").unwrap();
+        drop(store);
+        let store = JournalStore::open(dir.path()).unwrap();
+        assert_eq!(store.get_blob(&next).unwrap(), b"after oversized record");
+        assert!(store.get_raw(&oversized).unwrap().is_none());
+    }
+
+    fn check_large_corrupt_tail(reopen: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::open(dir.path()).unwrap();
+        let kept = store.put_blob(b"valid prefix").unwrap();
+        let path = store.journal_path().to_path_buf();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0xff; HEADER]).unwrap();
+        // Unix creates a sparse tail. Keep the Windows fixture small because
+        // extending an ordinary NTFS file can allocate its complete length.
+        file.set_len(if cfg!(unix) { 512 * 1024 * 1024 } else { 8 * 1024 * 1024 }).unwrap();
+        drop(file);
+        let store = if reopen {
+            drop(store);
+            JournalStore::open(dir.path()).unwrap()
+        } else {
+            store
+        };
+        let next = store.put_blob(b"after corrupt tail").unwrap();
+        assert!(fs::metadata(&path).unwrap().len() < 1024);
+        assert_eq!(store.get_blob(&kept).unwrap(), b"valid prefix");
+        drop(store);
+        let store = JournalStore::open(dir.path()).unwrap();
+        assert_eq!(store.get_blob(&kept).unwrap(), b"valid prefix");
+        assert_eq!(store.get_blob(&next).unwrap(), b"after corrupt tail");
+    }
+
+    #[test]
+    fn large_corrupt_journal_tail_on_open_keeps_valid_objects() {
+        check_large_corrupt_tail(true);
+    }
+
+    #[test]
+    fn large_corrupt_journal_tail_on_refresh_keeps_valid_objects() {
+        check_large_corrupt_tail(false);
+    }
+
+    #[test]
+    fn valid_journal_above_compaction_threshold_keeps_every_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::open(dir.path()).unwrap();
+        let prefix = store.put_blob(b"before the large append").unwrap();
+        let observer = JournalStore::open(dir.path()).unwrap();
+        let ids: Vec<_> = (0..70u8)
+            .map(|i| store.put_blob(&vec![i; SMALL_OBJECT]).unwrap())
+            .collect();
+        assert!(fs::metadata(store.journal_path()).unwrap().len() > COMPACT_AT);
+        assert_eq!(observer.get_blob(ids.last().unwrap()).unwrap(), vec![69; SMALL_OBJECT]);
+        assert_eq!(observer.get_blob(&prefix).unwrap(), b"before the large append");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(observer.get_blob(id).unwrap(), vec![i as u8; SMALL_OBJECT]);
+        }
+        drop(observer);
+        drop(store);
+        let store = JournalStore::open(dir.path()).unwrap();
+        assert_eq!(fs::metadata(store.journal_path()).unwrap().len(), 0);
+        assert_eq!(store.get_blob(&prefix).unwrap(), b"before the large append");
+        for (i, id) in ids.iter().enumerate() {
+            assert!(store.disk().has(id).unwrap());
+            assert_eq!(store.get_blob(id).unwrap(), vec![i as u8; SMALL_OBJECT]);
+        }
     }
 }
